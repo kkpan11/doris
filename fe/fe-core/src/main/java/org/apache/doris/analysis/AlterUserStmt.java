@@ -18,12 +18,10 @@
 package org.apache.doris.analysis;
 
 import org.apache.doris.catalog.Env;
-import org.apache.doris.cluster.ClusterNamespace;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.UserException;
-import org.apache.doris.mysql.privilege.Auth.PrivLevel;
 import org.apache.doris.mysql.privilege.PasswordPolicy.FailedLoginPolicy;
 import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.qe.ConnectContext;
@@ -40,11 +38,13 @@ import java.util.Set;
 //      ACCOUNT_LOCK[ACCOUNT_UNLOCK]
 //      FAILED_LOGIN_ATTEMPTS
 //      PASSWORD_LOCK_TIME
-public class AlterUserStmt extends DdlStmt {
+public class AlterUserStmt extends DdlStmt implements NotFallbackInParser {
     private boolean ifExist;
     private UserDesc userDesc;
     private String role;
     private PasswordOptions passwordOptions;
+
+    private String comment;
 
     // Only support doing one of these operation at one time.
     public enum OpType {
@@ -52,16 +52,19 @@ public class AlterUserStmt extends DdlStmt {
         SET_ROLE,
         SET_PASSWORD_POLICY,
         LOCK_ACCOUNT,
-        UNLOCK_ACCOUNT
+        UNLOCK_ACCOUNT,
+        MODIFY_COMMENT
     }
 
     private Set<OpType> ops = Sets.newHashSet();
 
-    public AlterUserStmt(boolean ifExist, UserDesc userDesc, String role, PasswordOptions passwordOptions) {
+    public AlterUserStmt(boolean ifExist, UserDesc userDesc, String role, PasswordOptions passwordOptions,
+            String comment) {
         this.ifExist = ifExist;
         this.userDesc = userDesc;
         this.role = role;
         this.passwordOptions = passwordOptions;
+        this.comment = comment;
     }
 
     public boolean isIfExist() {
@@ -92,10 +95,14 @@ public class AlterUserStmt extends DdlStmt {
         return ops.iterator().next();
     }
 
+    public String getComment() {
+        return comment;
+    }
+
     @Override
     public void analyze(Analyzer analyzer) throws UserException {
         super.analyze(analyzer);
-        userDesc.getUserIdent().analyze(analyzer.getClusterName());
+        userDesc.getUserIdent().analyze();
         userDesc.getPassVar().analyze();
 
         if (userDesc.hasPassword()) {
@@ -103,10 +110,13 @@ public class AlterUserStmt extends DdlStmt {
         }
 
         if (!Strings.isNullOrEmpty(role)) {
-            role = ClusterNamespace.getFullName(analyzer.getClusterName(), role);
             ops.add(OpType.SET_ROLE);
         }
 
+        // may be set comment to "", so not use `Strings.isNullOrEmpty`
+        if (comment != null) {
+            ops.add(OpType.MODIFY_COMMENT);
+        }
         passwordOptions.analyze();
         if (passwordOptions.getAccountUnlocked() == FailedLoginPolicy.LOCK_ACCOUNT) {
             throw new AnalysisException("Not support lock account now");
@@ -123,9 +133,7 @@ public class AlterUserStmt extends DdlStmt {
             throw new AnalysisException("Only support doing one type of operation at one time");
         }
 
-        // check if current user has GRANT priv on GLOBAL or DATABASE level.
-        if (!Env.getCurrentEnv().getAccessManager().checkHasPriv(ConnectContext.get(),
-                PrivPredicate.GRANT, PrivLevel.GLOBAL, PrivLevel.DATABASE)) {
+        if (!Env.getCurrentEnv().getAccessManager().checkGlobalPriv(ConnectContext.get(), PrivPredicate.GRANT)) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR, "GRANT");
         }
     }
@@ -150,5 +158,10 @@ public class AlterUserStmt extends DdlStmt {
         }
 
         return sb.toString();
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.ALTER;
     }
 }

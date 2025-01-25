@@ -25,22 +25,14 @@
 #include "vec/data_types/data_type.h"
 #include "vec/data_types/data_type_nullable.h"
 
-namespace doris {
-namespace vectorized {
-class VecDateTimeValue;
-struct DateTimeV2ValueType;
-struct DateV2ValueType;
-template <typename T>
-class DateV2Value;
-} // namespace vectorized
-} // namespace doris
-
 namespace doris::vectorized {
+#include "common/compile_check_begin.h"
 
 template <template <typename, typename> typename AggregateFunction>
 AggregateFunctionPtr create_aggregate_function_sequence_base(const std::string& name,
                                                              const DataTypes& argument_types,
-                                                             const bool result_is_nullable) {
+                                                             const bool result_is_nullable,
+                                                             const AggregateFunctionAttr& attr) {
     const auto arg_count = argument_types.size();
 
     if (arg_count < 4) {

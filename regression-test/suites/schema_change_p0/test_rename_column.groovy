@@ -40,6 +40,7 @@ suite ("test_rename_column") {
             `max_dwell_time` INT DEFAULT "0" COMMENT "用户最大停留时间",
             `min_dwell_time` INT DEFAULT "99999" COMMENT "用户最小停留时间")
         UNIQUE KEY(`user_id`, `date`, `city`, `age`, `sex`) DISTRIBUTED BY HASH(`user_id`)
+        BUCKETS 8
         PROPERTIES ( "replication_num" = "1" , "light_schema_change" = "false")
         """
     qt_desc """ desc ${tableName} """
@@ -55,7 +56,9 @@ suite ("test_rename_column") {
     sql """ sync """
 
     // alter and test light schema change
-    sql """ALTER TABLE ${tableName} SET ("light_schema_change" = "true");"""
+    if (!isCloudMode()) {
+        sql """ALTER TABLE ${tableName} SET ("light_schema_change" = "true");"""
+    }
 
     qt_select """ SELECT * FROM ${tableName} order by user_id ASC, last_visit_date """
 
@@ -120,11 +123,14 @@ suite ("test_rename_column") {
             `max_dwell_time` INT DEFAULT "0" COMMENT "用户最大停留时间",
             `min_dwell_time` INT DEFAULT "99999" COMMENT "用户最小停留时间")
         UNIQUE KEY(`user_id`, `date`, `city`, `age`, `sex`) DISTRIBUTED BY HASH(`user_id`)
+        BUCKETS 8
         PROPERTIES ( "replication_num" = "1" , "light_schema_change" = "false")
         """
-    test {
-        sql """ ALTER table ${tableName} RENAME COLUMN  date new_date """
-        exception "not implemented"
+    if (!isCloudMode()) {
+        test {
+            sql """ ALTER table ${tableName} RENAME COLUMN  date new_date """
+            exception "not implemented"
+        }
     }
     sql """ DROP TABLE ${tableName} """
 
@@ -142,7 +148,7 @@ suite ("test_rename_column") {
                 `hll_col` HLL HLL_UNION NOT NULL COMMENT "HLL列",
                 `bitmap_col` Bitmap BITMAP_UNION NOT NULL COMMENT "bitmap列")
             AGGREGATE KEY(`user_id`, `date`, `city`, `age`, `sex`) DISTRIBUTED BY HASH(`user_id`)
-            BUCKETS 1
+            BUCKETS 8
             PROPERTIES ( "replication_num" = "1", "light_schema_change" = "true" );
         """
     qt_desc """ desc ${tableName} """
@@ -209,7 +215,7 @@ suite ("test_rename_column") {
                 `hll_col` HLL HLL_UNION NOT NULL COMMENT "HLL列",
                 `bitmap_col` Bitmap BITMAP_UNION NOT NULL COMMENT "bitmap列")
             AGGREGATE KEY(`user_id`, `date`, `city`, `age`, `sex`) DISTRIBUTED BY HASH(`user_id`)
-            BUCKETS 1
+            BUCKETS 8
             PROPERTIES ( "replication_num" = "1", "light_schema_change" = "true" );
         """
 
@@ -230,8 +236,11 @@ suite ("test_rename_column") {
             }
         }
     }
+    String viewName = "renameColumnView1"
+    sql "create view ${viewName} (user_id, max_cost) as select user_id, max(cost) as max_cost from ${tableName} group by user_id"
 
     qt_select """ select user_id, cost from ${tableName} order by user_id """
+    qt_select """ select user_id, max_cost, "${viewName}" from ${viewName} order by user_id """
 
     sql """ INSERT INTO ${tableName} VALUES
             (1, '2017-10-01', 'Beijing', 10, 1, 1, 30, 20, hll_hash(1), to_bitmap(1))
@@ -259,9 +268,11 @@ suite ("test_rename_column") {
     qt_desc """ desc ${tableName} """
 
     qt_select""" select * from ${tableName} order by user_id """
+    qt_select """ select user_id, max_cost, "${viewName}" from ${viewName} order by user_id """
 
     qt_select """ select user_id, sum(cost) from ${tableName} group by user_id order by user_id """
 
+    sql """ DROP VIEW ${viewName} """
     sql """ DROP TABLE ${tableName} """
 
 }

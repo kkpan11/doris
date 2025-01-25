@@ -41,14 +41,23 @@ bool DataTypeDate::equals(const IDataType& rhs) const {
     return typeid(rhs) == typeid(*this);
 }
 
+size_t DataTypeDate::number_length() const {
+    return 10;
+}
+void DataTypeDate::push_number(ColumnString::Chars& chars, const Int64& num) const {
+    doris::VecDateTimeValue value = binary_cast<Int64, doris::VecDateTimeValue>(num);
+    char buf[64];
+    char* pos = value.to_string(buf);
+    // DateTime to_string the end is /0
+    chars.insert(buf, pos - 1);
+}
 std::string DataTypeDate::to_string(const IColumn& column, size_t row_num) const {
     auto result = check_column_const_set_readability(column, row_num);
     ColumnPtr ptr = result.first;
     row_num = result.second;
 
     Int64 int_val = assert_cast<const ColumnInt64&>(*ptr).get_element(row_num);
-    doris::vectorized::VecDateTimeValue value =
-            binary_cast<Int64, doris::vectorized::VecDateTimeValue>(int_val);
+    doris::VecDateTimeValue value = binary_cast<Int64, doris::VecDateTimeValue>(int_val);
 
     char buf[64];
     value.to_string(buf);
@@ -61,8 +70,7 @@ void DataTypeDate::to_string(const IColumn& column, size_t row_num, BufferWritab
     row_num = result.second;
 
     Int64 int_val = assert_cast<const ColumnInt64&>(*ptr).get_element(row_num);
-    doris::vectorized::VecDateTimeValue value =
-            binary_cast<Int64, doris::vectorized::VecDateTimeValue>(int_val);
+    doris::VecDateTimeValue value = binary_cast<Int64, doris::VecDateTimeValue>(int_val);
 
     char buf[64];
     char* pos = value.to_string(buf);

@@ -25,6 +25,7 @@ import org.apache.doris.mysql.MysqlPacket;
 
 // query state used to record state of query, maybe query status is better
 public class QueryState {
+    // Reused by arrow flight protocol
     public enum MysqlStateType {
         NOOP,   // send nothing to remote
         OK,     // send OK packet to remote
@@ -49,6 +50,7 @@ public class QueryState {
     // make it public for easy to use
     public int serverStatus = 0;
     public boolean isNereids = false;
+    private ShowResultSet rs = null;
 
     public QueryState() {
     }
@@ -63,10 +65,15 @@ public class QueryState {
         affectedRows = 0;
         warningRows = 0;
         isNereids = false;
+        rs = null;
     }
 
     public MysqlStateType getStateType() {
         return stateType;
+    }
+
+    public void setNoop() {
+        stateType = MysqlStateType.NOOP;
     }
 
     public void setEof() {
@@ -88,8 +95,7 @@ public class QueryState {
     }
 
     public void setError(String errorMsg) {
-        this.stateType = MysqlStateType.ERR;
-        this.errorMessage = errorMsg;
+        this.setError(ErrorCode.ERR_UNKNOWN_ERROR, errorMsg);
     }
 
     public void setError(ErrorCode code, String msg) {
@@ -144,6 +150,14 @@ public class QueryState {
 
     public boolean isNereids() {
         return isNereids;
+    }
+
+    public void setResultSet(ShowResultSet rs) {
+        this.rs = rs;
+    }
+
+    public ShowResultSet getResultSet() {
+        return this.rs;
     }
 
     public MysqlPacket toResponsePacket() {

@@ -17,7 +17,6 @@
 
 package org.apache.doris.analysis;
 
-import org.apache.doris.cluster.ClusterNamespace;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.UserException;
@@ -30,7 +29,7 @@ import com.google.common.base.Strings;
   syntax:
       RESUME ROUTINE LOAD [database.]name
  */
-public class ResumeRoutineLoadStmt extends DdlStmt {
+public class ResumeRoutineLoadStmt extends DdlStmt implements NotFallbackInParser {
 
     private final LabelName labelName;
     private String db;
@@ -61,7 +60,12 @@ public class ResumeRoutineLoadStmt extends DdlStmt {
             if (Strings.isNullOrEmpty(analyzer.getDefaultDb())) {
                 ErrorReport.reportAnalysisException(ErrorCode.ERR_NO_DB_ERROR);
             }
-            db = ClusterNamespace.getFullName(analyzer.getClusterName(), analyzer.getDefaultDb());
+            db = analyzer.getDefaultDb();
         }
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.RESUME;
     }
 }

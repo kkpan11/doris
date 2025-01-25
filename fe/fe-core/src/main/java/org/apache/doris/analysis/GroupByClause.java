@@ -19,6 +19,7 @@ package org.apache.doris.analysis;
 
 import org.apache.doris.catalog.Type;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.qe.ConnectContext;
 
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicates;
@@ -124,6 +125,9 @@ public class GroupByClause implements ParseNode {
             try {
                 genGroupingExprs();
             } catch (AnalysisException e) {
+                if (ConnectContext.get() != null) {
+                    ConnectContext.get().getState().reset();
+                }
                 LOG.error("gen grouping expr error:", e);
                 return null;
             }
@@ -186,6 +190,11 @@ public class GroupByClause implements ParseNode {
                 // reference the original expr in the error msg
                 throw new AnalysisException(
                         "GROUP BY expression must not contain aggregate functions: "
+                                + groupingExpr.toSql());
+            }
+            if (groupingExpr.contains(GroupingFunctionCallExpr.class)) {
+                throw new AnalysisException(
+                        "GROUP BY expression must not contain grouping scalar functions: "
                                 + groupingExpr.toSql());
             }
             if (groupingExpr.contains(AnalyticExpr.class)) {

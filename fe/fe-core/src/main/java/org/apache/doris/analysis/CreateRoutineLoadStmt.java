@@ -34,10 +34,13 @@ import org.apache.doris.load.routineload.AbstractDataSourceProperties;
 import org.apache.doris.load.routineload.RoutineLoadDataSourcePropertyFactory;
 import org.apache.doris.load.routineload.RoutineLoadJob;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.OriginStatement;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Maps;
+import lombok.Getter;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -85,13 +88,15 @@ import java.util.function.Predicate;
       type of routine load:
           KAFKA
 */
-public class CreateRoutineLoadStmt extends DdlStmt {
+public class CreateRoutineLoadStmt extends DdlStmt implements NotFallbackInParser {
     private static final Logger LOG = LogManager.getLogger(CreateRoutineLoadStmt.class);
 
     // routine load properties
     public static final String DESIRED_CONCURRENT_NUMBER_PROPERTY = "desired_concurrent_number";
+    public static final String CURRENT_CONCURRENT_NUMBER_PROPERTY = "current_concurrent_number";
     // max error number in ten thousand records
     public static final String MAX_ERROR_NUMBER_PROPERTY = "max_error_number";
+    public static final String MAX_FILTER_RATIO_PROPERTY = "max_filter_ratio";
     // the following 3 properties limit the time and batch size of a single routine load task
     public static final String MAX_BATCH_INTERVAL_SEC_PROPERTY = "max_batch_interval";
     public static final String MAX_BATCH_ROWS_PROPERTY = "max_batch_rows";
@@ -105,6 +110,10 @@ public class CreateRoutineLoadStmt extends DdlStmt {
     public static final String NUM_AS_STRING = "num_as_string";
     public static final String FUZZY_PARSE = "fuzzy_parse";
 
+    public static final String PARTIAL_COLUMNS = "partial_columns";
+
+    public static final String WORKLOAD_GROUP = "workload_group";
+
     private static final String NAME_TYPE = "ROUTINE LOAD NAME";
     public static final String ENDPOINT_REGEX = "[-A-Za-z0-9+&@#/%?=~_|!:,.;]+[-A-Za-z0-9+&@#/%=~_|]";
     public static final String SEND_BATCH_PARALLELISM = "send_batch_parallelism";
@@ -116,6 +125,7 @@ public class CreateRoutineLoadStmt extends DdlStmt {
     private static final ImmutableSet<String> PROPERTIES_SET = new ImmutableSet.Builder<String>()
             .add(DESIRED_CONCURRENT_NUMBER_PROPERTY)
             .add(MAX_ERROR_NUMBER_PROPERTY)
+            .add(MAX_FILTER_RATIO_PROPERTY)
             .add(MAX_BATCH_INTERVAL_SEC_PROPERTY)
             .add(MAX_BATCH_ROWS_PROPERTY)
             .add(MAX_BATCH_SIZE_PROPERTY)
@@ -130,10 +140,14 @@ public class CreateRoutineLoadStmt extends DdlStmt {
             .add(EXEC_MEM_LIMIT_PROPERTY)
             .add(SEND_BATCH_PARALLELISM)
             .add(LOAD_TO_SINGLE_TABLET)
+            .add(PARTIAL_COLUMNS)
+            .add(WORKLOAD_GROUP)
+            .add(LoadStmt.KEY_ENCLOSE)
+            .add(LoadStmt.KEY_ESCAPE)
             .build();
 
     private final LabelName labelName;
-    private final String tableName;
+    private String tableName;
     private final List<ParseNode> loadPropertyList;
     private final Map<String, String> jobProperties;
     private final String typeName;
@@ -145,6 +159,7 @@ public class CreateRoutineLoadStmt extends DdlStmt {
     private RoutineLoadDesc routineLoadDesc;
     private int desiredConcurrentNum = 1;
     private long maxErrorNum = -1;
+    private double maxFilterRatio = -1;
     private long maxBatchIntervalS = -1;
     private long maxBatchRows = -1;
     private long maxBatchSizeBytes = -1;
@@ -156,8 +171,8 @@ public class CreateRoutineLoadStmt extends DdlStmt {
     /**
      * RoutineLoad support json data.
      * Require Params:
-     *   1) dataFormat = "json"
-     *   2) jsonPaths = "$.XXX.xxx"
+     * 1) dataFormat = "json"
+     * 2) jsonPaths = "$.XXX.xxx"
      */
     private String format = ""; //default is csv.
     private String jsonPaths = "";
@@ -166,15 +181,31 @@ public class CreateRoutineLoadStmt extends DdlStmt {
     private boolean numAsString = false;
     private boolean fuzzyParse = false;
 
+    private byte enclose;
+
+    private byte escape;
+
+    private long workloadGroupId = -1;
+
+    /**
+     * support partial columns load(Only Unique Key Columns)
+     */
+    @Getter
+    private boolean isPartialUpdate = false;
+
     private String comment = "";
 
     private LoadTask.MergeType mergeType;
 
+    private boolean isMultiTable = false;
+
     public static final Predicate<Long> DESIRED_CONCURRENT_NUMBER_PRED = (v) -> v > 0L;
     public static final Predicate<Long> MAX_ERROR_NUMBER_PRED = (v) -> v >= 0L;
-    public static final Predicate<Long> MAX_BATCH_INTERVAL_PRED = (v) -> v >= 5 && v <= 60;
+    public static final Predicate<Double> MAX_FILTER_RATIO_PRED = (v) -> v >= 0 && v <= 1;
+    public static final Predicate<Long> MAX_BATCH_INTERVAL_PRED = (v) -> v >= 1;
     public static final Predicate<Long> MAX_BATCH_ROWS_PRED = (v) -> v >= 200000;
-    public static final Predicate<Long> MAX_BATCH_SIZE_PRED = (v) -> v >= 100 * 1024 * 1024 && v <= 1024 * 1024 * 1024;
+    public static final Predicate<Long> MAX_BATCH_SIZE_PRED = (v) -> v >= 100 * 1024 * 1024
+                                                            && v <= (long) (1024 * 1024 * 1024) * 10;
     public static final Predicate<Long> EXEC_MEM_LIMIT_PRED = (v) -> v >= 0L;
     public static final Predicate<Long> SEND_BATCH_PARALLELISM_PRED = (v) -> v > 0L;
 
@@ -183,16 +214,65 @@ public class CreateRoutineLoadStmt extends DdlStmt {
                                  Map<String, String> dataSourceProperties, LoadTask.MergeType mergeType,
                                  String comment) {
         this.labelName = labelName;
+        if (StringUtils.isBlank(tableName)) {
+            this.isMultiTable = true;
+        }
         this.tableName = tableName;
         this.loadPropertyList = loadPropertyList;
         this.jobProperties = jobProperties == null ? Maps.newHashMap() : jobProperties;
         this.typeName = typeName.toUpperCase();
         this.dataSourceProperties = RoutineLoadDataSourcePropertyFactory
-                .createDataSource(typeName, dataSourceProperties);
+                .createDataSource(typeName, dataSourceProperties, this.isMultiTable);
         this.mergeType = mergeType;
+        this.isPartialUpdate = this.jobProperties.getOrDefault(PARTIAL_COLUMNS, "false").equalsIgnoreCase("true");
         if (comment != null) {
             this.comment = comment;
         }
+    }
+
+    /*
+     * make stmt by nereids
+     */
+    public CreateRoutineLoadStmt(LabelName labelName, String dbName, String name, String tableName,
+            List<ParseNode> loadPropertyList, OriginStatement origStmt, UserIdentity userIdentity,
+            Map<String, String> jobProperties, String typeName, RoutineLoadDesc routineLoadDesc,
+            int desireTaskConcurrentNum, long maxErrorNum, double maxFilterRatio, long maxBatchIntervalS,
+            long maxBatchRows, long maxBatchSizeBytes, long execMemLimit, int sendBatchParallelism, String timezone,
+            String format, String jsonPaths, String jsonRoot, byte enclose, byte escape, long workloadGroupId,
+            boolean loadToSingleTablet, boolean strictMode, boolean isPartialUpdate, boolean stripOuterArray,
+            boolean numAsString, boolean fuzzyParse, AbstractDataSourceProperties dataSourceProperties) {
+        this.labelName = labelName;
+        this.dbName = dbName;
+        this.name = name;
+        this.tableName = tableName;
+        this.loadPropertyList = loadPropertyList;
+        this.setOrigStmt(origStmt);
+        this.setUserInfo(userIdentity);
+        this.jobProperties = jobProperties;
+        this.typeName = typeName;
+        this.routineLoadDesc = routineLoadDesc;
+        this.desiredConcurrentNum = desireTaskConcurrentNum;
+        this.maxErrorNum = maxErrorNum;
+        this.maxFilterRatio = maxFilterRatio;
+        this.maxBatchIntervalS = maxBatchIntervalS;
+        this.maxBatchRows = maxBatchRows;
+        this.maxBatchSizeBytes = maxBatchSizeBytes;
+        this.execMemLimit = execMemLimit;
+        this.sendBatchParallelism = sendBatchParallelism;
+        this.timezone = timezone;
+        this.format = format;
+        this.jsonPaths = jsonPaths;
+        this.jsonRoot = jsonRoot;
+        this.enclose = enclose;
+        this.escape = escape;
+        this.workloadGroupId = workloadGroupId;
+        this.loadToSingleTablet = loadToSingleTablet;
+        this.strictMode = strictMode;
+        this.isPartialUpdate = isPartialUpdate;
+        this.stripOuterArray = stripOuterArray;
+        this.numAsString = numAsString;
+        this.fuzzyParse = fuzzyParse;
+        this.dataSourceProperties = dataSourceProperties;
     }
 
     public String getName() {
@@ -221,6 +301,10 @@ public class CreateRoutineLoadStmt extends DdlStmt {
 
     public long getMaxErrorNum() {
         return maxErrorNum;
+    }
+
+    public double getMaxFilterRatio() {
+        return maxFilterRatio;
     }
 
     public long getMaxBatchIntervalS() {
@@ -275,6 +359,14 @@ public class CreateRoutineLoadStmt extends DdlStmt {
         return jsonPaths;
     }
 
+    public byte getEnclose() {
+        return enclose;
+    }
+
+    public byte getEscape() {
+        return escape;
+    }
+
     public String getJsonRoot() {
         return jsonRoot;
     }
@@ -291,13 +383,24 @@ public class CreateRoutineLoadStmt extends DdlStmt {
         return comment;
     }
 
+    public long getWorkloadGroupId() {
+        return workloadGroupId;
+    }
+
     @Override
     public void analyze(Analyzer analyzer) throws UserException {
         super.analyze(analyzer);
         // check dbName and tableName
         checkDBTable(analyzer);
         // check name
-        FeNameFormat.checkCommonName(NAME_TYPE, name);
+        try {
+            FeNameFormat.checkCommonName(NAME_TYPE, name);
+        } catch (AnalysisException e) {
+            // 64 is the length of regular expression matching
+            // (FeNameFormat.COMMON_NAME_REGEX/UNDERSCORE_COMMON_NAME_REGEX)
+            throw new AnalysisException(e.getMessage()
+                    + " Maybe routine load job name is longer than 64 or contains illegal characters");
+        }
         // check load properties include column separator etc.
         checkLoadProperties();
         // check routine load job properties include desired concurrent number etc.
@@ -316,10 +419,16 @@ public class CreateRoutineLoadStmt extends DdlStmt {
         labelName.analyze(analyzer);
         dbName = labelName.getDbName();
         name = labelName.getLabelName();
+        Database db = Env.getCurrentInternalCatalog().getDbOrAnalysisException(dbName);
+        if (isPartialUpdate && isMultiTable) {
+            throw new AnalysisException("Partial update is not supported in multi-table load.");
+        }
+        if (isMultiTable) {
+            return;
+        }
         if (Strings.isNullOrEmpty(tableName)) {
             throw new AnalysisException("Table name should not be null");
         }
-        Database db = Env.getCurrentInternalCatalog().getDbOrAnalysisException(dbName);
         Table table = db.getTableOrAnalysisException(tableName);
         if (mergeType != LoadTask.MergeType.APPEND
                 && (table.getType() != Table.TableType.OLAP
@@ -329,6 +438,9 @@ public class CreateRoutineLoadStmt extends DdlStmt {
         if (mergeType != LoadTask.MergeType.APPEND
                 && !(table.getType() == Table.TableType.OLAP && ((OlapTable) table).hasDeleteSign())) {
             throw new AnalysisException("load by MERGE or DELETE need to upgrade table to support batch delete.");
+        }
+        if (isPartialUpdate && !((OlapTable) table).getEnableUniqueKeyMergeOnWrite()) {
+            throw new AnalysisException("load by PARTIAL_COLUMNS is only supported in unique table MoW");
         }
     }
 
@@ -352,6 +464,9 @@ public class CreateRoutineLoadStmt extends DdlStmt {
                     columnSeparator = (Separator) parseNode;
                     columnSeparator.analyze(null);
                 } else if (parseNode instanceof ImportColumnsStmt) {
+                    if (isMultiTable) {
+                        throw new AnalysisException("Multi-table load does not support setting columns info");
+                    }
                     // check columns info
                     if (importColumnsStmt != null) {
                         throw new AnalysisException("repeat setting of columns info");
@@ -361,6 +476,9 @@ public class CreateRoutineLoadStmt extends DdlStmt {
                     // check where expr
                     ImportWhereStmt node = (ImportWhereStmt) parseNode;
                     if (node.isPreceding()) {
+                        if (isMultiTable) {
+                            throw new AnalysisException("Multi-table load does not support setting columns info");
+                        }
                         if (precedingImportWhereStmt != null) {
                             throw new AnalysisException("repeat setting of preceding where predicate");
                         }
@@ -394,9 +512,9 @@ public class CreateRoutineLoadStmt extends DdlStmt {
             }
         }
         routineLoadDesc = new RoutineLoadDesc(columnSeparator, lineDelimiter, importColumnsStmt,
-                        precedingImportWhereStmt, importWhereStmt,
-                        partitionNames, importDeleteOnStmt == null ? null : importDeleteOnStmt.getExpr(), mergeType,
-                        importSequenceStmt == null ? null : importSequenceStmt.getSequenceColName());
+                precedingImportWhereStmt, importWhereStmt,
+                partitionNames, importDeleteOnStmt == null ? null : importDeleteOnStmt.getExpr(), mergeType,
+                importSequenceStmt == null ? null : importSequenceStmt.getSequenceColName());
     }
 
     private void checkJobProperties() throws UserException {
@@ -409,15 +527,19 @@ public class CreateRoutineLoadStmt extends DdlStmt {
         desiredConcurrentNum = ((Long) Util.getLongPropertyOrDefault(
                 jobProperties.get(DESIRED_CONCURRENT_NUMBER_PROPERTY),
                 Config.max_routine_load_task_concurrent_num, DESIRED_CONCURRENT_NUMBER_PRED,
-                DESIRED_CONCURRENT_NUMBER_PROPERTY + " should > 0")).intValue();
+                DESIRED_CONCURRENT_NUMBER_PROPERTY + " must be greater than 0")).intValue();
 
         maxErrorNum = Util.getLongPropertyOrDefault(jobProperties.get(MAX_ERROR_NUMBER_PROPERTY),
                 RoutineLoadJob.DEFAULT_MAX_ERROR_NUM, MAX_ERROR_NUMBER_PRED,
                 MAX_ERROR_NUMBER_PROPERTY + " should >= 0");
 
+        maxFilterRatio = Util.getDoublePropertyOrDefault(jobProperties.get(MAX_FILTER_RATIO_PROPERTY),
+                RoutineLoadJob.DEFAULT_MAX_FILTER_RATIO, MAX_FILTER_RATIO_PRED,
+                MAX_FILTER_RATIO_PROPERTY + " should between 0 and 1");
+
         maxBatchIntervalS = Util.getLongPropertyOrDefault(jobProperties.get(MAX_BATCH_INTERVAL_SEC_PROPERTY),
                 RoutineLoadJob.DEFAULT_MAX_INTERVAL_SECOND, MAX_BATCH_INTERVAL_PRED,
-                MAX_BATCH_INTERVAL_SEC_PROPERTY + " should between 5 and 60");
+                MAX_BATCH_INTERVAL_SEC_PROPERTY + " should >= 1");
 
         maxBatchRows = Util.getLongPropertyOrDefault(jobProperties.get(MAX_BATCH_ROWS_PROPERTY),
                 RoutineLoadJob.DEFAULT_MAX_BATCH_ROWS, MAX_BATCH_ROWS_PRED,
@@ -425,20 +547,44 @@ public class CreateRoutineLoadStmt extends DdlStmt {
 
         maxBatchSizeBytes = Util.getLongPropertyOrDefault(jobProperties.get(MAX_BATCH_SIZE_PROPERTY),
                 RoutineLoadJob.DEFAULT_MAX_BATCH_SIZE, MAX_BATCH_SIZE_PRED,
-                MAX_BATCH_SIZE_PROPERTY + " should between 100MB and 1GB");
+                MAX_BATCH_SIZE_PROPERTY + " should between 100MB and 10GB");
 
         strictMode = Util.getBooleanPropertyOrDefault(jobProperties.get(LoadStmt.STRICT_MODE),
                 RoutineLoadJob.DEFAULT_STRICT_MODE,
                 LoadStmt.STRICT_MODE + " should be a boolean");
         execMemLimit = Util.getLongPropertyOrDefault(jobProperties.get(EXEC_MEM_LIMIT_PROPERTY),
-                RoutineLoadJob.DEFAULT_EXEC_MEM_LIMIT, EXEC_MEM_LIMIT_PRED, EXEC_MEM_LIMIT_PROPERTY + "should > 0");
+                RoutineLoadJob.DEFAULT_EXEC_MEM_LIMIT, EXEC_MEM_LIMIT_PRED,
+                EXEC_MEM_LIMIT_PROPERTY + " must be greater than 0");
 
         sendBatchParallelism = ((Long) Util.getLongPropertyOrDefault(jobProperties.get(SEND_BATCH_PARALLELISM),
                 ConnectContext.get().getSessionVariable().getSendBatchParallelism(), SEND_BATCH_PARALLELISM_PRED,
-                SEND_BATCH_PARALLELISM + " should > 0")).intValue();
+                SEND_BATCH_PARALLELISM + " must be greater than 0")).intValue();
         loadToSingleTablet = Util.getBooleanPropertyOrDefault(jobProperties.get(LoadStmt.LOAD_TO_SINGLE_TABLET),
                 RoutineLoadJob.DEFAULT_LOAD_TO_SINGLE_TABLET,
                 LoadStmt.LOAD_TO_SINGLE_TABLET + " should be a boolean");
+
+        String encloseStr = jobProperties.get(LoadStmt.KEY_ENCLOSE);
+        if (encloseStr != null) {
+            if (encloseStr.length() != 1) {
+                throw new AnalysisException("enclose must be single-char");
+            } else {
+                enclose = encloseStr.getBytes()[0];
+            }
+        }
+        String escapeStr = jobProperties.get(LoadStmt.KEY_ESCAPE);
+        if (escapeStr != null) {
+            if (escapeStr.length() != 1) {
+                throw new AnalysisException("enclose must be single-char");
+            } else {
+                escape = escapeStr.getBytes()[0];
+            }
+        }
+
+        String inputWorkloadGroupStr = jobProperties.get(WORKLOAD_GROUP);
+        if (!StringUtils.isEmpty(inputWorkloadGroupStr)) {
+            this.workloadGroupId = Env.getCurrentEnv().getWorkloadGroupMgr()
+                    .getWorkloadGroup(ConnectContext.get().getCurrentUserIdentity(), inputWorkloadGroupStr);
+        }
 
         if (ConnectContext.get() != null) {
             timezone = ConnectContext.get().getSessionVariable().getTimeZone();
@@ -467,5 +613,10 @@ public class CreateRoutineLoadStmt extends DdlStmt {
     private void checkDataSourceProperties() throws UserException {
         this.dataSourceProperties.setTimezone(this.timezone);
         this.dataSourceProperties.analyze();
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.CREATE;
     }
 }

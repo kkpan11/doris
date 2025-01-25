@@ -18,38 +18,55 @@
 #include "olap/memtable_flush_executor.h"
 
 #include <gen_cpp/olap_file.pb.h>
-#include <stddef.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <ostream>
 
 #include "common/config.h"
 #include "common/logging.h"
+#include "common/signal_handler.h"
 #include "olap/memtable.h"
+#include "olap/rowset/rowset_writer.h"
+#include "util/debug_points.h"
+#include "util/doris_metrics.h"
+#include "util/metrics.h"
 #include "util/stopwatch.hpp"
 #include "util/time.h"
 
 namespace doris {
 using namespace ErrorCode;
 
-class MemtableFlushTask final : public Runnable {
-public:
-    MemtableFlushTask(FlushToken* flush_token, std::unique_ptr<MemTable> memtable,
-                      int64_t submit_task_time)
-            : _flush_token(flush_token),
-              _memtable(std::move(memtable)),
-              _submit_task_time(submit_task_time) {}
+bvar::Adder<int64_t> g_flush_task_num("memtable_flush_task_num");
 
-    ~MemtableFlushTask() override = default;
+class MemtableFlushTask final : public Runnable {
+    ENABLE_FACTORY_CREATOR(MemtableFlushTask);
+
+public:
+    MemtableFlushTask(std::shared_ptr<FlushToken> flush_token, std::shared_ptr<MemTable> memtable,
+                      int32_t segment_id, int64_t submit_task_time)
+            : _flush_token(flush_token),
+              _memtable(memtable),
+              _segment_id(segment_id),
+              _submit_task_time(submit_task_time) {
+        g_flush_task_num << 1;
+    }
+
+    ~MemtableFlushTask() override { g_flush_task_num << -1; }
 
     void run() override {
-        _flush_token->_flush_memtable(_memtable.get(), _submit_task_time);
-        _memtable.reset();
+        auto token = _flush_token.lock();
+        if (token) {
+            token->_flush_memtable(_memtable, _segment_id, _submit_task_time);
+        } else {
+            LOG(WARNING) << "flush token is deconstructed, ignore the flush task";
+        }
     }
 
 private:
-    FlushToken* _flush_token;
-    std::unique_ptr<MemTable> _memtable;
+    std::weak_ptr<FlushToken> _flush_token;
+    std::shared_ptr<MemTable> _memtable;
+    int32_t _segment_id;
     int64_t _submit_task_time;
 };
 
@@ -63,45 +80,128 @@ std::ostream& operator<<(std::ostream& os, const FlushStatistic& stat) {
     return os;
 }
 
-Status FlushToken::submit(std::unique_ptr<MemTable> mem_table) {
-    auto s = _flush_status.load();
-    if (s != OK) {
-        return Status::Error(s);
+Status FlushToken::submit(std::shared_ptr<MemTable> mem_table) {
+    {
+        std::shared_lock rdlk(_flush_status_lock);
+        DBUG_EXECUTE_IF("FlushToken.submit_flush_error", {
+            _flush_status = Status::IOError<false>("dbug_be_memtable_submit_flush_error");
+        });
+        if (!_flush_status.ok()) {
+            return _flush_status;
+        }
+    }
+
+    if (mem_table == nullptr || mem_table->empty()) {
+        return Status::OK();
     }
     int64_t submit_task_time = MonotonicNanos();
-    auto task = std::make_shared<MemtableFlushTask>(this, std::move(mem_table), submit_task_time);
-    _stats.flush_running_count++;
-    return _flush_token->submit(std::move(task));
+    auto task = MemtableFlushTask::create_shared(
+            shared_from_this(), mem_table, _rowset_writer->allocate_segment_id(), submit_task_time);
+    // NOTE: we should guarantee WorkloadGroup is not deconstructed when submit memtable flush task.
+    // because currently WorkloadGroup's can only be destroyed when all queries in the group is finished,
+    // but not consider whether load channel is finish.
+    std::shared_ptr<WorkloadGroup> wg_sptr = _wg_wptr.lock();
+    ThreadPool* wg_thread_pool = nullptr;
+    if (wg_sptr) {
+        wg_thread_pool = wg_sptr->get_memtable_flush_pool_ptr();
+    }
+    Status ret = wg_thread_pool ? wg_thread_pool->submit(std::move(task))
+                                : _thread_pool->submit(std::move(task));
+    if (ret.ok()) {
+        // _wait_running_task_finish was executed after this function, so no need to notify _cond here
+        _stats.flush_running_count++;
+    }
+    return ret;
+}
+
+// NOTE: FlushToken's submit/cancel/wait run in one thread,
+// so we don't need to make them mutually exclusive, std::atomic is enough.
+void FlushToken::_wait_running_task_finish() {
+    std::unique_lock<std::mutex> lock(_mutex);
+    _cond.wait(lock, [&]() { return _stats.flush_running_count.load() == 0; });
 }
 
 void FlushToken::cancel() {
-    _flush_token->shutdown();
+    _shutdown_flush_token();
+    _wait_running_task_finish();
 }
 
 Status FlushToken::wait() {
-    _flush_token->wait();
-    auto s = _flush_status.load();
-    return s == OK ? Status::OK() : Status::Error(s);
+    _wait_running_task_finish();
+    {
+        std::shared_lock rdlk(_flush_status_lock);
+        if (!_flush_status.ok()) {
+            return _flush_status;
+        }
+    }
+    return Status::OK();
 }
 
-void FlushToken::_flush_memtable(MemTable* memtable, int64_t submit_task_time) {
+Status FlushToken::_do_flush_memtable(MemTable* memtable, int32_t segment_id, int64_t* flush_size) {
+    VLOG_CRITICAL << "begin to flush memtable for tablet: " << memtable->tablet_id()
+                  << ", memsize: " << memtable->memory_usage()
+                  << ", rows: " << memtable->stat().raw_rows;
+    memtable->update_mem_type(MemType::FLUSH);
+    int64_t duration_ns;
+    SCOPED_RAW_TIMER(&duration_ns);
+    SCOPED_ATTACH_TASK(memtable->query_thread_context());
+    signal::set_signal_task_id(_rowset_writer->load_id());
+    signal::tablet_id = memtable->tablet_id();
+    {
+        SCOPED_CONSUME_MEM_TRACKER(memtable->mem_tracker());
+        std::unique_ptr<vectorized::Block> block;
+        RETURN_IF_ERROR(memtable->to_block(&block));
+        RETURN_IF_ERROR(_rowset_writer->flush_memtable(block.get(), segment_id, flush_size));
+    }
+    memtable->set_flush_success();
+    _memtable_stat += memtable->stat();
+    DorisMetrics::instance()->memtable_flush_total->increment(1);
+    DorisMetrics::instance()->memtable_flush_duration_us->increment(duration_ns / 1000);
+    VLOG_CRITICAL << "after flush memtable for tablet: " << memtable->tablet_id()
+                  << ", flushsize: " << *flush_size;
+    return Status::OK();
+}
+
+void FlushToken::_flush_memtable(std::shared_ptr<MemTable> memtable_ptr, int32_t segment_id,
+                                 int64_t submit_task_time) {
+    Defer defer {[&]() {
+        std::lock_guard<std::mutex> lock(_mutex);
+        _stats.flush_running_count--;
+        if (_stats.flush_running_count == 0) {
+            _cond.notify_one();
+        }
+    }};
+    if (_is_shutdown()) {
+        return;
+    }
     uint64_t flush_wait_time_ns = MonotonicNanos() - submit_task_time;
     _stats.flush_wait_time_ns += flush_wait_time_ns;
     // If previous flush has failed, return directly
-    if (_flush_status.load() != OK) {
-        return;
+    {
+        std::shared_lock rdlk(_flush_status_lock);
+        if (!_flush_status.ok()) {
+            return;
+        }
     }
 
     MonotonicStopWatch timer;
     timer.start();
-    size_t memory_usage = memtable->memory_usage();
-    Status s = memtable->flush();
-    if (!s) {
-        LOG(WARNING) << "Flush memtable failed with res = " << s;
-        // If s is not ok, ignore the code, just use other code is ok
-        _flush_status.store(s.code());
+    size_t memory_usage = memtable_ptr->memory_usage();
+
+    int64_t flush_size;
+    Status s = _do_flush_memtable(memtable_ptr.get(), segment_id, &flush_size);
+
+    {
+        std::shared_lock rdlk(_flush_status_lock);
+        if (!_flush_status.ok()) {
+            return;
+        }
     }
-    if (_flush_status.load() != OK) {
+    if (!s.ok()) {
+        std::lock_guard wrlk(_flush_status_lock);
+        LOG(WARNING) << "Flush memtable failed with res = " << s
+                     << ", load_id: " << print_id(_rowset_writer->load_id());
+        _flush_status = s;
         return;
     }
 
@@ -109,57 +209,54 @@ void FlushToken::_flush_memtable(MemTable* memtable, int64_t submit_task_time) {
                   << "(ns), flush memtable cost: " << timer.elapsed_time()
                   << "(ns), running count: " << _stats.flush_running_count
                   << ", finish count: " << _stats.flush_finish_count
-                  << ", mem size: " << memory_usage << ", disk size: " << memtable->flush_size();
+                  << ", mem size: " << memory_usage << ", disk size: " << flush_size;
     _stats.flush_time_ns += timer.elapsed_time();
     _stats.flush_finish_count++;
-    _stats.flush_running_count--;
-    _stats.flush_size_bytes += memtable->memory_usage();
-    _stats.flush_disk_size_bytes += memtable->flush_size();
+    _stats.flush_size_bytes += memtable_ptr->memory_usage();
+    _stats.flush_disk_size_bytes += flush_size;
 }
 
-void MemTableFlushExecutor::init(const std::vector<DataDir*>& data_dirs) {
-    int32_t data_dir_num = data_dirs.size();
-    size_t min_threads = std::max(1, config::flush_thread_num_per_store);
-    size_t max_threads = data_dir_num * min_threads;
-    ThreadPoolBuilder("MemTableFlushThreadPool")
-            .set_min_threads(min_threads)
-            .set_max_threads(max_threads)
-            .build(&_flush_pool);
+void MemTableFlushExecutor::init(int num_disk) {
+    num_disk = std::max(1, num_disk);
+    int num_cpus = std::thread::hardware_concurrency();
+    int min_threads = std::max(1, config::flush_thread_num_per_store);
+    int max_threads = num_cpus == 0 ? num_disk * min_threads
+                                    : std::min(num_disk * min_threads,
+                                               num_cpus * config::max_flush_thread_num_per_cpu);
+    static_cast<void>(ThreadPoolBuilder("MemTableFlushThreadPool")
+                              .set_min_threads(min_threads)
+                              .set_max_threads(max_threads)
+                              .build(&_flush_pool));
 
     min_threads = std::max(1, config::high_priority_flush_thread_num_per_store);
-    max_threads = data_dir_num * min_threads;
-    ThreadPoolBuilder("MemTableHighPriorityFlushThreadPool")
-            .set_min_threads(min_threads)
-            .set_max_threads(max_threads)
-            .build(&_high_prio_flush_pool);
+    max_threads = num_cpus == 0 ? num_disk * min_threads
+                                : std::min(num_disk * min_threads,
+                                           num_cpus * config::max_flush_thread_num_per_cpu);
+    static_cast<void>(ThreadPoolBuilder("MemTableHighPriorityFlushThreadPool")
+                              .set_min_threads(min_threads)
+                              .set_max_threads(max_threads)
+                              .build(&_high_prio_flush_pool));
 }
 
 // NOTE: we use SERIAL mode here to ensure all mem-tables from one tablet are flushed in order.
-Status MemTableFlushExecutor::create_flush_token(std::unique_ptr<FlushToken>* flush_token,
-                                                 RowsetTypePB rowset_type, bool should_serial,
-                                                 bool is_high_priority) {
-    if (!is_high_priority) {
-        if (rowset_type == BETA_ROWSET && !should_serial) {
-            // beta rowset can be flush in CONCURRENT, because each memtable using a new segment writer.
-            flush_token->reset(
-                    new FlushToken(_flush_pool->new_token(ThreadPool::ExecutionMode::CONCURRENT)));
-        } else {
-            // alpha rowset do not support flush in CONCURRENT.
-            flush_token->reset(
-                    new FlushToken(_flush_pool->new_token(ThreadPool::ExecutionMode::SERIAL)));
-        }
-    } else {
-        if (rowset_type == BETA_ROWSET && !should_serial) {
-            // beta rowset can be flush in CONCURRENT, because each memtable using a new segment writer.
-            flush_token->reset(new FlushToken(
-                    _high_prio_flush_pool->new_token(ThreadPool::ExecutionMode::CONCURRENT)));
-        } else {
-            // alpha rowset do not support flush in CONCURRENT.
-            flush_token->reset(new FlushToken(
-                    _high_prio_flush_pool->new_token(ThreadPool::ExecutionMode::SERIAL)));
-        }
+Status MemTableFlushExecutor::create_flush_token(std::shared_ptr<FlushToken>& flush_token,
+                                                 std::shared_ptr<RowsetWriter> rowset_writer,
+                                                 bool is_high_priority,
+                                                 std::shared_ptr<WorkloadGroup> wg_sptr) {
+    switch (rowset_writer->type()) {
+    case ALPHA_ROWSET:
+        // alpha rowset do not support flush in CONCURRENT.  and not support alpha rowset now.
+        return Status::InternalError<false>("not support alpha rowset load now.");
+    case BETA_ROWSET: {
+        // beta rowset can be flush in CONCURRENT, because each memtable using a new segment writer.
+        ThreadPool* pool = is_high_priority ? _high_prio_flush_pool.get() : _flush_pool.get();
+        flush_token = FlushToken::create_shared(pool, wg_sptr);
+        flush_token->set_rowset_writer(rowset_writer);
+        return Status::OK();
     }
-    return Status::OK();
+    default:
+        return Status::InternalError<false>("unknown rowset type.");
+    }
 }
 
 } // namespace doris

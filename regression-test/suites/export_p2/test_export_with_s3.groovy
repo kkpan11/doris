@@ -16,12 +16,16 @@
 // under the License.
 
 suite("test_export_with_s3", "p2") {
+    // open nereids
+    sql """ set enable_nereids_planner=true """
+    sql """ set enable_fallback_to_original_planner=false """
+
     
     String ak = getS3AK()
     String sk = getS3SK()
     String s3_endpoint = getS3Endpoint()
     String region = getS3Region()
-    String bucket = context.config.otherConfigs.get("s3ExportBucketName");
+    String bucket = context.config.otherConfigs.get("s3BucketName");
 
     def table_export_name = "test_export_with_s3"
     // create table and insert
@@ -38,7 +42,8 @@ suite("test_export_with_s3", "p2") {
             PARTITION between_20_70 VALUES [("20"),("70")),
             PARTITION more_than_70 VALUES LESS THAN ("151")
         )
-        DISTRIBUTED BY HASH(id) PROPERTIES("replication_num" = "1");
+        DISTRIBUTED BY HASH(id) BUCKETS 3
+        PROPERTIES("replication_num" = "1");
     """
     StringBuilder sb = new StringBuilder()
     int i = 1
@@ -63,9 +68,9 @@ suite("test_export_with_s3", "p2") {
             if (res[0][2] == "FINISHED") {
                 def json = parseJson(res[0][11])
                 assert json instanceof List
-                assertEquals("1", json.fileNumber[0])
-                log.info("outfile_path: ${json.url[0]}")
-                return json.url[0];
+                assertEquals("1", json.fileNumber[0][0])
+                log.info("outfile_path: ${json.url[0][0]}")
+                return json.url[0][0];
             } else if (res[0][2] == "CANCELLED") {
                 throw new IllegalStateException("""export failed: ${res[0][10]}""")
             } else {
@@ -91,7 +96,8 @@ suite("test_export_with_s3", "p2") {
                 "s3.endpoint" = "${s3_endpoint}",
                 "s3.region" = "${region}",
                 "s3.secret_key"="${sk}",
-                "s3.access_key" = "${ak}"
+                "s3.access_key" = "${ak}",
+                "provider" = "${getS3Provider()}"
             );
         """
 
@@ -99,10 +105,13 @@ suite("test_export_with_s3", "p2") {
 
         // check data correctness
         order_qt_select """ select * from s3(
-                "uri" = "http://${s3_endpoint}${outfile_url.substring(4)}0.${file_suffix}",
+                "uri" = "http://${bucket}.${s3_endpoint}${outfile_url.substring(5 + bucket.length())}0.${file_suffix}",
                 "ACCESS_KEY"= "${ak}",
                 "SECRET_KEY" = "${sk}",
-                "format" = "${format}"
+                "format" = "${format}",
+                "column_separator" = ",",
+                "provider" = "${getS3Provider()}",
+                "region" = "${region}"
             );
             """
     }

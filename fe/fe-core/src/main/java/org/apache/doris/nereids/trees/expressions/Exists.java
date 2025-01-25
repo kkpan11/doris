@@ -18,7 +18,6 @@
 package org.apache.doris.nereids.trees.expressions;
 
 import org.apache.doris.nereids.exceptions.UnboundException;
-import org.apache.doris.nereids.trees.expressions.shape.LeafExpression;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.nereids.types.BooleanType;
@@ -33,12 +32,13 @@ import java.util.Optional;
 /**
  * Exists subquery expression.
  */
-public class Exists extends SubqueryExpr implements LeafExpression {
+public class Exists extends SubqueryExpr {
+
     private final boolean isNot;
 
     public Exists(LogicalPlan subquery, boolean isNot) {
         super(Objects.requireNonNull(subquery, "subquery can not be null"));
-        this.isNot = Objects.requireNonNull(isNot, "isNot can not be null");
+        this.isNot = isNot;
     }
 
     public Exists(LogicalPlan subquery, List<Slot> correlateSlots, boolean isNot) {
@@ -52,7 +52,7 @@ public class Exists extends SubqueryExpr implements LeafExpression {
         super(Objects.requireNonNull(subquery, "subquery can not be null"),
                 Objects.requireNonNull(correlateSlots, "subquery can not be null"),
                 typeCoercionExpr);
-        this.isNot = Objects.requireNonNull(isNot, "isNot can not be null");
+        this.isNot = isNot;
     }
 
     public boolean isNot() {
@@ -65,8 +65,8 @@ public class Exists extends SubqueryExpr implements LeafExpression {
     }
 
     @Override
-    public String toSql() {
-        return "EXISTS (SUBQUERY) " + super.toSql();
+    public String computeToSql() {
+        return "EXISTS (SUBQUERY) " + super.computeToSql();
     }
 
     @Override
@@ -94,12 +94,17 @@ public class Exists extends SubqueryExpr implements LeafExpression {
     }
 
     @Override
-    public int hashCode() {
+    public int computeHashCode() {
         return Objects.hash(this.queryPlan, this.isNot);
     }
 
     @Override
     public Expression withTypeCoercion(DataType dataType) {
         return this;
+    }
+
+    @Override
+    public Exists withSubquery(LogicalPlan subquery) {
+        return new Exists(subquery, correlateSlots, typeCoercionExpr, isNot);
     }
 }

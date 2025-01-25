@@ -27,35 +27,6 @@ suite("test_segcompaction_dup_keys_index") {
 
 
     try {
-        String backend_id;
-        def backendId_to_backendIP = [:]
-        def backendId_to_backendHttpPort = [:]
-        getBackendIpHttpPort(backendId_to_backendIP, backendId_to_backendHttpPort);
-
-        backend_id = backendId_to_backendIP.keySet()[0]
-        StringBuilder showConfigCommand = new StringBuilder();
-        showConfigCommand.append("curl -X GET http://")
-        showConfigCommand.append(backendId_to_backendIP.get(backend_id))
-        showConfigCommand.append(":")
-        showConfigCommand.append(backendId_to_backendHttpPort.get(backend_id))
-        showConfigCommand.append("/api/show_config")
-        logger.info(showConfigCommand.toString())
-        def process = showConfigCommand.toString().execute()
-        int code = process.waitFor()
-        String err = IOGroovyMethods.getText(new BufferedReader(new InputStreamReader(process.getErrorStream())));
-        String out = process.getText()
-        logger.info("Show config: code=" + code + ", out=" + out + ", err=" + err)
-        assertEquals(code, 0)
-        def configList = parseJson(out.trim())
-        assert configList instanceof List
-
-        boolean disableAutoCompaction = true
-        for (Object ele in (List) configList) {
-            assert ele instanceof List<String>
-            if (((List<String>) ele)[0] == "disable_auto_compaction") {
-                disableAutoCompaction = Boolean.parseBoolean(((List<String>) ele)[2])
-            }
-        }
 
         sql """ DROP TABLE IF EXISTS ${tableName} """
         sql """
@@ -95,10 +66,8 @@ suite("test_segcompaction_dup_keys_index") {
                 "AWS_ACCESS_KEY" = "$ak",
                 "AWS_SECRET_KEY" = "$sk",
                 "AWS_ENDPOINT" = "$endpoint",
-                "AWS_REGION" = "$region"
-            )
-            properties(
-                "use_new_load_scan_node" = "true"
+                "AWS_REGION" = "$region",
+                "provider" = "${getS3Provider()}"
             )
             """
 
@@ -119,6 +88,7 @@ suite("test_segcompaction_dup_keys_index") {
                 assertTrue(1 == 2, "load Timeout: $uuid")
             }
         }
+        sql "sync"
 
         qt_select_default """ SELECT * FROM ${tableName} WHERE col_0=47 order by col_1, col_2; """
         qt_select_default """ SELECT COUNT(*) FROM ${tableName} WHERE col_1 MATCH_ANY 'lemon'; """

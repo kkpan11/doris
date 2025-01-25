@@ -48,15 +48,45 @@ public class PartitionNames implements ParseNode, Writable {
     // true if these partitions are temp partitions
     @SerializedName(value = "isTemp")
     private final boolean isTemp;
+    private final boolean isStar;
+    private final long count;
+    // Default partition count to collect statistic for external table.
+    private static final long DEFAULT_PARTITION_COUNT = 100;
 
     public PartitionNames(boolean isTemp, List<String> partitionNames) {
         this.partitionNames = partitionNames;
         this.isTemp = isTemp;
+        this.isStar = false;
+        this.count = 0;
     }
 
     public PartitionNames(PartitionNames other) {
         this.partitionNames = Lists.newArrayList(other.partitionNames);
         this.isTemp = other.isTemp;
+        this.isStar = other.isStar;
+        this.count = 0;
+    }
+
+    public PartitionNames(boolean isStar) {
+        this.partitionNames = null;
+        this.isTemp = false;
+        this.isStar = isStar;
+        this.count = 0;
+    }
+
+    public PartitionNames(long partitionCount) {
+        this.partitionNames = null;
+        this.isTemp = false;
+        this.isStar = false;
+        this.count = partitionCount;
+    }
+
+    // for nereids
+    public PartitionNames(boolean isTemp, List<String> partitionNames, boolean isStar, long partitionCount) {
+        this.partitionNames = partitionNames;
+        this.isTemp = isTemp;
+        this.isStar = isStar;
+        this.count = partitionCount;
     }
 
     public List<String> getPartitionNames() {
@@ -67,9 +97,27 @@ public class PartitionNames implements ParseNode, Writable {
         return isTemp;
     }
 
+    /**
+     * @return for OLAP table, only in overwrite situation, overwrite auto detect partition
+     *         for External table, all partitions.
+     */
+    public boolean isStar() {
+        return isStar;
+    }
+
+    public long getCount() {
+        return count;
+    }
+
     @Override
     public void analyze(Analyzer analyzer) throws AnalysisException {
-        if (partitionNames.isEmpty()) {
+        if (isStar && count > 0) {
+            throw new AnalysisException("All partition and partition count couldn't be set at the same time.");
+        }
+        if (isStar || count > 0) {
+            return;
+        }
+        if (partitionNames == null || partitionNames.isEmpty()) {
             throw new AnalysisException("No partition specified in partition lists");
         }
         // check if partition name is not empty string

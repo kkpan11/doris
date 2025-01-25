@@ -17,29 +17,37 @@
 
 #pragma once
 
+#include <utility>
+
 #include "vec/aggregate_functions/aggregate_function.h"
 #include "vec/data_types/data_type_agg_state.h"
 
 namespace doris::vectorized {
+#include "common/compile_check_begin.h"
 const static std::string AGG_UNION_SUFFIX = "_union";
 
 class AggregateStateUnion : public IAggregateFunctionHelper<AggregateStateUnion> {
 public:
-    AggregateStateUnion(AggregateFunctionPtr function, const DataTypes& argument_types,
-                        const DataTypePtr& return_type)
-            : IAggregateFunctionHelper(argument_types),
-              _function(function),
-              _return_type(return_type) {}
+    AggregateStateUnion(AggregateFunctionPtr function, const DataTypes& argument_types_,
+                        DataTypePtr return_type)
+            : IAggregateFunctionHelper(argument_types_),
+              _function(std::move(function)),
+              _return_type(std::move(return_type)) {}
     ~AggregateStateUnion() override = default;
 
     static AggregateFunctionPtr create(AggregateFunctionPtr function,
-                                       const DataTypes& argument_types,
+                                       const DataTypes& argument_types_,
                                        const DataTypePtr& return_type) {
-        CHECK(argument_types.size() == 1);
+        CHECK(argument_types_.size() == 1);
         if (function == nullptr) {
             return nullptr;
         }
-        return std::make_shared<AggregateStateUnion>(function, argument_types, return_type);
+        return std::make_shared<AggregateStateUnion>(function, argument_types_, return_type);
+    }
+
+    void set_version(const int version_) override {
+        IAggregateFunctionHelper::set_version(version_);
+        _function->set_version(version_);
     }
 
     void create(AggregateDataPtr __restrict place) const override { _function->create(place); }
@@ -48,11 +56,11 @@ public:
 
     DataTypePtr get_return_type() const override { return _return_type; }
 
-    void add(AggregateDataPtr __restrict place, const IColumn** columns, size_t row_num,
+    void add(AggregateDataPtr __restrict place, const IColumn** columns, ssize_t row_num,
              Arena* arena) const override {
-        VectorBufferReader buffer_reader(
-                (assert_cast<const ColumnString&>(*columns[0])).get_data_at(row_num));
-        deserialize_and_merge(place, buffer_reader, arena);
+        //the range is [begin, end]
+        _function->deserialize_and_merge_from_column_range(place, *columns[0], row_num, row_num,
+                                                           arena);
     }
 
     void add_batch_single_place(size_t batch_size, AggregateDataPtr place, const IColumn** columns,
@@ -61,6 +69,14 @@ public:
                                                            arena);
     }
 
+    void add_batch(size_t batch_size, AggregateDataPtr* places, size_t place_offset,
+                   const IColumn** columns, Arena* arena, bool agg_many) const override {
+        for (size_t i = 0; i < batch_size; ++i) {
+            //the range is [i, i]
+            _function->deserialize_and_merge_from_column_range(places[i] + place_offset,
+                                                               *columns[0], i, i, arena);
+        }
+    }
     void reset(AggregateDataPtr place) const override { _function->reset(place); }
 
     void merge(AggregateDataPtr __restrict place, ConstAggregateDataPtr rhs,
@@ -97,3 +113,5 @@ protected:
 };
 
 } // namespace doris::vectorized
+
+#include "common/compile_check_end.h"

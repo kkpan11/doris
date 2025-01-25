@@ -49,4 +49,9 @@ suite("agg_with_const") {
          select count(2) + 1, sum(2) + sum(2) from agg_with_const_tbl
     """
 
+    explain {
+        sql """select count(*) from ( select distinct col1 as a0, null as not_appear_col from agg_with_const_tbl)t"""
+        notContains "not_appear_col"
+    }
+
 }

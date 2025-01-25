@@ -25,8 +25,11 @@ import org.apache.doris.nereids.trees.expressions.Not;
 import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.BitmapContains;
 import org.apache.doris.nereids.trees.plans.GroupPlan;
+import org.apache.doris.nereids.trees.plans.JoinType;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalJoin;
+import org.apache.doris.nereids.util.JoinUtils;
+import org.apache.doris.planner.NestedLoopJoinNode;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.thrift.TRuntimeFilterType;
 
@@ -38,6 +41,7 @@ import java.util.List;
 public class JoinCommute extends OneExplorationRuleFactory {
 
     public static final JoinCommute LEFT_DEEP = new JoinCommute(SwapType.LEFT_DEEP, false);
+    public static final JoinCommute LEFT_ZIG_ZAG = new JoinCommute(SwapType.LEFT_ZIG_ZAG, false);
     public static final JoinCommute ZIG_ZAG = new JoinCommute(SwapType.ZIG_ZAG, false);
     public static final JoinCommute BUSHY = new JoinCommute(SwapType.BUSHY, false);
     public static final JoinCommute NON_INNER = new JoinCommute(SwapType.BUSHY, true);
@@ -54,13 +58,24 @@ public class JoinCommute extends OneExplorationRuleFactory {
     public Rule build() {
         return logicalJoin()
                 .when(join -> !justNonInner || !join.getJoinType().isInnerJoin())
+                .when(join -> checkReorder(join))
                 .when(join -> check(swapType, join))
-                .whenNot(LogicalJoin::hasJoinHint)
+                .whenNot(LogicalJoin::hasDistributeHint)
                 .whenNot(join -> joinOrderMatchBitmapRuntimeFilterOrder(join))
-                .whenNot(LogicalJoin::isMarkJoin)
+                // null aware mark join will be translated to null aware left semi/anti join
+                // we don't support null aware right semi/anti join, so should not commute
+                .whenNot(join -> JoinUtils.isNullAwareMarkJoin(join))
+                // commuting nest loop mark join or left anti mark join is not supported by be
+                .whenNot(join -> join.isMarkJoin() && (join.getHashJoinConjuncts().isEmpty()
+                        || join.getJoinType().isLeftAntiJoin()))
+                // For a nested loop join, if commutativity causes a join that could originally be executed
+                // in parallel to become non-parallelizable, then we reject this swap.
+                .whenNot(join -> JoinUtils.shouldNestedLoopJoin(join)
+                        && NestedLoopJoinNode.canParallelize(JoinType.toJoinOperator(join.getJoinType()))
+                        && !NestedLoopJoinNode.canParallelize(JoinType.toJoinOperator(join.getJoinType().swap())))
                 .then(join -> {
                     LogicalJoin<Plan, Plan> newJoin = join.withTypeChildren(join.getJoinType().swap(),
-                            join.right(), join.left());
+                            join.right(), join.left(), null);
                     newJoin.getJoinReorderContext().copyFrom(join.getJoinReorderContext());
                     newJoin.getJoinReorderContext().setHasCommute(true);
                     if (swapType == SwapType.ZIG_ZAG && isNotBottomJoin(join)) {
@@ -72,7 +87,8 @@ public class JoinCommute extends OneExplorationRuleFactory {
     }
 
     enum SwapType {
-        LEFT_DEEP, ZIG_ZAG, BUSHY
+        LEFT_DEEP, ZIG_ZAG, BUSHY,
+        LEFT_ZIG_ZAG
     }
 
     /**
@@ -87,7 +103,21 @@ public class JoinCommute extends OneExplorationRuleFactory {
             return false;
         }
 
-        return !join.getJoinReorderContext().hasCommute() && !join.getJoinReorderContext().hasExchange();
+        if (swapType == SwapType.LEFT_ZIG_ZAG) {
+            double leftRows = join.left().getGroup().getStatistics().getRowCount();
+            double rightRows = join.right().getGroup().getStatistics().getRowCount();
+            return leftRows <= rightRows && isZigZagJoin(join);
+        }
+
+        return true;
+    }
+
+    private boolean checkReorder(LogicalJoin<GroupPlan, GroupPlan> join) {
+        if (join.isLeadingJoin()) {
+            return false;
+        }
+        return !join.getJoinReorderContext().hasCommute()
+                && !join.getJoinReorderContext().hasExchange();
     }
 
     public static boolean isNotBottomJoin(LogicalJoin<GroupPlan, GroupPlan> join) {
@@ -95,10 +125,18 @@ public class JoinCommute extends OneExplorationRuleFactory {
         return containJoin(join.left()) || containJoin(join.right());
     }
 
+    public static boolean isZigZagJoin(LogicalJoin<GroupPlan, GroupPlan> join) {
+        return !containJoin(join.left()) || !containJoin(join.right());
+    }
+
     private static boolean containJoin(GroupPlan groupPlan) {
-        // TODO: tmp way to judge containJoin
-        List<Slot> output = groupPlan.getOutput();
-        return !output.stream().map(Slot::getQualifier).allMatch(output.get(0).getQualifier()::equals);
+        if (groupPlan.getGroup().getStatistics() != null) {
+            return groupPlan.getGroup().getStatistics().getWidthInJoinCluster() > 1;
+        } else {
+            // tmp way to judge containJoin, just used for test case where stats is null
+            List<Slot> output = groupPlan.getOutput();
+            return !output.stream().map(Slot::getQualifier).allMatch(output.get(0).getQualifier()::equals);
+        }
     }
 
     /**

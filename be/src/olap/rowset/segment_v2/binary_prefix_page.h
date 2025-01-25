@@ -41,22 +41,26 @@ namespace segment_v2 {
 // Entry := SharedPrefixLength(vint), UnsharedLength(vint), Byte^UnsharedLength
 // Trailer := NumEntry(uint32_t), RESTART_POINT_INTERVAL(uint8_t)
 //            RestartPointStartOffset(uint32_t)^NumRestartPoints,NumRestartPoints(uint32_t)
-class BinaryPrefixPageBuilder : public PageBuilder {
+class BinaryPrefixPageBuilder : public PageBuilderHelper<BinaryPrefixPageBuilder> {
 public:
-    BinaryPrefixPageBuilder(const PageBuilderOptions& options) : _options(options) { reset(); }
+    using Self = BinaryPrefixPageBuilder;
+    friend class PageBuilderHelper<Self>;
+
+    Status init() override { return reset(); }
 
     bool is_page_full() override { return size() >= _options.data_page_size; }
 
     Status add(const uint8_t* vals, size_t* add_count) override;
 
-    OwnedSlice finish() override;
+    Status finish(OwnedSlice* slice) override;
 
-    void reset() override {
+    Status reset() override {
         _restart_points_offset.clear();
         _last_entry.clear();
         _count = 0;
         _buffer.clear();
         _finished = false;
+        return Status::OK();
     }
 
     uint64_t size() const override {
@@ -72,7 +76,7 @@ public:
     Status get_first_value(void* value) const override {
         DCHECK(_finished);
         if (_count == 0) {
-            return Status::NotFound("page is empty");
+            return Status::Error<ErrorCode::ENTRY_NOT_FOUND>("page is empty");
         }
         *reinterpret_cast<Slice*>(value) = Slice(_first_entry);
         return Status::OK();
@@ -81,13 +85,15 @@ public:
     Status get_last_value(void* value) const override {
         DCHECK(_finished);
         if (_count == 0) {
-            return Status::NotFound("page is empty");
+            return Status::Error<ErrorCode::ENTRY_NOT_FOUND>("page is empty");
         }
         *reinterpret_cast<Slice*>(value) = Slice(_last_entry);
         return Status::OK();
     }
 
 private:
+    BinaryPrefixPageBuilder(const PageBuilderOptions& options) : _options(options) {}
+
     PageBuilderOptions _options;
     std::vector<uint32_t> _restart_points_offset;
     faststring _first_entry;
@@ -137,7 +143,7 @@ private:
 
     // read next value at `_cur_pos` and `_next_ptr` into `_current_value`.
     // return OK and advance `_next_ptr` on success. `_cur_pos` is not modified.
-    // return NotFound when no more entry can be read.
+    // return EndOfFile when no more entry can be read.
     // return other error status otherwise.
     Status _read_next_value();
 

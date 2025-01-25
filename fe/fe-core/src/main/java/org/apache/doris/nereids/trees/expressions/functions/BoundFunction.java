@@ -18,20 +18,25 @@
 package org.apache.doris.nereids.trees.expressions.functions;
 
 import org.apache.doris.catalog.FunctionSignature;
+import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.exceptions.UnboundException;
 import org.apache.doris.nereids.trees.expressions.Expression;
+import org.apache.doris.nereids.trees.expressions.OrderExpression;
+import org.apache.doris.nereids.trees.expressions.functions.agg.GroupConcat;
+import org.apache.doris.nereids.trees.expressions.functions.agg.MultiDistinctGroupConcat;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
+import org.apache.doris.nereids.util.Utils;
 
 import com.google.common.base.Suppliers;
 
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 /** BoundFunction. */
 public abstract class BoundFunction extends Function implements ComputeSignature {
-    private final String name;
 
     private final Supplier<FunctionSignature> signatureCache = Suppliers.memoize(() -> {
         // first step: find the candidate signature in the signature list
@@ -41,17 +46,23 @@ public abstract class BoundFunction extends Function implements ComputeSignature
     });
 
     public BoundFunction(String name, Expression... arguments) {
-        super(arguments);
-        this.name = Objects.requireNonNull(name, "name can not be null");
+        super(name, arguments);
     }
 
     public BoundFunction(String name, List<Expression> children) {
-        super(children);
-        this.name = Objects.requireNonNull(name, "name can not be null");
+        this(name, children, false);
     }
 
-    public String getName() {
-        return name;
+    public BoundFunction(String name, List<Expression> children, boolean inferred) {
+        super(name, children, inferred);
+    }
+
+    @Override
+    public String getExpressionName() {
+        if (!this.exprName.isPresent()) {
+            this.exprName = Optional.of(Utils.normalizeName(getName(), DEFAULT_EXPRESSION_NAME));
+        }
+        return this.exprName.get();
     }
 
     public FunctionSignature getSignature() {
@@ -64,29 +75,27 @@ public abstract class BoundFunction extends Function implements ComputeSignature
     }
 
     @Override
-    public boolean equals(Object o) {
-        if (this == o) {
-            return true;
-        }
-        if (o == null || getClass() != o.getClass()) {
-            return false;
-        }
-        BoundFunction that = (BoundFunction) o;
-        return Objects.equals(name, that.name) && Objects.equals(children, that.children);
+    protected boolean extraEquals(Expression that) {
+        return Objects.equals(getName(), ((BoundFunction) that).getName());
     }
 
     @Override
-    public int hashCode() {
-        return Objects.hash(name, children);
+    public int computeHashCode() {
+        return Objects.hash(getName(), children);
     }
 
     @Override
-    public String toSql() throws UnboundException {
-        String args = children()
-                .stream()
-                .map(Expression::toSql)
-                .collect(Collectors.joining(", "));
-        return name + "(" + args + ")";
+    public String computeToSql() throws UnboundException {
+        StringBuilder sql = new StringBuilder(getName()).append("(");
+        int arity = arity();
+        for (int i = 0; i < arity; i++) {
+            Expression arg = child(i);
+            sql.append(arg.toSql());
+            if (i + 1 < arity) {
+                sql.append(", ");
+            }
+        }
+        return sql.append(")").toString();
     }
 
     @Override
@@ -95,6 +104,19 @@ public abstract class BoundFunction extends Function implements ComputeSignature
                 .stream()
                 .map(Expression::toString)
                 .collect(Collectors.joining(", "));
-        return name + "(" + args + ")";
+        return getName() + "(" + args + ")";
+    }
+
+    /**
+     * checkOrderExprIsValid.
+     */
+    public void checkOrderExprIsValid() {
+        for (Expression child : children) {
+            if (child instanceof OrderExpression
+                    && !(this instanceof GroupConcat || this instanceof MultiDistinctGroupConcat)) {
+                throw new AnalysisException(
+                        String.format("%s doesn't support order by expression", getName()));
+            }
+        }
     }
 }

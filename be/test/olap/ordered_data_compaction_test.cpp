@@ -41,6 +41,7 @@
 #include "gtest/gtest_pred_impl.h"
 #include "gutil/stringprintf.h"
 #include "io/fs/local_file_system.h"
+#include "json2pb/json_to_pb.h"
 #include "olap/cumulative_compaction.h"
 #include "olap/data_dir.h"
 #include "olap/delete_handler.h"
@@ -61,6 +62,7 @@
 #include "olap/tablet_meta.h"
 #include "olap/tablet_schema.h"
 #include "olap/utils.h"
+#include "runtime/exec_env.h"
 #include "util/uid_util.h"
 #include "vec/columns/column.h"
 #include "vec/core/block.h"
@@ -72,7 +74,7 @@ using namespace ErrorCode;
 namespace vectorized {
 
 static const uint32_t MAX_PATH_LEN = 1024;
-static StorageEngine* k_engine = nullptr;
+static StorageEngine* engine_ref = nullptr;
 
 class OrderedDataCompactionTest : public ::testing::Test {
 protected:
@@ -80,27 +82,36 @@ protected:
         char buffer[MAX_PATH_LEN];
         EXPECT_NE(getcwd(buffer, MAX_PATH_LEN), nullptr);
         absolute_dir = std::string(buffer) + kTestDir;
-        EXPECT_TRUE(io::global_local_filesystem()->delete_and_create_directory(absolute_dir).ok());
+        auto st = io::global_local_filesystem()->delete_directory(absolute_dir);
+        ASSERT_TRUE(st.ok()) << st;
+        st = io::global_local_filesystem()->create_directory(absolute_dir);
+        ASSERT_TRUE(st.ok()) << st;
         EXPECT_TRUE(io::global_local_filesystem()
                             ->create_directory(absolute_dir + "/tablet_path")
                             .ok());
+        // tmp dir
+        EXPECT_TRUE(io::global_local_filesystem()->delete_directory(tmp_dir).ok());
+        EXPECT_TRUE(io::global_local_filesystem()->create_directory(tmp_dir).ok());
+        std::vector<StorePath> paths;
+        paths.emplace_back(std::string(tmp_dir), 1024000000);
+        auto tmp_file_dirs = std::make_unique<segment_v2::TmpFileDirs>(paths);
+        st = tmp_file_dirs->init();
+        EXPECT_TRUE(st.ok()) << st.to_json();
+        ExecEnv::GetInstance()->set_tmp_file_dir(std::move(tmp_file_dirs));
 
-        _data_dir = std::make_unique<DataDir>(absolute_dir);
-        _data_dir->update_capacity();
         doris::EngineOptions options;
-        k_engine = new StorageEngine(options);
-        StorageEngine::_s_instance = k_engine;
-
+        auto engine = std::make_unique<StorageEngine>(options);
+        engine_ref = engine.get();
+        _data_dir = std::make_unique<DataDir>(*engine_ref, absolute_dir);
+        static_cast<void>(_data_dir->update_capacity());
+        ExecEnv::GetInstance()->set_storage_engine(std::move(engine));
         config::enable_ordered_data_compaction = true;
         config::ordered_data_compaction_min_segment_size = 10;
     }
     void TearDown() override {
         EXPECT_TRUE(io::global_local_filesystem()->delete_directory(absolute_dir).ok());
-        if (k_engine != nullptr) {
-            k_engine->stop();
-            delete k_engine;
-            k_engine = nullptr;
-        }
+        engine_ref = nullptr;
+        ExecEnv::GetInstance()->set_storage_engine(nullptr);
     }
 
     TabletSchemaSPtr create_schema(KeysType keys_type = DUP_KEYS) {
@@ -151,6 +162,62 @@ protected:
         return tablet_schema;
     }
 
+    TabletSchemaSPtr create_inverted_index_v1_schema(KeysType keys_type = DUP_KEYS) {
+        TabletSchemaSPtr tablet_schema = std::make_shared<TabletSchema>();
+        TabletSchemaPB tablet_schema_pb;
+        tablet_schema_pb.set_keys_type(keys_type);
+        tablet_schema_pb.set_num_short_key_columns(1);
+        tablet_schema_pb.set_num_rows_per_row_block(1024);
+        tablet_schema_pb.set_compress_kind(COMPRESS_NONE);
+        tablet_schema_pb.set_next_column_unique_id(4);
+        tablet_schema_pb.set_inverted_index_storage_format(InvertedIndexStorageFormatPB::V1);
+
+        auto* index_pb = tablet_schema_pb.add_index();
+        index_pb->set_index_id(1);
+        index_pb->set_index_name("c1_index");
+        index_pb->set_index_type(IndexType::INVERTED);
+        index_pb->add_col_unique_id(2);
+
+        ColumnPB* column_1 = tablet_schema_pb.add_column();
+        column_1->set_unique_id(1);
+        column_1->set_name("c1");
+        column_1->set_type("INT");
+        column_1->set_is_key(true);
+        column_1->set_length(4);
+        column_1->set_index_length(4);
+        column_1->set_is_nullable(false);
+        column_1->set_is_bf_column(false);
+
+        ColumnPB* column_2 = tablet_schema_pb.add_column();
+        column_2->set_unique_id(2);
+        column_2->set_name("c2");
+        column_2->set_type("INT");
+        column_2->set_length(4);
+        column_2->set_index_length(4);
+        column_2->set_is_nullable(true);
+        column_2->set_is_key(false);
+        column_2->set_is_nullable(false);
+        column_2->set_is_bf_column(false);
+
+        // unique table must contains the DELETE_SIGN column
+        if (keys_type == UNIQUE_KEYS) {
+            ColumnPB* column_3 = tablet_schema_pb.add_column();
+            column_3->set_unique_id(3);
+            column_3->set_name(DELETE_SIGN);
+            column_3->set_type("TINYINT");
+            column_3->set_length(1);
+            column_3->set_index_length(1);
+            column_3->set_is_nullable(false);
+            column_3->set_is_key(false);
+            column_3->set_is_nullable(false);
+            column_3->set_is_bf_column(false);
+        }
+
+        tablet_schema->init_from_pb(tablet_schema_pb);
+
+        return tablet_schema;
+    }
+
     TabletSchemaSPtr create_agg_schema() {
         TabletSchemaSPtr tablet_schema = std::make_shared<TabletSchema>();
         TabletSchemaPB tablet_schema_pb;
@@ -198,7 +265,7 @@ protected:
         rowset_writer_context->data_dir = _data_dir.get();
         rowset_writer_context->rowset_state = VISIBLE;
         rowset_writer_context->tablet_schema = tablet_schema;
-        rowset_writer_context->rowset_dir = rowset_dir;
+        rowset_writer_context->tablet_path = rowset_dir;
         rowset_writer_context->version = Version(inc_id, inc_id);
         rowset_writer_context->segments_overlap = overlap;
         rowset_writer_context->max_rows_per_segment = max_rows_per_segment;
@@ -232,9 +299,9 @@ protected:
         create_rowset_writer_context(tablet_schema, tablet->tablet_path(), overlap, UINT32_MAX,
                                      &writer_context);
 
-        std::unique_ptr<RowsetWriter> rowset_writer;
-        Status s = RowsetFactory::create_rowset_writer(writer_context, true, &rowset_writer);
-        EXPECT_TRUE(s.ok());
+        auto res = RowsetFactory::create_rowset_writer(*engine_ref, writer_context, true);
+        EXPECT_TRUE(res.has_value()) << res.error();
+        auto rowset_writer = std::move(res).value();
 
         uint32_t num_rows = 0;
         for (int i = 0; i < rowset_data.size(); ++i) {
@@ -252,15 +319,14 @@ protected:
                 }
                 num_rows++;
             }
-            s = rowset_writer->add_block(&block);
+            auto s = rowset_writer->add_block(&block);
             EXPECT_TRUE(s.ok());
             s = rowset_writer->flush();
             EXPECT_TRUE(s.ok());
         }
 
         RowsetSharedPtr rowset;
-        rowset = rowset_writer->build();
-        EXPECT_TRUE(rowset != nullptr);
+        EXPECT_EQ(Status::OK(), rowset_writer->build(rowset));
         EXPECT_EQ(rowset_data.size(), rowset->rowset_meta()->num_segments());
         EXPECT_EQ(num_rows, rowset->rowset_meta()->num_rows());
         return rowset;
@@ -270,6 +336,7 @@ protected:
         std::string json_rowset_meta = R"({
             "rowset_id": 540085,
             "tablet_id": 15674,
+            "partition_id": 10000,
             "txn_id": 4045,
             "tablet_schema_hash": 567997588,
             "rowset_type": "BETA_ROWSET",
@@ -306,8 +373,8 @@ protected:
         rsm->set_rowset_id(id);
         rsm->set_delete_predicate(del_pred);
         rsm->set_tablet_schema(tablet->tablet_schema());
-        RowsetSharedPtr rowset = std::make_shared<BetaRowset>(tablet->tablet_schema(), "", rsm);
-        tablet->add_rowset(rowset);
+        RowsetSharedPtr rowset = std::make_shared<BetaRowset>(tablet->tablet_schema(), rsm, "");
+        static_cast<void>(tablet->add_rowset(rowset));
     }
 
     TabletSharedPtr create_tablet(const TabletSchema& tablet_schema,
@@ -342,8 +409,8 @@ protected:
                                UniqueId(1, 2), TTabletType::TABLET_TYPE_DISK,
                                TCompressionType::LZ4F, 0, enable_unique_key_merge_on_write));
 
-        TabletSharedPtr tablet(new Tablet(tablet_meta, _data_dir.get()));
-        tablet->init();
+        TabletSharedPtr tablet(new Tablet(*engine_ref, tablet_meta, _data_dir.get()));
+        static_cast<void>(tablet->init());
         if (has_delete_handler) {
             // delete data with key < 1000
             std::vector<TCondition> conditions;
@@ -399,7 +466,8 @@ protected:
     }
 
 private:
-    const std::string kTestDir = "/ut_dir/vertical_compaction_test";
+    const std::string kTestDir = "/ut_dir/ordered_compaction_test";
+    const std::string tmp_dir = "./ut_dir/ordered_compaction_test/tmp";
     string absolute_dir;
     std::unique_ptr<DataDir> _data_dir;
 };
@@ -430,14 +498,11 @@ TEST_F(OrderedDataCompactionTest, test_01) {
         input_rowsets.push_back(rowset);
     }
     //auto end_version = input_rowsets.back()->end_version();
-    CumulativeCompaction cu_compaction(tablet);
-    cu_compaction.set_input_rowset(input_rowsets);
+    CumulativeCompaction cu_compaction(*engine_ref, tablet);
+    cu_compaction._input_rowsets = std::move(input_rowsets);
     EXPECT_EQ(cu_compaction.handle_ordered_data_compaction(), true);
-    for (int i = 0; i < 100; ++i) {
-        LOG(INFO) << "stop";
-    }
 
-    RowsetSharedPtr out_rowset = cu_compaction.output_rowset();
+    auto& out_rowset = cu_compaction._output_rowset;
 
     // create output rowset reader
     RowsetReaderContext reader_context;
@@ -462,11 +527,9 @@ TEST_F(OrderedDataCompactionTest, test_01) {
             output_data.emplace_back(columns[0].column->get_int(i), columns[1].column->get_int(i));
         }
     } while (s == Status::OK());
-    EXPECT_EQ(Status::Error<END_OF_FILE>(), s);
+    EXPECT_EQ(Status::Error<END_OF_FILE>(""), s);
     EXPECT_EQ(out_rowset->rowset_meta()->num_rows(), output_data.size());
     EXPECT_EQ(output_data.size(), num_input_rowset * num_segments * rows_per_segment);
-    std::vector<uint32_t> segment_num_rows;
-    EXPECT_TRUE(output_rs_reader->get_segment_num_rows(&segment_num_rows).ok());
     // check vertical compaction result
     for (auto id = 0; id < output_data.size(); id++) {
         LOG(INFO) << "output data: " << std::get<0>(output_data[id]) << " "
@@ -488,5 +551,75 @@ TEST_F(OrderedDataCompactionTest, test_01) {
     }
 }
 
+TEST_F(OrderedDataCompactionTest, test_index_disk_size) {
+    auto num_input_rowset = 3;
+    auto num_segments = 2;
+    auto rows_per_segment = 50;
+    std::vector<std::vector<std::vector<std::tuple<int64_t, int64_t>>>> input_data;
+    generate_input_data(num_input_rowset, num_segments, rows_per_segment, input_data);
+
+    TabletSchemaSPtr tablet_schema = create_inverted_index_v1_schema();
+    TabletSharedPtr tablet = create_tablet(*tablet_schema, false, 10000, false);
+    EXPECT_TRUE(io::global_local_filesystem()->create_directory(tablet->tablet_path()).ok());
+
+    vector<RowsetSharedPtr> input_rowsets;
+    SegmentsOverlapPB new_overlap = NONOVERLAPPING;
+    for (auto i = 0; i < num_input_rowset; i++) {
+        RowsetWriterContext writer_context;
+        create_rowset_writer_context(tablet_schema, tablet->tablet_path(), new_overlap, UINT32_MAX,
+                                     &writer_context);
+
+        auto res = RowsetFactory::create_rowset_writer(*engine_ref, writer_context, false);
+        EXPECT_TRUE(res.has_value()) << res.error();
+        auto rowset_writer = std::move(res).value();
+
+        uint32_t num_rows = 0;
+        for (int j = 0; j < input_data[i].size(); ++j) {
+            vectorized::Block block = tablet_schema->create_block();
+            auto columns = block.mutate_columns();
+            for (int rid = 0; rid < input_data[i][j].size(); ++rid) {
+                int32_t c1 = std::get<0>(input_data[i][j][rid]);
+                int32_t c2 = std::get<1>(input_data[i][j][rid]);
+                columns[0]->insert_data((const char*)&c1, sizeof(c1));
+                columns[1]->insert_data((const char*)&c2, sizeof(c2));
+
+                if (tablet_schema->keys_type() == UNIQUE_KEYS) {
+                    uint8_t num = 0;
+                    columns[2]->insert_data((const char*)&num, sizeof(num));
+                }
+                num_rows++;
+            }
+            auto s = rowset_writer->add_block(&block);
+            EXPECT_TRUE(s.ok());
+            s = rowset_writer->flush();
+            EXPECT_TRUE(s.ok());
+        }
+
+        RowsetSharedPtr rowset;
+        EXPECT_EQ(Status::OK(), rowset_writer->build(rowset));
+        EXPECT_EQ(input_data[i].size(), rowset->rowset_meta()->num_segments());
+        EXPECT_EQ(num_rows, rowset->rowset_meta()->num_rows());
+
+        // Set random index_disk_size
+        rowset->rowset_meta()->set_index_disk_size(1024000000000000LL);
+        input_rowsets.push_back(rowset);
+    }
+
+    CumulativeCompaction cu_compaction(*engine_ref, tablet);
+    cu_compaction._input_rowsets = std::move(input_rowsets);
+    EXPECT_EQ(cu_compaction.handle_ordered_data_compaction(), true);
+
+    auto& out_rowset = cu_compaction._output_rowset;
+
+    // Verify the index_disk_size of the output rowset
+    int64_t expected_total_size = 0;
+    for (const auto& rowset : cu_compaction._input_rowsets) {
+        expected_total_size += rowset->rowset_meta()->total_disk_size();
+    }
+    std::cout << "expected_total_size: " << expected_total_size << std::endl;
+    std::cout << "actual_total_disk_size: " << out_rowset->rowset_meta()->total_disk_size()
+              << std::endl;
+    EXPECT_EQ(out_rowset->rowset_meta()->total_disk_size(), expected_total_size);
+}
 } // namespace vectorized
 } // namespace doris

@@ -17,8 +17,6 @@
 
 package org.apache.doris.common;
 
-import org.apache.doris.common.ExperimentalUtil.ExperimentalType;
-
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -54,9 +52,11 @@ public class ConfigBase {
 
         String comment() default "";
 
-        ExperimentalType expType() default ExperimentalType.NONE;
+        VariableAnnotation varType() default VariableAnnotation.NONE;
 
         Class<? extends ConfHandler> callback() default DefaultConfHandler.class;
+
+        String callbackClassString() default "";
 
         // description for this config item.
         // There should be 2 elements in the array.
@@ -72,7 +72,7 @@ public class ConfigBase {
         void handle(Field field, String confVal) throws Exception;
     }
 
-    static class DefaultConfHandler implements ConfHandler {
+    public static class DefaultConfHandler implements ConfHandler {
         @Override
         public void handle(Field field, String confVal) throws Exception {
             setConfigField(field, confVal);
@@ -103,10 +103,7 @@ public class ConfigBase {
                     continue;
                 }
                 confFields.put(field.getName(), field);
-                if (confField.expType() == ExperimentalType.EXPERIMENTAL
-                        || confField.expType() == ExperimentalType.EXPERIMENTAL_ONLINE) {
-                    confFields.put(ExperimentalUtil.EXPERIMENTAL_PREFIX + field.getName(), field);
-                }
+                confFields.put(confField.varType().getPrefix() + field.getName(), field);
             }
 
             initConf(confFile);
@@ -120,13 +117,14 @@ public class ConfigBase {
                     continue;
                 }
                 ldapConfFields.put(field.getName(), field);
-                if (confField.expType() == ExperimentalType.EXPERIMENTAL
-                        || confField.expType() == ExperimentalType.EXPERIMENTAL_ONLINE) {
-                    ldapConfFields.put(ExperimentalUtil.EXPERIMENTAL_PREFIX + field.getName(), field);
-                }
+                ldapConfFields.put(confField.varType().getPrefix() + field.getName(), field);
             }
             initConf(ldapConfFile);
         }
+    }
+
+    public static Field getField(String name) {
+        return confFields.get(name);
     }
 
     public void initCustom(String customConfFile) throws Exception {
@@ -141,7 +139,9 @@ public class ConfigBase {
 
     private void initConf(String confFile) throws Exception {
         Properties props = new Properties();
-        props.load(new FileReader(confFile));
+        try (FileReader fr = new FileReader(confFile)) {
+            props.load(fr);
+        }
         replacedByEnv(props);
         setFields(props, isLdapConfig);
     }
@@ -223,13 +223,17 @@ public class ConfigBase {
 
             // ensure that field has property string
             String confKey = f.getName();
-            String confVal = props.getProperty(confKey,
-                    props.getProperty(ExperimentalUtil.EXPERIMENTAL_PREFIX + confKey));
+            String confVal = props.getProperty(confKey, props.getProperty(anno.varType().getPrefix() + confKey));
             if (Strings.isNullOrEmpty(confVal)) {
                 continue;
             }
 
-            setConfigField(f, confVal);
+            try {
+                setConfigField(f, confVal);
+            } catch (Exception e) {
+                String msg = String.format("Failed to set config, name: %s, value: %s", f.getName(), confVal);
+                throw new IllegalArgumentException(msg, e);
+            }
         }
     }
 
@@ -336,15 +340,23 @@ public class ConfigBase {
             throw new ConfigException("Failed to set config '" + key + "'. err: " + e.getMessage());
         }
 
+        String callbackClassString = anno.callbackClassString();
+        if (!Strings.isNullOrEmpty(callbackClassString)) {
+            try {
+                ConfHandler confHandler = (ConfHandler) Class.forName(anno.callbackClassString()).newInstance();
+                confHandler.handle(field, value);
+            } catch (Exception e) {
+                throw new ConfigException("Failed to set config '" + key + "'. err: " + e.getMessage());
+            }
+        }
+
         LOG.info("set config {} to {}", key, value);
     }
 
     /**
      * Get display name of experimental configs.
-     * For an experimental config, the given "configsToFilter" contains both config w/o "experimental_" prefix.
-     * We need to return the right display name for these configs, by following rules:
-     * 1. If this config is EXPERIMENTAL, only return the config with "experimental_" prefix.
-     * 2. If this config is not EXPERIMENTAL, only return the config without "experimental_" prefix.
+     * For an experimental/deprecated config, the given "configsToFilter" contains both config w/o
+     * "experimental_/deprecated_" prefix.
      *
      * @param configsToFilter
      * @param allConfigs
@@ -353,12 +365,8 @@ public class ConfigBase {
         for (Map.Entry<String, Field> e : configsToFilter.entrySet()) {
             Field f = e.getValue();
             ConfField confField = f.getAnnotation(ConfField.class);
-            boolean isExperimental = e.getKey().startsWith(ExperimentalUtil.EXPERIMENTAL_PREFIX);
 
-            if (isExperimental && confField.expType() != ExperimentalType.EXPERIMENTAL) {
-                continue;
-            }
-            if (!isExperimental && confField.expType() == ExperimentalType.EXPERIMENTAL) {
+            if (!e.getKey().startsWith(confField.varType().getPrefix())) {
                 continue;
             }
             allConfigs.put(e.getKey(), f);
@@ -377,7 +385,13 @@ public class ConfigBase {
             if (matcher == null || matcher.match(confKey)) {
                 List<String> config = Lists.newArrayList();
                 config.add(confKey);
-                config.add(getConfValue(f));
+                String value = getConfValue(f);
+                // For compatibility, this PR #32933 change the log dir's config logic,
+                // and deprecate the `sys_log_dir` config.
+                if (confKey.equals("sys_log_dir") && Strings.isNullOrEmpty(value)) {
+                    value = System.getenv("DORIS_HOME") + "/log";
+                }
+                config.add(value);
                 config.add(f.getType().getSimpleName());
                 config.add(String.valueOf(confField.mutable()));
                 config.add(String.valueOf(confField.masterOnly()));
@@ -404,6 +418,7 @@ public class ConfigBase {
             throws IOException {
         File file = new File(customConfFile);
         if (!file.exists()) {
+            file.getParentFile().mkdirs();
             file.createNewFile();
         } else if (resetPersist) {
             // clear the customConfFile content
@@ -413,7 +428,9 @@ public class ConfigBase {
         }
 
         Properties props = new Properties();
-        props.load(new FileReader(customConfFile));
+        try (FileReader fr = new FileReader(customConfFile)) {
+            props.load(fr);
+        }
 
         for (Map.Entry<String, String> entry : customConf.entrySet()) {
             props.setProperty(entry.getKey(), entry.getValue());
@@ -426,14 +443,14 @@ public class ConfigBase {
         }
     }
 
-    public static int getConfigNumByExperimentalType(ExperimentalType type) {
+    public static int getConfigNumByVariableAnnotation(VariableAnnotation type) {
         int num = 0;
         for (Field field : Config.class.getFields()) {
             ConfField confField = field.getAnnotation(ConfField.class);
             if (confField == null) {
                 continue;
             }
-            if (confField.expType() == type) {
+            if (confField.varType() == type) {
                 ++num;
             }
         }

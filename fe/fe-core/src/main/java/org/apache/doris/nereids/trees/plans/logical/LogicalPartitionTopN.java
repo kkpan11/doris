@@ -28,6 +28,7 @@ import org.apache.doris.nereids.trees.expressions.functions.window.Rank;
 import org.apache.doris.nereids.trees.expressions.functions.window.RowNumber;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.PlanType;
+import org.apache.doris.nereids.trees.plans.PropagateFuncDeps;
 import org.apache.doris.nereids.trees.plans.WindowFuncType;
 import org.apache.doris.nereids.trees.plans.algebra.PartitionTopN;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
@@ -43,7 +44,8 @@ import java.util.Optional;
 /**
  * Logical partition-top-N plan.
  */
-public class LogicalPartitionTopN<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_TYPE> implements PartitionTopN {
+public class LogicalPartitionTopN<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_TYPE>
+        implements PartitionTopN, PropagateFuncDeps {
     private final WindowFuncType function;
     private final List<Expression> partitionKeys;
     private final List<OrderExpression> orderKeys;
@@ -175,6 +177,12 @@ public class LogicalPartitionTopN<CHILD_TYPE extends Plan> extends LogicalUnary<
             .build();
     }
 
+    public LogicalPartitionTopN<Plan> withPartitionKeysAndOrderKeys(
+            List<Expression> partitionKeys, List<OrderExpression> orderKeys) {
+        return new LogicalPartitionTopN<>(function, partitionKeys, orderKeys, hasGlobalLimit, partitionLimit,
+                Optional.empty(), Optional.of(getLogicalProperties()), child());
+    }
+
     @Override
     public LogicalPartitionTopN<Plan> withChildren(List<Plan> children) {
         Preconditions.checkArgument(children.size() == 1);
@@ -189,8 +197,10 @@ public class LogicalPartitionTopN<CHILD_TYPE extends Plan> extends LogicalUnary<
     }
 
     @Override
-    public LogicalPartitionTopN<Plan> withLogicalProperties(Optional<LogicalProperties> logicalProperties) {
+    public Plan withGroupExprLogicalPropChildren(Optional<GroupExpression> groupExpression,
+            Optional<LogicalProperties> logicalProperties, List<Plan> children) {
+        Preconditions.checkArgument(children.size() == 1);
         return new LogicalPartitionTopN<>(function, partitionKeys, orderKeys, hasGlobalLimit, partitionLimit,
-            Optional.empty(), logicalProperties, child());
+                groupExpression, logicalProperties, children.get(0));
     }
 }

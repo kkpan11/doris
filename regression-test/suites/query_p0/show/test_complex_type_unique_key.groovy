@@ -22,15 +22,13 @@ suite("test_complex_type_unique_key", "p0") {
     def dataFile1 = "complex_unique_2.csv"
 
     sql "DROP TABLE IF EXISTS ${testTable}"
-    sql "ADMIN SET FRONTEND CONFIG ('enable_struct_type' = 'true')"
-    sql "ADMIN SET FRONTEND CONFIG ('enable_map_type' = 'true')"
 
     sql """
         CREATE TABLE IF NOT EXISTS tbl_test_complex_unique (
             id INT,
             a ARRAY<SMALLINT> NOT NULL COMMENT "",
             m MAP<STRING, INT(11)> NOT NULL COMMENT "",
-            s STRUCT<f1:SMALLINT, f2:INT(11)> NOT NULL COMMENT "",
+            s STRUCT<f1:SMALLINT COMMENT 'sf1', f2:INT(11) COMMENT 'sf2'> NOT NULL COMMENT "",
             an ARRAY<DATE>,
             mn MAP<STRING, INT(11)>,
             sn STRUCT<f1:SMALLINT, f2:INT(11)>

@@ -31,13 +31,16 @@ namespace segment_v2 {
 static const size_t PLAIN_PAGE_HEADER_SIZE = sizeof(uint32_t);
 
 template <FieldType Type>
-class PlainPageBuilder : public PageBuilder {
+class PlainPageBuilder : public PageBuilderHelper<PlainPageBuilder<Type> > {
 public:
-    PlainPageBuilder(const PageBuilderOptions& options) : _options(options) {
+    using Self = PlainPageBuilder<Type>;
+    friend class PageBuilderHelper<Self>;
+
+    Status init() override {
         // Reserve enough space for the page, plus a bit of slop since
         // we often overrun the page by a few values.
-        _buffer.reserve(_options.data_page_size + 1024);
-        reset();
+        RETURN_IF_CATCH_EXCEPTION(_buffer.reserve(_options.data_page_size + 1024));
+        return reset();
     }
 
     bool is_page_full() override { return _buffer.size() > _options.data_page_size; }
@@ -48,27 +51,36 @@ public:
             return Status::OK();
         }
         size_t old_size = _buffer.size();
-        _buffer.resize(old_size + *count * SIZE_OF_TYPE);
+        // This may need a large memory, should return error if could not allocated
+        // successfully, to avoid BE OOM.
+        RETURN_IF_CATCH_EXCEPTION(_buffer.resize(old_size + *count * SIZE_OF_TYPE));
         memcpy(&_buffer[old_size], vals, *count * SIZE_OF_TYPE);
         _count += *count;
         return Status::OK();
     }
 
-    OwnedSlice finish() override {
+    Status finish(OwnedSlice* slice) override {
         encode_fixed32_le((uint8_t*)&_buffer[0], _count);
-        if (_count > 0) {
-            _first_value.assign_copy(&_buffer[PLAIN_PAGE_HEADER_SIZE], SIZE_OF_TYPE);
-            _last_value.assign_copy(&_buffer[PLAIN_PAGE_HEADER_SIZE + (_count - 1) * SIZE_OF_TYPE],
-                                    SIZE_OF_TYPE);
-        }
-        return _buffer.build();
+        RETURN_IF_CATCH_EXCEPTION({
+            if (_count > 0) {
+                _first_value.assign_copy(&_buffer[PLAIN_PAGE_HEADER_SIZE], SIZE_OF_TYPE);
+                _last_value.assign_copy(
+                        &_buffer[PLAIN_PAGE_HEADER_SIZE + (_count - 1) * SIZE_OF_TYPE],
+                        SIZE_OF_TYPE);
+            }
+            *slice = _buffer.build();
+        });
+        return Status::OK();
     }
 
-    void reset() override {
-        _buffer.reserve(_options.data_page_size + 1024);
-        _count = 0;
-        _buffer.clear();
-        _buffer.resize(PLAIN_PAGE_HEADER_SIZE);
+    Status reset() override {
+        RETURN_IF_CATCH_EXCEPTION({
+            _buffer.reserve(_options.data_page_size + 1024);
+            _count = 0;
+            _buffer.clear();
+            _buffer.resize(PLAIN_PAGE_HEADER_SIZE);
+        });
+        return Status::OK();
     }
 
     size_t count() const override { return _count; }
@@ -77,7 +89,7 @@ public:
 
     Status get_first_value(void* value) const override {
         if (_count == 0) {
-            return Status::NotFound("page is empty");
+            return Status::Error<ErrorCode::ENTRY_NOT_FOUND>("page is empty");
         }
         memcpy(value, _first_value.data(), SIZE_OF_TYPE);
         return Status::OK();
@@ -85,13 +97,15 @@ public:
 
     Status get_last_value(void* value) const override {
         if (_count == 0) {
-            return Status::NotFound("page is empty");
+            return Status::Error<ErrorCode::ENTRY_NOT_FOUND>("page is empty");
         }
         memcpy(value, _last_value.data(), SIZE_OF_TYPE);
         return Status::OK();
     }
 
 private:
+    PlainPageBuilder(const PageBuilderOptions& options) : _options(options) {}
+
     faststring _buffer;
     PageBuilderOptions _options;
     size_t _count;
@@ -125,7 +139,7 @@ public:
 
         _parsed = true;
 
-        seek_to_position_in_page(0);
+        RETURN_IF_ERROR(seek_to_position_in_page(0));
         return Status::OK();
     }
 
@@ -147,7 +161,7 @@ public:
         DCHECK(_parsed) << "Must call init() firstly";
 
         if (_num_elems == 0) {
-            return Status::NotFound("page is empty");
+            return Status::Error<ErrorCode::ENTRY_NOT_FOUND>("page is empty");
         }
 
         size_t left = 0;
@@ -168,7 +182,7 @@ public:
             }
         }
         if (left >= _num_elems) {
-            return Status::NotFound("all value small than the value");
+            return Status::Error<ErrorCode::ENTRY_NOT_FOUND>("all value small than the value");
         }
         const void* find_value = &_data[PLAIN_PAGE_HEADER_SIZE + left * SIZE_OF_TYPE];
         if (TypeTraits<Type>::cmp(find_value, value) == 0) {

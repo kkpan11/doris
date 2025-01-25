@@ -18,7 +18,6 @@
 package org.apache.doris.analysis;
 
 import org.apache.doris.catalog.Env;
-import org.apache.doris.cluster.ClusterNamespace;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
@@ -32,7 +31,7 @@ import com.google.common.base.Strings;
 import java.util.Map;
 import java.util.Optional;
 
-public class DropFileStmt extends DdlStmt {
+public class DropFileStmt extends DdlStmt implements NotFallbackInParser {
     public static final String PROP_CATALOG = "catalog";
 
     private String fileName;
@@ -70,11 +69,6 @@ public class DropFileStmt extends DdlStmt {
 
         if (dbName == null) {
             dbName = analyzer.getDefaultDb();
-        } else {
-            if (Strings.isNullOrEmpty(analyzer.getClusterName())) {
-                ErrorReport.reportAnalysisException(ErrorCode.ERR_CLUSTER_NAME_NULL);
-            }
-            dbName = ClusterNamespace.getFullName(analyzer.getClusterName(), dbName);
         }
 
         if (Strings.isNullOrEmpty(dbName)) {
@@ -114,5 +108,10 @@ public class DropFileStmt extends DdlStmt {
     @Override
     public RedirectStatus getRedirectStatus() {
         return RedirectStatus.FORWARD_WITH_SYNC;
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.DROP;
     }
 }

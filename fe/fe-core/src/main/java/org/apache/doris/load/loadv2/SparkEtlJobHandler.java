@@ -60,6 +60,7 @@ import java.util.Map;
  * 4. get spark etl file paths
  * 5. delete etl output path
  */
+@Deprecated
 public class SparkEtlJobHandler {
     private static final Logger LOG = LogManager.getLogger(SparkEtlJobHandler.class);
 
@@ -223,11 +224,13 @@ public class SparkEtlJobHandler {
                     if (stderr.contains("doesn't exist in RM")) {
                         LOG.warn("spark app not found. spark app id: {}, load job id: {}", appId, loadJobId);
                         status.setState(TEtlState.CANCELLED);
+                        status.setFailMsg(stderr);
                     }
                 }
                 LOG.warn("yarn application status failed. spark app id: {}, load job id: {}, timeout: {}, msg: {}",
                             appId, loadJobId, EXEC_CMD_TIMEOUT_MS, stderr);
                 status.setState(TEtlState.CANCELLED);
+                status.setFailMsg(stderr);
                 return status;
             }
             ApplicationReport report = new YarnApplicationReport(result.getStdout()).getReport();
@@ -346,7 +349,9 @@ public class SparkEtlJobHandler {
             }
             filePathToSize.put(fstatus.getPath(), fstatus.getSize());
         }
-        LOG.debug("get spark etl file paths. files map: {}", filePathToSize);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("get spark etl file paths. files map: {}", filePathToSize);
+        }
 
         return filePathToSize;
     }
@@ -361,7 +366,7 @@ public class SparkEtlJobHandler {
 
     public void deleteEtlOutputPath(String outputPath, BrokerDesc brokerDesc) {
         try {
-            BrokerUtil.deletePath(outputPath, brokerDesc);
+            BrokerUtil.deletePathWithBroker(outputPath, brokerDesc);
             LOG.info("delete path success. path: {}", outputPath);
         } catch (UserException e) {
             LOG.warn("delete path failed. path: {}", outputPath, e);

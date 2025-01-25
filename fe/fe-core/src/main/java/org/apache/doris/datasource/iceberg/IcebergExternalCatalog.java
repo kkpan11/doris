@@ -17,65 +17,67 @@
 
 package org.apache.doris.datasource.iceberg;
 
-import org.apache.doris.common.AnalysisException;
-import org.apache.doris.common.FeNameFormat;
-import org.apache.doris.common.util.Util;
+import org.apache.doris.common.ThreadPoolManager;
+import org.apache.doris.common.security.authentication.AuthenticationConfig;
+import org.apache.doris.common.security.authentication.HadoopAuthenticator;
+import org.apache.doris.common.security.authentication.PreExecutionAuthenticator;
 import org.apache.doris.datasource.ExternalCatalog;
 import org.apache.doris.datasource.InitCatalogLog;
 import org.apache.doris.datasource.SessionContext;
+import org.apache.doris.datasource.operations.ExternalMetadataOperations;
+import org.apache.doris.datasource.property.PropertyConverter;
+import org.apache.doris.transaction.TransactionManagerFactory;
 
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hdfs.HdfsConfiguration;
+import org.apache.hadoop.fs.s3a.Constants;
 import org.apache.iceberg.catalog.Catalog;
-import org.apache.iceberg.catalog.Namespace;
-import org.apache.iceberg.catalog.SupportsNamespaces;
-import org.apache.iceberg.catalog.TableIdentifier;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Collectors;
 
 public abstract class IcebergExternalCatalog extends ExternalCatalog {
 
-    private static final Logger LOG = LogManager.getLogger(IcebergExternalCatalog.class);
     public static final String ICEBERG_CATALOG_TYPE = "iceberg.catalog.type";
     public static final String ICEBERG_REST = "rest";
     public static final String ICEBERG_HMS = "hms";
+    public static final String ICEBERG_HADOOP = "hadoop";
     public static final String ICEBERG_GLUE = "glue";
     public static final String ICEBERG_DLF = "dlf";
+    public static final String EXTERNAL_CATALOG_NAME = "external_catalog.name";
     protected String icebergCatalogType;
     protected Catalog catalog;
-    protected SupportsNamespaces nsCatalog;
+    private static final int ICEBERG_CATALOG_EXECUTOR_THREAD_NUM = 16;
 
     public IcebergExternalCatalog(long catalogId, String name, String comment) {
         super(catalogId, name, InitCatalogLog.Type.ICEBERG, comment);
     }
 
-    @Override
-    protected void init() {
-        nsCatalog = (SupportsNamespaces) catalog;
-        super.init();
-    }
+    // Create catalog based on catalog type
+    protected abstract void initCatalog();
 
-    protected Configuration getConfiguration() {
-        Configuration conf = new HdfsConfiguration();
-        Map<String, String> catalogProperties = catalogProperty.getHadoopProperties();
-        for (Map.Entry<String, String> entry : catalogProperties.entrySet()) {
-            conf.set(entry.getKey(), entry.getValue());
-        }
-        return conf;
+    @Override
+    protected void initLocalObjectsImpl() {
+        preExecutionAuthenticator = new PreExecutionAuthenticator();
+        // TODO If the storage environment does not support Kerberos (such as s3),
+        //      there is no need to generate a simple authentication information anymore.
+        AuthenticationConfig config = AuthenticationConfig.getKerberosConfig(getConfiguration());
+        HadoopAuthenticator authenticator = HadoopAuthenticator.getHadoopAuthenticator(config);
+        preExecutionAuthenticator.setHadoopAuthenticator(authenticator);
+        initCatalog();
+        IcebergMetadataOps ops = ExternalMetadataOperations.newIcebergMetadataOps(this, catalog);
+        transactionManager = TransactionManagerFactory.createIcebergTransactionManager(ops);
+        threadPoolWithPreAuth = ThreadPoolManager.newDaemonFixedThreadPoolWithPreAuth(
+            ICEBERG_CATALOG_EXECUTOR_THREAD_NUM,
+            Integer.MAX_VALUE,
+            String.format("iceberg_catalog_%s_executor_pool", name),
+            true,
+            preExecutionAuthenticator);
+        metadataOps = ops;
     }
 
     public Catalog getCatalog() {
         makeSureInitialized();
-        return catalog;
-    }
-
-    public SupportsNamespaces getNsCatalog() {
-        makeSureInitialized();
-        return nsCatalog;
+        return ((IcebergMetadataOps) metadataOps).getCatalog();
     }
 
     public String getIcebergCatalogType() {
@@ -83,36 +85,20 @@ public abstract class IcebergExternalCatalog extends ExternalCatalog {
         return icebergCatalogType;
     }
 
-    protected List<String> listDatabaseNames() {
-        return nsCatalog.listNamespaces().stream()
-            .map(e -> {
-                String dbName = e.toString();
-                try {
-                    FeNameFormat.checkDbName(dbName);
-                } catch (AnalysisException ex) {
-                    Util.logAndThrowRuntimeException(LOG,
-                            String.format("Not a supported namespace name format: %s", dbName), ex);
-                }
-                return dbName;
-            })
-            .collect(Collectors.toList());
-    }
-
     @Override
     public boolean tableExist(SessionContext ctx, String dbName, String tblName) {
         makeSureInitialized();
-        return catalog.tableExists(TableIdentifier.of(dbName, tblName));
+        return metadataOps.tableExist(dbName, tblName);
     }
 
     @Override
     public List<String> listTableNames(SessionContext ctx, String dbName) {
         makeSureInitialized();
-        List<TableIdentifier> tableIdentifiers = catalog.listTables(Namespace.of(dbName));
-        return tableIdentifiers.stream().map(TableIdentifier::name).collect(Collectors.toList());
+        return metadataOps.listTableNames(dbName);
     }
 
-    public org.apache.iceberg.Table getIcebergTable(String dbName, String tblName) {
-        makeSureInitialized();
-        return catalog.loadTable(TableIdentifier.of(dbName, tblName));
+    protected void initS3Param(Configuration conf) {
+        Map<String, String> properties = catalogProperty.getHadoopProperties();
+        conf.set(Constants.AWS_CREDENTIALS_PROVIDER, PropertyConverter.getAWSCredentialsProviders(properties));
     }
 }

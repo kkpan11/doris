@@ -20,9 +20,20 @@
 // **Note**: default db will be create if not exist
 defaultDb = "regression_test"
 
-jdbcUrl = "jdbc:mysql://172.19.0.2:9131/?useLocalSessionState=true&allowLoadLocalInfile=true"
+jdbcUrl = "jdbc:mysql://172.19.0.2:9131/?useLocalSessionState=true&allowLoadLocalInfile=true&zeroDateTimeBehavior=round"
+targetJdbcUrl = "jdbc:mysql://172.19.0.2:9131/?useLocalSessionState=true&allowLoadLocalInfile=true&zeroDateTimeBehavior=round"
 jdbcUser = "root"
 jdbcPassword = ""
+
+ccrDownstreamUrl = "jdbc:mysql://172.19.0.2:9131/?useLocalSessionState=true&allowLoadLocalInfile=true"
+ccrDownstreamUser = "root"
+ccrDownstreamPassword = ""
+ccrDownstreamFeThriftAddress = "127.0.0.1:9020"
+
+feSourceThriftAddress = "127.0.0.1:9020"
+feTargetThriftAddress = "127.0.0.1:9020"
+feSyncerUser = "root"
+feSyncerPassword = ""
 
 feHttpAddress = "172.19.0.2:8131"
 feHttpUser = "root"
@@ -34,6 +45,7 @@ suitePath = "${DORIS_HOME}/regression-test/suites"
 dataPath = "${DORIS_HOME}/regression-test/data"
 pluginPath = "${DORIS_HOME}/regression-test/plugins"
 realDataPath = "${DORIS_HOME}/regression-test/realdata"
+trinoPluginsPath = "/tmp/trino_connector"
 // sf1DataPath can be url like "https://doris-community-test-1308700295.cos.ap-hongkong.myqcloud.com" or local path like "/data"
 //sf1DataPath = "https://doris-community-test-1308700295.cos.ap-hongkong.myqcloud.com"
 
@@ -48,9 +60,28 @@ testDirectories = ""
 // this groups will not be executed
 excludeGroups = ""
 // this suites will not be executed
-excludeSuites = "test_broker_load,test_spark_load,analyze_test"
+// load_stream_fault_injection may cause bad disk
+
+excludeSuites = "000_the_start_sentinel_do_not_touch," + // keep this line as the first line
+    "test_dump_image," +
+    "test_index_failure_injection," +
+    "test_profile," +
+    "test_refresh_mtmv," +
+    "test_spark_load," +
+    "test_broker_load_func," +
+    "test_index_compaction_failure_injection," +
+    "test_full_compaction_run_status," +
+    "test_topn_fault_injection," + 
+    "zzz_the_end_sentinel_do_not_touch" // keep this line as the last line
+
 // this directories will not be executed
-excludeDirectories = ""
+excludeDirectories = "000_the_start_sentinel_do_not_touch," + // keep this line as the first line
+    "cloud," +
+    "cloud_p0," +
+    "nereids_rules_p0/subquery," +
+    "workload_manager_p1," +
+    "plsql_p0," + // plsql is not developped any more, add by sk
+    "zzz_the_end_sentinel_do_not_touch"// keep this line as the last line
 
 customConf1 = "test_custom_conf_value"
 
@@ -70,17 +101,53 @@ enableBrokerLoad=true
 enableJdbcTest=false
 mysql_57_port=7111
 pg_14_port=7121
-
+mariadb_10_port=3326
 // hive catalog test config
 // To enable jdbc test, you need first start hive container.
 // See `docker/thirdparties/start-thirdparties-docker.sh`
 enableHiveTest=false
-hms_port=7141
+enablePaimonTest=false
+
+// port of hive2 docker
+hive2HmsPort=9083
+hive2HdfsPort=8020
+hive2ServerPort=10000
+hive2PgPort=5432
+
+// port of hive3 docker
+hive3HmsPort=9383
+hive3HdfsPort=8320
+hive3ServerPort=13000
+hive3PgPort=5732
+
+// kafka test config
+// to enable kafka test, you need firstly to start kafka container
+// See `docker/thirdparties/start-thirdparties-docker.sh`
+enableKafkaTest=true
+kafka_port=19193
+
+// iceberg test config
+iceberg_rest_uri_port=18181
+iceberg_minio_port=19001
+
+enableEsTest=false
+es_6_port=19200
+es_7_port=29200
+es_8_port=39200
 
 cacheDataPath = "/data/regression/"
 
-s3Endpoint = "cos.ap-hongkong.myqcloud.com"
-s3BucketName = "doris-build-hk-1308700295"
-s3Region = "ap-hongkong"
+s3Source="aliyun"
+
+//arrow flight sql test config
+extArrowFlightSqlHost = "127.0.0.1"
+extArrowFlightSqlPort = 8081
+extArrowFlightSqlUser = "root"
+extArrowFlightSqlPassword= ""
 
 max_failure_num=50
+
+externalEnvIp="127.0.0.1"
+
+// trino-connector catalog test config
+enableTrinoConnectorTest = false

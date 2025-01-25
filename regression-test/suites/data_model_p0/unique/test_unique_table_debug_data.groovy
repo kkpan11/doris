@@ -19,7 +19,6 @@ import org.codehaus.groovy.runtime.IOGroovyMethods
 
 suite("test_unique_table_debug_data") {
 
-    sql "ADMIN SET FRONTEND CONFIG ('enable_batch_delete_by_default' = 'true')"
     sql "SET show_hidden_columns=false"
     sql "SET skip_delete_predicate=false"
     sql "SET skip_storage_engine_merge=false"
@@ -38,6 +37,7 @@ suite("test_unique_table_debug_data") {
                 "enable_unique_key_merge_on_write" = "false"
             );
         """
+        // test mor table
 
     //BackendId,Cluster,IP,HeartbeatPort,BePort,HttpPort,BrpcPort,LastStartTime,LastHeartbeat,Alive,SystemDecommissioned,ClusterDecommissioned,TabletNum,DataUsedCapacity,AvailCapacity,TotalCapacity,UsedPct,MaxDiskUsedPct,Tag,ErrMsg,Version,Status
     String[][] backends = sql """ show backends; """

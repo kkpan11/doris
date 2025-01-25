@@ -30,15 +30,17 @@
 #include <type_traits>
 #include <utility>
 
-// IWYU pragma: no_include <opentelemetry/common/threadlocal.h>
 #include "common/compiler_util.h" // IWYU pragma: keep
 #include "common/status.h"
 #include "vec/columns/column.h"
 #include "vec/columns/column_array.h"
 #include "vec/columns/column_impl.h"
+#include "vec/columns/column_nullable.h"
+#include "vec/columns/column_struct.h"
 #include "vec/columns/column_vector.h"
 #include "vec/common/assert_cast.h"
 #include "vec/common/cow.h"
+#include "vec/common/sip_hash.h"
 #include "vec/common/string_ref.h"
 #include "vec/core/field.h"
 #include "vec/core/types.h"
@@ -75,8 +77,6 @@ public:
     }
 
     std::string get_name() const override;
-    const char* get_family_name() const override { return "Map"; }
-    TypeIndex get_data_type() const override { return TypeIndex::Map; }
 
     void for_each_subcolumn(ColumnCallback callback) override {
         callback(keys_column);
@@ -90,9 +90,15 @@ public:
         offsets_column->clear();
     }
 
-    MutableColumnPtr clone_resized(size_t size) const override;
+    ColumnPtr convert_to_full_column_if_const() const override;
 
-    bool can_be_inside_nullable() const override { return true; }
+    MutableColumnPtr clone_resized(size_t size) const override;
+    bool is_variable_length() const override { return true; }
+
+    bool is_exclusive() const override {
+        return IColumn::is_exclusive() && keys_column->is_exclusive() &&
+               values_column->is_exclusive() && offsets_column->is_exclusive();
+    }
 
     Field operator[](size_t n) const override;
     void get(size_t n, Field& res) const override;
@@ -100,6 +106,8 @@ public:
 
     void insert_data(const char* pos, size_t length) override;
     void insert_range_from(const IColumn& src, size_t start, size_t length) override;
+    void insert_range_from_ignore_overflow(const IColumn& src, size_t start,
+                                           size_t length) override;
     void insert_from(const IColumn& src_, size_t n) override;
     void insert(const Field& x) override;
     void insert_default() override;
@@ -110,46 +118,30 @@ public:
     const char* deserialize_and_insert_from_arena(const char* pos) override;
 
     void update_hash_with_value(size_t n, SipHash& hash) const override;
-
+    void shrink_padding_chars() override;
     ColumnPtr filter(const Filter& filt, ssize_t result_size_hint) const override;
     size_t filter(const Filter& filter) override;
-    Status filter_by_selector(const uint16_t* sel, size_t sel_size, IColumn* col_ptr) override;
     ColumnPtr permute(const Permutation& perm, size_t limit) const override;
     ColumnPtr replicate(const Offsets& offsets) const override;
-    MutableColumns scatter(ColumnIndex num_columns, const Selector& selector) const override {
-        return scatter_impl<ColumnMap>(num_columns, selector);
-    }
-    void get_extremes(Field& min, Field& max) const override {
-        LOG(FATAL) << "get_extremes not implemented";
-    };
-    [[noreturn]] int compare_at(size_t n, size_t m, const IColumn& rhs_,
-                                int nan_direction_hint) const override {
-        LOG(FATAL) << "compare_at not implemented";
-    }
-    void get_permutation(bool reverse, size_t limit, int nan_direction_hint,
-                         Permutation& res) const override {
-        LOG(FATAL) << "get_permutation not implemented";
-    }
-    void insert_indices_from(const IColumn& src, const int* indices_begin,
-                             const int* indices_end) override;
 
-    void append_data_by_selector(MutableColumnPtr& res,
-                                 const IColumn::Selector& selector) const override {
-        return append_data_by_selector_impl<ColumnMap>(res, selector);
-    }
+    int compare_at(size_t n, size_t m, const IColumn& rhs_, int nan_direction_hint) const override;
 
-    void replace_column_data(const IColumn&, size_t row, size_t self_row = 0) override {
-        LOG(FATAL) << "replace_column_data not implemented";
-    }
-    void replace_column_data_default(size_t self_row = 0) override {
-        LOG(FATAL) << "replace_column_data_default not implemented";
+    void insert_indices_from(const IColumn& src, const uint32_t* indices_begin,
+                             const uint32_t* indices_end) override;
+
+    void insert_many_from(const IColumn& src, size_t position, size_t length) override;
+
+    void replace_column_data(const IColumn& rhs, size_t row, size_t self_row = 0) override {
+        throw doris::Exception(ErrorCode::INTERNAL_ERROR,
+                               "Method replace_column_data is not supported for " + get_name());
     }
 
     ColumnArray::Offsets64& ALWAYS_INLINE get_offsets() {
-        return assert_cast<COffsets&>(*offsets_column).get_data();
+        return assert_cast<COffsets&, TypeCheckOnRelease::DISABLE>(*offsets_column).get_data();
     }
     const ColumnArray::Offsets64& ALWAYS_INLINE get_offsets() const {
-        return assert_cast<const COffsets&>(*offsets_column).get_data();
+        return assert_cast<const COffsets&, TypeCheckOnRelease::DISABLE>(*offsets_column)
+                .get_data();
     }
     IColumn& get_offsets_column() { return *offsets_column; }
     const IColumn& get_offsets_column() const { return *offsets_column; }
@@ -164,7 +156,18 @@ public:
     void resize(size_t n) override;
     size_t byte_size() const override;
     size_t allocated_bytes() const override;
-    void protect() override;
+
+    void update_xxHash_with_value(size_t start, size_t end, uint64_t& hash,
+                                  const uint8_t* __restrict null_data) const override;
+    void update_crc_with_value(size_t start, size_t end, uint32_t& hash,
+                               const uint8_t* __restrict null_data) const override;
+
+    void update_hashes_with_value(uint64_t* __restrict hashes,
+                                  const uint8_t* __restrict null_data = nullptr) const override;
+
+    void update_crcs_with_value(uint32_t* __restrict hash, PrimitiveType type, uint32_t rows,
+                                uint32_t offset = 0,
+                                const uint8_t* __restrict null_data = nullptr) const override;
 
     /******************** keys and values ***************/
     const ColumnPtr& get_keys_ptr() const { return keys_column; }
@@ -191,6 +194,12 @@ public:
 
     size_t ALWAYS_INLINE size_at(ssize_t i) const {
         return get_offsets()[i] - get_offsets()[i - 1];
+    }
+
+    ColumnPtr convert_column_if_overflow() override {
+        keys_column = keys_column->convert_column_if_overflow();
+        values_column = values_column->convert_column_if_overflow();
+        return IColumn::convert_column_if_overflow();
     }
 
 private:

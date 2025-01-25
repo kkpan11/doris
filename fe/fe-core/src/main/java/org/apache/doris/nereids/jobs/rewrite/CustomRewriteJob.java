@@ -17,16 +17,16 @@
 
 package org.apache.doris.nereids.jobs.rewrite;
 
+import org.apache.doris.nereids.CascadesContext;
+import org.apache.doris.nereids.PlanProcess;
 import org.apache.doris.nereids.jobs.Job;
 import org.apache.doris.nereids.jobs.JobContext;
-import org.apache.doris.nereids.jobs.RewriteJob;
 import org.apache.doris.nereids.rules.RuleType;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.visitor.CustomRewriter;
 
-import java.util.Locale;
+import java.util.BitSet;
 import java.util.Objects;
-import java.util.Set;
 import java.util.function.Supplier;
 
 /**
@@ -36,8 +36,8 @@ import java.util.function.Supplier;
  * You can check the 'CustomRewriter' interface to see which rules use this way to do rewrite.
  */
 public class CustomRewriteJob implements RewriteJob {
-    private final RuleType ruleType;
 
+    private final RuleType ruleType;
     private final Supplier<CustomRewriter> customRewriter;
 
     /**
@@ -50,23 +50,29 @@ public class CustomRewriteJob implements RewriteJob {
 
     @Override
     public void execute(JobContext context) {
-        Set<String> disableRules = Job.getDisableRules(context);
-        if (disableRules.contains(ruleType.name().toUpperCase(Locale.ROOT))) {
+        BitSet disableRules = Job.getDisableRules(context);
+        if (disableRules.get(ruleType.type())) {
             return;
         }
-        Plan root = context.getCascadesContext().getRewritePlan();
+        CascadesContext cascadesContext = context.getCascadesContext();
+        Plan root = cascadesContext.getRewritePlan();
         // COUNTER_TRACER.log(CounterEvent.of(Memo.get=-StateId(), CounterType.JOB_EXECUTION, group, logicalExpression,
         //         root));
         Plan rewrittenRoot = customRewriter.get().rewriteRoot(root, context);
+        if (rewrittenRoot == null) {
+            return;
+        }
 
         // don't remove this comment, it can help us to trace some bug when developing.
 
-        // if (!root.deepEquals(rewrittenRoot)) {
-        //     String traceBefore = root.treeString();
-        //     String traceAfter = root.treeString();
-        //     printTraceLog(ruleType, traceBefore, traceAfter);
-        // }
-        context.getCascadesContext().setRewritePlan(rewrittenRoot);
+        if (!root.deepEquals(rewrittenRoot)) {
+            if (cascadesContext.showPlanProcess()) {
+                PlanProcess planProcess = new PlanProcess(
+                        ruleType.name(), root.treeString(), rewrittenRoot.treeString());
+                cascadesContext.addPlanProcess(planProcess);
+            }
+        }
+        cascadesContext.setRewritePlan(rewrittenRoot);
     }
 
     @Override
@@ -74,8 +80,8 @@ public class CustomRewriteJob implements RewriteJob {
         return false;
     }
 
-    private void printTraceLog(RuleType ruleType, String traceBefore, String traceAfter) {
-        System.out.println("========== " + getClass().getSimpleName() + " " + ruleType
-                + " ==========\nbefore:\n" + traceBefore + "\n\nafter:\n" + traceAfter + "\n");
+    public RuleType getRuleType() {
+        return ruleType;
     }
+
 }

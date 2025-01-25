@@ -20,11 +20,14 @@ package org.apache.doris;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.CommandLineOptions;
 import org.apache.doris.common.Config;
+import org.apache.doris.common.FeConstants;
+import org.apache.doris.common.FeMetaVersion;
 import org.apache.doris.common.LdapConfig;
 import org.apache.doris.common.Log4jConfig;
+import org.apache.doris.common.LogUtils;
 import org.apache.doris.common.ThreadPoolManager;
 import org.apache.doris.common.Version;
-import org.apache.doris.common.telemetry.Telemetry;
+import org.apache.doris.common.lock.DeadlockMonitor;
 import org.apache.doris.common.util.JdkUtils;
 import org.apache.doris.common.util.NetUtils;
 import org.apache.doris.httpv2.HttpServer;
@@ -33,14 +36,15 @@ import org.apache.doris.journal.bdbje.BDBTool;
 import org.apache.doris.journal.bdbje.BDBToolOptions;
 import org.apache.doris.persist.meta.MetaReader;
 import org.apache.doris.qe.QeService;
+import org.apache.doris.qe.SimpleScheduler;
 import org.apache.doris.service.ExecuteEnv;
 import org.apache.doris.service.FeServer;
 import org.apache.doris.service.FrontendOptions;
 
 import com.google.common.base.Charsets;
 import com.google.common.base.Strings;
-import io.grpc.netty.shaded.io.netty.util.internal.logging.InternalLoggerFactory;
-import io.grpc.netty.shaded.io.netty.util.internal.logging.Log4JLoggerFactory;
+import io.netty.util.internal.logging.InternalLoggerFactory;
+import io.netty.util.internal.logging.Log4JLoggerFactory;
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.CommandLineParser;
 import org.apache.commons.cli.DefaultParser;
@@ -53,8 +57,12 @@ import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.lang.management.ManagementFactory;
+import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.channels.OverlappingFileLockException;
+import java.nio.file.StandardOpenOption;
+import java.time.LocalDate;
+import java.util.concurrent.TimeUnit;
 
 public class DorisFE {
     private static final Logger LOG = LogManager.getLogger(DorisFE.class);
@@ -66,11 +74,35 @@ public class DorisFE {
     public static final String DORIS_HOME_DIR = System.getenv("DORIS_HOME");
     public static final String PID_DIR = System.getenv("PID_DIR");
 
+
+    private static String LOCK_FILE_PATH;
+
+    private static final String LOCK_FILE_NAME = "process.lock";
+    private static FileChannel processLockFileChannel;
+    private static FileLock processFileLock;
+
     public static void main(String[] args) {
+        // Every doris version should have a final meta version, it should not change
+        // between small releases. Add a check here to avoid mistake.
+        if (Version.DORIS_FE_META_VERSION > 0
+                && FeMetaVersion.VERSION_CURRENT != Version.DORIS_FE_META_VERSION) {
+            System.err.println("This release's fe meta version should be "
+                    + Version.DORIS_FE_META_VERSION
+                    + " but it is " + FeMetaVersion.VERSION_CURRENT
+                    + ". It should not change, or FE could not rollback in this version");
+            return;
+        }
         StartupOptions options = new StartupOptions();
         options.enableHttpServer = true;
         options.enableQeService = true;
         start(DORIS_HOME_DIR, PID_DIR, args, options);
+    }
+
+    private static void startMonitor() {
+        if (Config.enable_deadlock_detection) {
+            DeadlockMonitor deadlockMonitor = new DeadlockMonitor();
+            deadlockMonitor.startMonitoring(Config.deadlock_detection_interval_minute, TimeUnit.MINUTES);
+        }
     }
 
     // entrance for doris frontend
@@ -91,11 +123,6 @@ public class DorisFE {
         CommandLineOptions cmdLineOpts = parseArgs(args);
 
         try {
-            // pid file
-            if (!createAndLockPidFile(pidDir + "/fe.pid")) {
-                throw new IOException("pid file is already locked.");
-            }
-
             // init config
             Config config = new Config();
             config.init(dorisHomeDir + "/conf/fe.conf");
@@ -108,18 +135,35 @@ public class DorisFE {
                 ldapConfig.init(dorisHomeDir + "/conf/ldap.conf");
             }
 
+            overwriteConfigs();
+
             // check it after Config is initialized, otherwise the config 'check_java_version' won't work.
             if (!JdkUtils.checkJavaVersion()) {
                 throw new IllegalArgumentException("Java version doesn't match");
             }
 
             Log4jConfig.initLogging(dorisHomeDir + "/conf/");
+            Runtime.getRuntime().addShutdownHook(new Thread(LogManager::shutdown));
 
             // set dns cache ttl
             java.security.Security.setProperty("networkaddress.cache.ttl", "60");
 
+            // pid file
+            if (!cmdLineOpts.isVersion() && !createAndLockPidFile(pidDir + "/fe.pid")) {
+                throw new IOException("pid file is already locked.");
+            }
+
             // check command line options
             checkCommandLineOptions(cmdLineOpts);
+
+            try {
+                tryLockProcess();
+            } catch (Exception e) {
+                LOG.error("start doris failed.", e);
+                System.exit(-1);
+            }
+
+            fuzzyConfigs();
 
             LOG.info("Doris FE starting...");
 
@@ -130,7 +174,7 @@ public class DorisFE {
 
             if (Config.enable_bdbje_debug_mode) {
                 // Start in BDB Debug mode
-                BDBDebugger.get().startDebugMode(dorisHomeDir);
+                BDBDebugger.get().startDebugMode(Config.meta_dir + "/bdb");
                 return;
             }
 
@@ -145,8 +189,6 @@ public class DorisFE {
             // init catalog and wait it be ready
             Env.getCurrentEnv().initialize(args);
             Env.getCurrentEnv().waitForReady();
-
-            Telemetry.initOpenTelemetry();
 
             // init and start:
             // 1. HttpServer for HTTP Server
@@ -175,22 +217,35 @@ public class DorisFE {
                 Env.getCurrentEnv().setHttpReady(true);
             }
 
+            SimpleScheduler.init();
+
             if (options.enableQeService) {
-                QeService qeService = new QeService(Config.query_port, ExecuteEnv.getInstance().getScheduler());
+                QeService qeService = new QeService(Config.query_port, Config.arrow_flight_sql_port,
+                                                    ExecuteEnv.getInstance().getScheduler());
                 qeService.start();
             }
 
             ThreadPoolManager.registerAllThreadPoolMetric();
-
+            startMonitor();
             while (true) {
                 Thread.sleep(2000);
             }
         } catch (Throwable e) {
-            LOG.warn("", e);
+            // Some exception may thrown before LOG is inited.
+            // So need to print to stdout
+            e.printStackTrace();
+            LOG.error("", e);
+            // to avoid nonDaemon Thread block main Thread, we need to force exit
+            System.exit(-1);
         }
     }
 
     private static void checkAllPorts() throws IOException {
+        if (Config.enable_check_compatibility_mode) {
+            // The compatibility mode does not need to listen ports.
+            return;
+        }
+
         if (!NetUtils.isPortAvailable(FrontendOptions.getLocalHostAddress(), Config.edit_log_port,
                 "Edit log port", NetUtils.EDIT_LOG_PORT_SUGGESTION)) {
             throw new IOException("port " + Config.edit_log_port + " already in use");
@@ -210,6 +265,11 @@ public class DorisFE {
         if (!NetUtils.isPortAvailable(FrontendOptions.getLocalHostAddress(), Config.rpc_port,
                 "Rpc port", NetUtils.RPC_PORT_SUGGESTION)) {
             throw new IOException("port " + Config.rpc_port + " already in use");
+        }
+        if (Config.arrow_flight_sql_port != -1
+                && !NetUtils.isPortAvailable(FrontendOptions.getLocalHostAddress(), Config.arrow_flight_sql_port,
+                "Arrow Flight SQL port", NetUtils.ARROW_FLIGHT_SQL_SUGGESTION)) {
+            throw new IOException("port " + Config.arrow_flight_sql_port + " already in use");
         }
     }
 
@@ -251,6 +311,8 @@ public class DorisFE {
         options.addOption("f", "from", true, "Specify the start scan key");
         options.addOption("t", "to", true, "Specify the end scan key");
         options.addOption("m", "metaversion", true, "Specify the meta version to decode log value");
+        options.addOption("r", FeConstants.METADATA_FAILURE_RECOVERY_KEY, false,
+                "Check if the specified metadata recover is valid");
 
         CommandLine cmd = null;
         try {
@@ -283,6 +345,9 @@ public class DorisFE {
                 System.exit(-1);
             }
             return new CommandLineOptions(false, "", null, imagePath);
+        }
+        if (cmd.hasOption('r') || cmd.hasOption(FeConstants.METADATA_FAILURE_RECOVERY_KEY)) {
+            System.setProperty(FeConstants.METADATA_FAILURE_RECOVERY_KEY, "true");
         }
         if (cmd.hasOption('b') || cmd.hasOption("bdb")) {
             if (cmd.hasOption('l') || cmd.hasOption("listdb")) {
@@ -340,13 +405,30 @@ public class DorisFE {
         return new CommandLineOptions(false, null, null, "");
     }
 
+    private static void printVersion() {
+        LogUtils.stdout("Build version: " + Version.DORIS_BUILD_VERSION);
+        LogUtils.stdout("Build time: " + Version.DORIS_BUILD_TIME);
+        LogUtils.stdout("Build info: " + Version.DORIS_BUILD_INFO);
+        LogUtils.stdout("Build hash: " + Version.DORIS_BUILD_HASH);
+        LogUtils.stdout("Java compile version: " + Version.DORIS_JAVA_COMPILE_VERSION);
+
+        LOG.info("Build version: {}", Version.DORIS_BUILD_VERSION);
+        LOG.info("Build time: {}", Version.DORIS_BUILD_TIME);
+        LOG.info("Build info: {}", Version.DORIS_BUILD_INFO);
+        LOG.info("Build hash: {}", Version.DORIS_BUILD_HASH);
+        LOG.info("Java compile version: {}", Version.DORIS_JAVA_COMPILE_VERSION);
+
+        if (Config.isCloudMode()) {
+            LogUtils.stdout("Run FE in the cloud mode, cloud_unique_id: " + Config.cloud_unique_id
+                    + ", meta_service_endpoint: " + Config.meta_service_endpoint);
+        } else {
+            LogUtils.stdout("Run FE in the local mode");
+        }
+    }
+
     private static void checkCommandLineOptions(CommandLineOptions cmdLineOpts) {
         if (cmdLineOpts.isVersion()) {
-            System.out.println("Build version: " + Version.DORIS_BUILD_VERSION);
-            System.out.println("Build time: " + Version.DORIS_BUILD_TIME);
-            System.out.println("Build info: " + Version.DORIS_BUILD_INFO);
-            System.out.println("Build hash: " + Version.DORIS_BUILD_HASH);
-            System.out.println("Java compile version: " + Version.DORIS_JAVA_COMPILE_VERSION);
+            printVersion();
             System.exit(0);
         } else if (cmdLineOpts.runBdbTools()) {
             BDBTool bdbTool = new BDBTool(Env.getCurrentEnv().getBdbDir(), cmdLineOpts.getBdbToolOpts());
@@ -358,30 +440,30 @@ public class DorisFE {
         } else if (cmdLineOpts.runImageTool()) {
             File imageFile = new File(cmdLineOpts.getImagePath());
             if (!imageFile.exists()) {
-                System.out.println("image does not exist: " + imageFile.getAbsolutePath()
+                LogUtils.stderr("image does not exist: " + imageFile.getAbsolutePath()
                         + " . Please put an absolute path instead");
                 System.exit(-1);
             } else {
-                System.out.println("Start to load image: ");
+                LogUtils.stdout("Start to load image: ");
                 try {
                     MetaReader.read(imageFile, Env.getCurrentEnv());
-                    System.out.println("Load image success. Image file " + cmdLineOpts.getImagePath() + " is valid");
+                    LogUtils.stdout("Load image success. Image file " + cmdLineOpts.getImagePath() + " is valid");
                 } catch (Exception e) {
-                    System.out.println("Load image failed. Image file " + cmdLineOpts.getImagePath() + " is invalid");
+                    LogUtils.stderr("Load image failed. Image file " + cmdLineOpts.getImagePath() + " is invalid");
                     LOG.warn("", e);
                 } finally {
                     System.exit(0);
                 }
             }
         }
-
+        printVersion();
         // go on
     }
 
     private static boolean createAndLockPidFile(String pidFilePath) throws IOException {
         File pid = new File(pidFilePath);
-        RandomAccessFile file = new RandomAccessFile(pid, "rws");
-        try {
+
+        try (RandomAccessFile file = new RandomAccessFile(pid, "rws")) {
             FileLock lock = file.getChannel().tryLock();
             if (lock == null) {
                 return false;
@@ -395,11 +477,68 @@ public class DorisFE {
 
             return true;
         } catch (OverlappingFileLockException e) {
-            file.close();
             return false;
         } catch (IOException e) {
-            file.close();
             throw e;
+        }
+    }
+
+    /**
+     * When user starts multiple FE processes at the same time and uses one metadata directory,
+     * the metadata directory will be damaged. Therefore, we will bind the process by creating a file lock to ensure
+     * that only one FE process can occupy a metadata directory, and other processes will fail to start.
+     */
+    private static void tryLockProcess() {
+        try {
+            LOCK_FILE_PATH = Config.meta_dir + "/" + LOCK_FILE_NAME;
+            processLockFileChannel = FileChannel.open(new File(LOCK_FILE_PATH).toPath(), StandardOpenOption.WRITE,
+                    StandardOpenOption.CREATE);
+            processFileLock = processLockFileChannel.tryLock();
+            if (processFileLock != null) {
+                // we need bind the lock file with the process
+                Runtime.getRuntime().addShutdownHook(new Thread(DorisFE::releaseFileLockAndCloseFileChannel));
+                return;
+            }
+            releaseFileLockAndCloseFileChannel();
+        } catch (IOException e) {
+            releaseFileLockAndCloseFileChannel();
+            throw new RuntimeException("Try to lock process failed", e);
+        }
+        throw new RuntimeException("FE process has been started，please do not start multiple FE processes at the "
+                + "same time");
+    }
+
+    private static void releaseFileLockAndCloseFileChannel() {
+        if (processFileLock != null && processFileLock.isValid()) {
+            try {
+                processFileLock.release();
+            } catch (IOException ioException) {
+                LOG.warn("release process lock file failed", ioException);
+            }
+        }
+        if (processLockFileChannel != null && processLockFileChannel.isOpen()) {
+            try {
+                processLockFileChannel.close();
+            } catch (IOException ignored) {
+                LOG.warn("release process lock file failed", ignored);
+            }
+        }
+    }
+
+    public static void overwriteConfigs() {
+        if (Config.isCloudMode() && Config.enable_feature_binlog) {
+            Config.enable_feature_binlog = false;
+            LOG.warn("Force set enable_feature_binlog=false because it is not supported in the cloud mode yet");
+        }
+    }
+
+    private static void fuzzyConfigs() {
+        if (!Config.use_fuzzy_conf) {
+            return;
+        }
+        if (Config.fuzzy_test_type.equalsIgnoreCase("daily") || Config.fuzzy_test_type.equalsIgnoreCase("rqg")) {
+            Config.random_add_cluster_keys_for_mow = (LocalDate.now().getDayOfMonth() % 2 == 0);
+            LOG.info("fuzzy set random_add_cluster_keys_for_mow={}", Config.random_add_cluster_keys_for_mow);
         }
     }
 

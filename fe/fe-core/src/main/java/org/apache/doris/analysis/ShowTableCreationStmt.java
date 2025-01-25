@@ -19,7 +19,6 @@ package org.apache.doris.analysis;
 
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.ScalarType;
-import org.apache.doris.cluster.ClusterNamespace;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.UserException;
@@ -33,7 +32,7 @@ import com.google.common.base.Strings;
  * Syntax:
  *     SHOW TABLE CREATION [FROM db] [LIKE mask]
  */
-public class ShowTableCreationStmt extends ShowStmt {
+public class ShowTableCreationStmt extends ShowStmt implements NotFallbackInParser {
 
     private static final ShowResultSetMetaData META_DATA =
             ShowResultSetMetaData.builder()
@@ -68,8 +67,6 @@ public class ShowTableCreationStmt extends ShowStmt {
             if (Strings.isNullOrEmpty(dbName)) {
                 ErrorReport.reportAnalysisException(ErrorCode.ERR_NO_DB_ERROR);
             }
-        } else {
-            dbName = ClusterNamespace.getFullName(getClusterName(), dbName);
         }
     }
 

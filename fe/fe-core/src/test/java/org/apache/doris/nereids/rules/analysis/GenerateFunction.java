@@ -44,7 +44,6 @@ import org.apache.doris.nereids.trees.expressions.functions.DecimalWiderPrecisio
 import org.apache.doris.nereids.trees.expressions.functions.ExplicitlyCastableSignature;
 import org.apache.doris.nereids.trees.expressions.functions.IdenticalSignature;
 import org.apache.doris.nereids.trees.expressions.functions.ImplicitlyCastableSignature;
-import org.apache.doris.nereids.trees.expressions.functions.Nondeterministic;
 import org.apache.doris.nereids.trees.expressions.functions.NullOrIdenticalSignature;
 import org.apache.doris.nereids.trees.expressions.functions.PropagateNullable;
 import org.apache.doris.nereids.trees.expressions.literal.IntegerLiteral;
@@ -96,6 +95,7 @@ import java.util.TreeMap;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
+@Deprecated
 public class GenerateFunction {
 
     static final Set<String> unaryArithmeticOperators = Arrays.stream(ArithmeticExpr.Operator.values())
@@ -739,9 +739,6 @@ public class GenerateFunction {
             interfaces.add(arityExpressionType);
         }
         interfaces.add(getComputeSignatureInterface(functionName));
-        if (functionSet.isNondeterministicFunction(functionName)) {
-            interfaces.add(Nondeterministic.class);
-        }
 
         Function function = functions.get(0);
         if (!customNullableFunctions.contains(functionName)) {
@@ -1398,7 +1395,7 @@ public class GenerateFunction {
                     + "        Type assignmentCompatibleType = ScalarType.getAssignmentCompatibleType(\n"
                     + "                getArgumentType(1).toCatalogDataType(),\n"
                     + "                getArgumentType(2).toCatalogDataType(),\n"
-                    + "                true);\n"
+                    + "                true, false);\n"
                     + "        return DataType.fromCatalogType(assignmentCompatibleType);\n"
                     + "    });\n"
                     + "\n";
@@ -1409,7 +1406,7 @@ public class GenerateFunction {
             return "    @Override\n"
                     + "    public FunctionSignature computeSignature(FunctionSignature signature) {\n"
                     + "        DataType widerType = this.widerType.get();\n"
-                    + "        List<AbstractDataType> newArgumentsTypes = new ImmutableList.Builder<AbstractDataType>()\n"
+                    + "        List<DataType> newArgumentsTypes = new ImmutableList.Builder<DataType>()\n"
                     + "                .add(signature.argumentsTypes.get(0))\n"
                     + "                .add(widerType)\n"
                     + "                .add(widerType)\n"

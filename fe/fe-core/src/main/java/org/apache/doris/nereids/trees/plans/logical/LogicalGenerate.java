@@ -18,6 +18,8 @@
 package org.apache.doris.nereids.trees.plans.logical;
 
 import org.apache.doris.nereids.memo.GroupExpression;
+import org.apache.doris.nereids.properties.DataTrait;
+import org.apache.doris.nereids.properties.DataTrait.Builder;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.Slot;
@@ -30,6 +32,7 @@ import org.apache.doris.nereids.util.Utils;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Lists;
 
 import java.util.List;
 import java.util.Objects;
@@ -42,17 +45,25 @@ public class LogicalGenerate<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD
 
     private final List<Function> generators;
     private final List<Slot> generatorOutput;
+    // mapping with function.
+    private final List<List<String>> expandColumnAlias;
 
     public LogicalGenerate(List<Function> generators, List<Slot> generatorOutput, CHILD_TYPE child) {
-        this(generators, generatorOutput, Optional.empty(), Optional.empty(), child);
+        this(generators, generatorOutput, ImmutableList.of(), Optional.empty(), Optional.empty(), child);
     }
 
-    public LogicalGenerate(List<Function> generators, List<Slot> generatorOutput,
+    public LogicalGenerate(List<Function> generators, List<Slot> generatorOutput, List<List<String>> expandColumnAlias,
+            CHILD_TYPE child) {
+        this(generators, generatorOutput, expandColumnAlias, Optional.empty(), Optional.empty(), child);
+    }
+
+    public LogicalGenerate(List<Function> generators, List<Slot> generatorOutput, List<List<String>> expandColumnAlias,
             Optional<GroupExpression> groupExpression,
             Optional<LogicalProperties> logicalProperties, CHILD_TYPE child) {
-        super(PlanType.LOGICAL_FILTER, groupExpression, logicalProperties, child);
-        this.generators = ImmutableList.copyOf(generators);
-        this.generatorOutput = ImmutableList.copyOf(generatorOutput);
+        super(PlanType.LOGICAL_GENERATE, groupExpression, logicalProperties, child);
+        this.generators = Utils.fastToImmutableList(generators);
+        this.generatorOutput = Utils.fastToImmutableList(generatorOutput);
+        this.expandColumnAlias = Utils.fastToImmutableList(expandColumnAlias);
     }
 
     public List<Function> getGenerators() {
@@ -63,10 +74,14 @@ public class LogicalGenerate<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD
         return generatorOutput;
     }
 
+    public List<List<String>> getExpandColumnAlias() {
+        return expandColumnAlias;
+    }
+
     @Override
     public LogicalGenerate<Plan> withChildren(List<Plan> children) {
         Preconditions.checkArgument(children.size() == 1);
-        return new LogicalGenerate<>(generators, generatorOutput, children.get(0));
+        return new LogicalGenerate<>(generators, generatorOutput, expandColumnAlias, children.get(0));
     }
 
     @Override
@@ -79,21 +94,30 @@ public class LogicalGenerate<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD
         return generators;
     }
 
+    /**
+     * update generators
+     */
     public LogicalGenerate<Plan> withGenerators(List<Function> generators) {
-        return new LogicalGenerate<>(generators, generatorOutput,
-                Optional.empty(), Optional.of(getLogicalProperties()), child());
+        Preconditions.checkArgument(generators.size() == generatorOutput.size());
+        List<Slot> newGeneratorOutput = Lists.newArrayList();
+        for (int i = 0; i < generators.size(); i++) {
+            newGeneratorOutput.add(generatorOutput.get(i).withNullable(generators.get(i).nullable()));
+        }
+        return new LogicalGenerate<>(generators, newGeneratorOutput, expandColumnAlias, child());
     }
 
     @Override
     public LogicalGenerate<Plan> withGroupExpression(Optional<GroupExpression> groupExpression) {
-        return new LogicalGenerate<>(generators, generatorOutput,
+        return new LogicalGenerate<>(generators, generatorOutput, expandColumnAlias,
                 groupExpression, Optional.of(getLogicalProperties()), child());
     }
 
     @Override
-    public LogicalGenerate<Plan> withLogicalProperties(Optional<LogicalProperties> logicalProperties) {
-        return new LogicalGenerate<>(generators, generatorOutput,
-                Optional.empty(), logicalProperties, child());
+    public Plan withGroupExprLogicalPropChildren(Optional<GroupExpression> groupExpression,
+            Optional<LogicalProperties> logicalProperties, List<Plan> children) {
+        Preconditions.checkArgument(children.size() == 1);
+        return new LogicalGenerate<>(generators, generatorOutput, expandColumnAlias,
+                groupExpression, logicalProperties, children.get(0));
     }
 
     @Override
@@ -120,9 +144,6 @@ public class LogicalGenerate<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD
         if (o == null || getClass() != o.getClass()) {
             return false;
         }
-        if (!super.equals(o)) {
-            return false;
-        }
         LogicalGenerate<?> that = (LogicalGenerate<?>) o;
         return generators.equals(that.generators)
                 && generatorOutput.equals(that.generatorOutput);
@@ -130,6 +151,26 @@ public class LogicalGenerate<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD
 
     @Override
     public int hashCode() {
-        return Objects.hash(super.hashCode(), generators, generatorOutput);
+        return Objects.hash(generators, generatorOutput);
+    }
+
+    @Override
+    public void computeUnique(Builder builder) {
+        // don't generate and propagate unique
+    }
+
+    @Override
+    public void computeUniform(Builder builder) {
+        builder.addUniformSlot(child(0).getLogicalProperties().getTrait());
+    }
+
+    @Override
+    public void computeEqualSet(DataTrait.Builder builder) {
+        builder.addEqualSet(child().getLogicalProperties().getTrait());
+    }
+
+    @Override
+    public void computeFd(Builder builder) {
+        builder.addFuncDepsDG(child().getLogicalProperties().getTrait());
     }
 }

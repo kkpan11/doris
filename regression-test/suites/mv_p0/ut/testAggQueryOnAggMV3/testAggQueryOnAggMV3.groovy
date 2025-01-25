@@ -18,10 +18,7 @@
 import org.codehaus.groovy.runtime.IOGroovyMethods
 
 suite ("testAggQueryOnAggMV3") {
-
-    // because nereids cannot support rollup correctly forbid it temporary
-    sql """set enable_nereids_planner=false"""
-
+    sql """set enable_nereids_planner=true;"""
     sql """ DROP TABLE IF EXISTS emps; """
 
     sql """
@@ -41,21 +38,29 @@ suite ("testAggQueryOnAggMV3") {
     sql """insert into emps values("2020-01-04",4,"d",21,4,4);"""
 
 
+    createMV("create materialized view emps_mv as select deptno, commission, sum(salary) from emps group by deptno, commission;")
 
-    createMV("create materialized view emps_mv as select deptno, commission, sum(salary) from emps group by deptno, commission ;")
+    sql "analyze table emps with sync;"
+    sql """alter table emps modify column time_col set stats ('row_count'='4');"""
+    sql """set enable_stats=false;"""
 
-
-    explain {
-        sql("select * from emps order by empid;")
-        contains "(emps)"
-    }
+    mv_rewrite_fail("select * from emps order by empid;", "emps_mv")
     qt_select_star "select * from emps order by empid;"
 
-
-   explain {
-        sql("select commission, sum(salary) from emps where commission * (deptno + commission) = 100 group by commission order by commission;")
-        contains "(emps_mv)"
-    }
+    mv_rewrite_success("select commission, sum(salary) from emps where deptno > 0 and commission * (deptno + commission) = 100 group by commission order by commission;",
+            "emps_mv")
     qt_select_mv "select commission, sum(salary) from emps where commission * (deptno + commission) = 100 group by commission order by commission;"
 
+    mv_rewrite_success("select commission, sum(salary) from emps where deptno > 0 and  commission = 100 group by commission order by commission;",
+            "emps_mv")
+    qt_select_mv "select commission, sum(salary) from emps where commission = 100 group by commission order by commission;"
+
+    sql """set enable_stats=true;"""
+    mv_rewrite_fail("select * from emps order by empid;", "emps_mv")
+
+    mv_rewrite_success("select commission, sum(salary) from emps where deptno > 0 and commission * (deptno + commission) = 100 group by commission order by commission;",
+            "emps_mv")
+
+    mv_rewrite_success("select commission, sum(salary) from emps where deptno > 0 and  commission = 100 group by commission order by commission;",
+            "emps_mv")
 }

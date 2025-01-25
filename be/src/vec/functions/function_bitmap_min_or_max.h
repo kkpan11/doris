@@ -50,19 +50,11 @@ public:
     }
 
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t input_rows_count) override {
+                        uint32_t result, size_t input_rows_count) const override {
         auto result_column = ColumnInt64::create();
         auto result_null_map_column = ColumnUInt8::create(input_rows_count, 0);
 
         ColumnPtr argument_column = block.get_by_position(arguments[0]).column;
-        if (auto* nullable = check_and_get_column<ColumnNullable>(*argument_column)) {
-            // Danger: Here must dispose the null map data first! Because
-            // argument_columns[i]=nullable->get_nested_column_ptr(); will release the mem
-            // of column nullable mem of null map
-            VectorizedUtils::update_null_map(result_null_map_column->get_data(),
-                                             nullable->get_null_map_data());
-            argument_column = nullable->get_nested_column_ptr();
-        }
 
         execute_straight(assert_cast<const ColumnBitmap*>(argument_column.get()),
                          assert_cast<ColumnInt64*>(result_column.get()),
@@ -76,7 +68,7 @@ public:
 
 private:
     void execute_straight(const ColumnBitmap* date_column, ColumnInt64* result_column,
-                          NullMap& result_null_map, size_t input_rows_count) {
+                          NullMap& result_null_map, size_t input_rows_count) const {
         for (size_t i = 0; i < input_rows_count; i++) {
             if (result_null_map[i]) {
                 result_column->insert_default();

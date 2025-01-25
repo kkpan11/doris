@@ -33,6 +33,7 @@ import java.io.IOException;
 import java.util.Iterator;
 import java.util.List;
 
+@Deprecated
 public class SparkLoadAppHandle implements Writable {
     private static final Logger LOG = LogManager.getLogger(SparkLoadAppHandle.class);
     // 5min
@@ -49,7 +50,7 @@ public class SparkLoadAppHandle implements Writable {
     @SerializedName("startTime")
     private long startTime;
     @SerializedName("finalStatus")
-    private FinalApplicationStatus finalStatus;
+    private String finalStatus;
     @SerializedName("trackingUrl")
     private String trackingUrl;
     @SerializedName("user")
@@ -137,7 +138,7 @@ public class SparkLoadAppHandle implements Writable {
     }
 
     public FinalApplicationStatus getFinalStatus() {
-        return this.finalStatus;
+        return FinalApplicationStatus.valueOf(this.finalStatus);
     }
 
     public String getUrl() {
@@ -177,7 +178,7 @@ public class SparkLoadAppHandle implements Writable {
     }
 
     public void setFinalStatus(FinalApplicationStatus status) {
-        this.finalStatus = status;
+        this.finalStatus = status.toString();
         this.fireEvent(true);
     }
 

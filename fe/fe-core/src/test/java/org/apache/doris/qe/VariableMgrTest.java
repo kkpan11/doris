@@ -17,17 +17,23 @@
 
 package org.apache.doris.qe;
 
+import org.apache.doris.analysis.BoolLiteral;
 import org.apache.doris.analysis.CreateDbStmt;
+import org.apache.doris.analysis.IntLiteral;
 import org.apache.doris.analysis.SetStmt;
 import org.apache.doris.analysis.SetType;
 import org.apache.doris.analysis.SetVar;
 import org.apache.doris.analysis.StringLiteral;
-import org.apache.doris.analysis.SysVariableDesc;
+import org.apache.doris.analysis.VariableExpr;
 import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.Type;
+import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.jmockit.Deencapsulation;
+import org.apache.doris.nereids.trees.expressions.literal.Literal;
+import org.apache.doris.nereids.types.BigIntType;
 import org.apache.doris.utframe.UtFrameUtils;
 
 import org.apache.commons.io.FileUtils;
@@ -90,7 +96,7 @@ public class VariableMgrTest {
         var = VariableMgr.newSessionVariable();
         Assert.assertEquals(1234L, var.getMaxExecMemByte());
 
-        stmt = (SetStmt) UtFrameUtils.parseAndAnalyzeStmt("set global parallel_fragment_exec_instance_num=5", ctx);
+        stmt = (SetStmt) UtFrameUtils.parseAndAnalyzeStmt("set global parallel_pipeline_task_num=5", ctx);
         executor = new SetExecutor(ctx, stmt);
         executor.execute();
         Assert.assertEquals(1L, var.getParallelExecInstanceNum());
@@ -154,7 +160,7 @@ public class VariableMgrTest {
         Assert.assertEquals(8L, ctx.getSessionVariable().getRuntimeFilterType());
 
         // Get from name
-        SysVariableDesc desc = new SysVariableDesc("exec_mem_limit");
+        VariableExpr desc = new VariableExpr("exec_mem_limit");
         Assert.assertEquals(var.getMaxExecMemByte() + "", VariableMgr.getValue(var, desc));
     }
 
@@ -253,5 +259,37 @@ public class VariableMgrTest {
         executor.execute();
         SessionVariable defaultSessionVar = new SessionVariable();
         Assert.assertEquals(defaultSessionVar.enableProfile(), VariableMgr.newSessionVariable().enableProfile());
+    }
+
+    @Test
+    public void testAutoCommitConvert() throws Exception {
+        // boolean var with ConvertBoolToLongMethod annotation
+        VariableExpr desc = new VariableExpr("autocommit");
+        SessionVariable var = new SessionVariable();
+        VariableMgr.fillValue(var, desc);
+        Assert.assertTrue(desc.getLiteralExpr() instanceof IntLiteral);
+        Assert.assertEquals(Type.BIGINT, desc.getType());
+
+        // normal boolean var
+        desc = new VariableExpr("enable_bucket_shuffle_join");
+        VariableMgr.fillValue(var, desc);
+        Assert.assertTrue(desc.getLiteralExpr() instanceof BoolLiteral);
+        Assert.assertEquals(Type.BOOLEAN, desc.getType());
+    }
+
+    // @@auto_commit's type should be BIGINT
+    @Test
+    public void testAutoCommitType() throws AnalysisException {
+        // Old planner
+        SessionVariable sv = new SessionVariable();
+        VariableExpr desc = new VariableExpr(SessionVariable.AUTO_COMMIT);
+        VariableMgr.fillValue(sv, desc);
+        Assert.assertEquals(Type.BIGINT, desc.getType());
+        // Nereids
+        sv = new SessionVariable();
+        String name = SessionVariable.AUTO_COMMIT;
+        SetType setType = SetType.SESSION;
+        Literal l = VariableMgr.getLiteral(sv, name, setType);
+        Assert.assertEquals(BigIntType.INSTANCE, l.getDataType());
     }
 }

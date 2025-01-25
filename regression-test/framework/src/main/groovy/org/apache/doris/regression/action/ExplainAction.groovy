@@ -28,17 +28,26 @@ import java.util.stream.Collectors
 @Slf4j
 class ExplainAction implements SuiteAction {
     private String sql
+    private boolean verbose = false
     private SuiteContext context
     private Set<String> containsStrings = new LinkedHashSet<>()
+    private Set<String> containsAnyStrings = new LinkedHashSet<>()
     private Set<String> notContainsStrings = new LinkedHashSet<>()
+    private Map<String, Integer> multiContainsStrings = new HashMap<>()
+    private String coonType
     private Closure checkFunction
 
-    ExplainAction(SuiteContext context) {
+    ExplainAction(SuiteContext context, String coonType = "JDBC") {
         this.context = context
+        this.coonType = coonType
     }
 
     void sql(String sql) {
         this.sql = sql
+    }
+
+    void verbose(boolean verbose) {
+        this.verbose = verbose
     }
 
     void sql(Closure<String> sqlSupplier) {
@@ -47,6 +56,14 @@ class ExplainAction implements SuiteAction {
 
     void contains(String subString) {
         containsStrings.add(subString)
+    }
+
+    void containsAny(String subString) {
+        containsAnyStrings.add(subString)
+    }
+
+    void multiContains(String subString, int n) {
+        multiContainsStrings.put(subString, n);
     }
 
     void notContains(String subString) {
@@ -59,7 +76,7 @@ class ExplainAction implements SuiteAction {
 
     @Override
     void run() {
-        String explainSql = "explain\n" + sql
+        String explainSql = "explain\n" + (verbose ? "verbose\n" : "") + sql
         def result = doTest(explainSql)
         String explainString = result.result
         if (checkFunction != null) {
@@ -90,8 +107,7 @@ class ExplainAction implements SuiteAction {
             for (String string : containsStrings) {
                 if (!explainString.contains(string)) {
                     String msg = ("Explain and check failed, expect contains '${string}',"
-                            + "but actual explain string is:\n${explainString}").toString()
-                    log.info(msg)
+                            + " but actual explain string is:\n${explainString}").toString()
                     def t = new IllegalStateException(msg)
                     throw t
                 }
@@ -99,11 +115,31 @@ class ExplainAction implements SuiteAction {
             for (String string : notContainsStrings) {
                 if (explainString.contains(string)) {
                     String msg = ("Explain and check failed, expect not contains '${string}',"
-                            + "but actual explain string is:\n${explainString}").toString()
-                    log.info(msg)
+                            + " but actual explain string is:\n${explainString}").toString()
                     def t = new IllegalStateException(msg)
                     throw t
                 }
+            }
+            for (Map.Entry entry : multiContainsStrings) {
+                int count = explainString.count(entry.key);
+                if (count != entry.value) {
+                    String msg = ("Explain and check failed, expect multiContains '${entry.key}' , '${entry.value}' times, actural '${count}' times."
+                            + "Actual explain string is:\n${explainString}").toString()
+                    def t = new IllegalStateException(msg)
+                    throw t
+                }
+            }
+            boolean any = false;
+            for (String string : containsAnyStrings) {
+                if (explainString.contains(string)) {
+                    any = true;
+                }
+            }
+            if (!containsAnyStrings.isEmpty() && !any) {
+                    String msg = ("Explain and check failed, expect contains any '${containsAnyStrings}',"
+                            + " but actual explain string is:\n${explainString}").toString()
+                    def t = new IllegalStateException(msg)
+                    throw t
             }
         }
     }
@@ -115,7 +151,11 @@ class ExplainAction implements SuiteAction {
         ResultSetMetaData meta = null
         try {
             def temp = null
-            (temp, meta) = JdbcUtils.executeToList(context.getConnection(), explainSql)
+            if (coonType == "JDBC") {
+                (temp, meta) = JdbcUtils.executeToList(context.getConnection(), explainSql)
+            } else if (coonType == "ARROW_FLIGHT_SQL") {
+                (temp, meta) = JdbcUtils.executeToList(context.getArrowFlightSqlConnection(), (String) ("USE ${context.dbName};" + explainSql))
+            }
             explainString = temp.stream().map({row -> row.get(0).toString()}).collect(Collectors.joining("\n"))
             return new ActionResult(explainString, null, startTime, System.currentTimeMillis(), meta)
         } catch (Throwable t) {

@@ -20,16 +20,18 @@
 
 #pragma once
 
+#include <glog/logging.h>
+
 #include <vector>
 
 #include "olap/hll.h"
 #include "util/bitmap_value.h"
 #include "util/quantile_state.h"
 #include "vec/columns/column.h"
-#include "vec/columns/column_impl.h"
 #include "vec/columns/column_string.h"
 #include "vec/columns/column_vector.h"
 #include "vec/columns/columns_common.h"
+#include "vec/core/field.h"
 #include "vec/core/types.h"
 
 namespace doris::vectorized {
@@ -37,7 +39,7 @@ namespace doris::vectorized {
 template <typename T>
 class ColumnComplexType final : public COWHelper<IColumn, ColumnComplexType<T>> {
 private:
-    ColumnComplexType() {}
+    ColumnComplexType() = default;
     ColumnComplexType(const size_t n) : data(n) {}
     friend class COWHelper<IColumn, ColumnComplexType<T>>;
 
@@ -46,20 +48,14 @@ public:
     using value_type = T;
     using Container = std::vector<value_type>;
 
-    bool is_numeric() const override { return false; }
-
-    bool is_bitmap() const override { return std::is_same_v<T, BitmapValue>; }
-    bool is_hll() const override { return std::is_same_v<T, HyperLogLog>; }
-    bool is_quantile_state() const override { return std::is_same_v<T, QuantileState<double>>; }
-
     size_t size() const override { return data.size(); }
 
     StringRef get_data_at(size_t n) const override {
-        return StringRef(reinterpret_cast<const char*>(&data[n]), sizeof(data[n]));
+        return {reinterpret_cast<const char*>(&data[n]), sizeof(data[n])};
     }
 
     void insert_from(const IColumn& src, size_t n) override {
-        data.push_back(assert_cast<const Self&>(src).get_data()[n]);
+        data.push_back(assert_cast<const Self&, TypeCheckOnRelease::DISABLE>(src).get_data()[n]);
     }
 
     void insert_data(const char* pos, size_t /*length*/) override {
@@ -78,10 +74,11 @@ public:
             pvalue->deserialize(pos);
         } else if constexpr (std::is_same_v<T, HyperLogLog>) {
             pvalue->deserialize(Slice(pos, length));
-        } else if constexpr (std::is_same_v<T, QuantileStateDouble>) {
+        } else if constexpr (std::is_same_v<T, QuantileState>) {
             pvalue->deserialize(Slice(pos, length));
         } else {
-            LOG(FATAL) << "Unexpected type in column complex";
+            throw doris::Exception(ErrorCode::INTERNAL_ERROR, "Unexpected type in column complex");
+            __builtin_unreachable();
         }
     }
 
@@ -96,10 +93,9 @@ public:
         }
     }
 
-    void insert_many_binary_data(char* data_array, uint32_t* len_array,
-                                 uint32_t* start_offset_array, size_t num) override {
+    void insert_many_strings(const StringRef* strings, size_t num) override {
         for (size_t i = 0; i < num; i++) {
-            insert_binary_data(data_array + start_offset_array[i], len_array[i]);
+            insert_binary_data(strings[i].data, strings[i].size);
         }
     }
 
@@ -118,68 +114,40 @@ public:
 
     size_t allocated_bytes() const override { return byte_size(); }
 
-    void protect() override {}
-
     void insert_value(T value) { data.emplace_back(std::move(value)); }
-
-    [[noreturn]] void get_permutation(bool reverse, size_t limit, int nan_direction_hint,
-                                      IColumn::Permutation& res) const override {
-        LOG(FATAL) << "get_permutation not implemented";
-    }
-
-    [[noreturn]] TypeIndex get_data_type() const override {
-        LOG(FATAL) << "ColumnComplexType get_data_type not implemeted";
-    }
-
-    void get_indices_of_non_default_rows(IColumn::Offsets64& indices, size_t from,
-                                         size_t limit) const override {
-        LOG(FATAL) << "get_indices_of_non_default_rows not implemented";
-    }
-    [[noreturn]] ColumnPtr index(const IColumn& indexes, size_t limit) const override {
-        LOG(FATAL) << "index not implemented";
-    }
 
     void reserve(size_t n) override { data.reserve(n); }
 
     void resize(size_t n) override { data.resize(n); }
 
-    const char* get_family_name() const override { return TypeName<T>::get(); }
+    std::string get_name() const override { return TypeName<T>::get(); }
 
     MutableColumnPtr clone_resized(size_t size) const override;
 
     void insert(const Field& x) override {
-        const String& s = doris::vectorized::get<const String&>(x);
-        data.push_back(*reinterpret_cast<const T*>(s.c_str()));
+        DCHECK_EQ(x.get_type(), Field::TypeToEnum<T>::value);
+        const T& s = doris::vectorized::get<const T&>(x);
+        data.push_back(s);
     }
 
     Field operator[](size_t n) const override {
         assert(n < size());
-        return Field(reinterpret_cast<const char*>(&data[n]), sizeof(data[n]));
+        return Field(data[n]);
     }
 
     void get(size_t n, Field& res) const override {
         assert(n < size());
-        res.assign_string(reinterpret_cast<const char*>(&data[n]), sizeof(data[n]));
-    }
-
-    [[noreturn]] UInt64 get64(size_t n) const override {
-        LOG(FATAL) << "get field not implemented";
-    }
-
-    [[noreturn]] Float64 get_float64(size_t n) const override {
-        LOG(FATAL) << "get field not implemented";
-    }
-
-    [[noreturn]] UInt64 get_uint(size_t n) const override {
-        LOG(FATAL) << "get field not implemented";
+        res = Field(data[n]);
     }
 
     [[noreturn]] bool get_bool(size_t n) const override {
-        LOG(FATAL) << "get field not implemented";
+        throw doris::Exception(ErrorCode::INTERNAL_ERROR, "get field not implemented");
+        __builtin_unreachable();
     }
 
     [[noreturn]] Int64 get_int(size_t n) const override {
-        LOG(FATAL) << "get field not implemented";
+        throw doris::Exception(ErrorCode::INTERNAL_ERROR, "get field not implemented");
+        __builtin_unreachable();
     }
 
     void insert_range_from(const IColumn& src, size_t start, size_t length) override {
@@ -190,18 +158,22 @@ public:
         data.insert(data.end(), st, ed);
     }
 
-    void insert_indices_from(const IColumn& src, const int* indices_begin,
-                             const int* indices_end) override {
+    void insert_indices_from(const IColumn& src, const uint32_t* indices_begin,
+                             const uint32_t* indices_end) override {
         const Self& src_vec = assert_cast<const Self&>(src);
         auto new_size = indices_end - indices_begin;
 
-        for (int i = 0; i < new_size; ++i) {
+        for (uint32_t i = 0; i < new_size; ++i) {
             auto offset = *(indices_begin + i);
-            if (offset == -1) {
-                data.emplace_back(T {});
-            } else {
-                data.emplace_back(src_vec.get_element(offset));
-            }
+            data.emplace_back(src_vec.get_element(offset));
+        }
+    }
+
+    void insert_many_from(const IColumn& src, size_t position, size_t length) override {
+        const Self& src_vec = assert_cast<const Self&>(src);
+        auto val = src_vec.get_element(position);
+        for (uint32_t i = 0; i < length; ++i) {
+            data.emplace_back(val);
         }
     }
 
@@ -209,11 +181,15 @@ public:
     // it's impossible to use ComplexType as key , so we don't have to implement them
     [[noreturn]] StringRef serialize_value_into_arena(size_t n, Arena& arena,
                                                       char const*& begin) const override {
-        LOG(FATAL) << "serialize_value_into_arena not implemented";
+        throw doris::Exception(ErrorCode::INTERNAL_ERROR,
+                               "serialize_value_into_arena not implemented");
+        __builtin_unreachable();
     }
 
     [[noreturn]] const char* deserialize_and_insert_from_arena(const char* pos) override {
-        LOG(FATAL) << "deserialize_and_insert_from_arena not implemented";
+        throw doris::Exception(ErrorCode::INTERNAL_ERROR,
+                               "deserialize_and_insert_from_arena not implemented");
+        __builtin_unreachable();
     }
 
     // maybe we do not need to impl the function
@@ -221,31 +197,10 @@ public:
         // TODO add hash function
     }
 
-    virtual void update_hashes_with_value(
-            std::vector<SipHash>& hashes,
-            const uint8_t* __restrict null_data = nullptr) const override {
+    void update_hashes_with_value(uint64_t* __restrict hashes,
+                                  const uint8_t* __restrict null_data = nullptr) const override {
         // TODO add hash function
     }
-
-    virtual void update_hashes_with_value(
-            uint64_t* __restrict hashes,
-            const uint8_t* __restrict null_data = nullptr) const override {
-        // TODO add hash function
-    }
-
-    [[noreturn]] int compare_at(size_t n, size_t m, const IColumn& rhs,
-                                int nan_direction_hint) const override {
-        LOG(FATAL) << "compare_at not implemented";
-    }
-
-    void get_extremes(Field& min, Field& max) const override {
-        LOG(FATAL) << "get_extremes not implemented";
-    }
-
-    bool can_be_inside_nullable() const override { return true; }
-
-    bool is_fixed_and_contiguous() const override { return true; }
-    size_t size_of_value_if_fixed() const override { return sizeof(T); }
 
     StringRef get_raw_data() const override {
         return StringRef(reinterpret_cast<const char*>(data.data()), data.size());
@@ -271,27 +226,9 @@ public:
 
     ColumnPtr replicate(const IColumn::Offsets& replicate_offsets) const override;
 
-    void replicate(const uint32_t* counts, size_t target_size, IColumn& column, size_t begin = 0,
-                   int count_sz = -1) const override;
-
-    [[noreturn]] MutableColumns scatter(IColumn::ColumnIndex num_columns,
-                                        const IColumn::Selector& selector) const override {
-        LOG(FATAL) << "scatter not implemented";
-    }
-
-    void append_data_by_selector(MutableColumnPtr& res,
-                                 const IColumn::Selector& selector) const override {
-        this->template append_data_by_selector_impl<ColumnComplexType<T>>(res, selector);
-    }
-
     void replace_column_data(const IColumn& rhs, size_t row, size_t self_row = 0) override {
         DCHECK(size() > self_row);
-        data[self_row] = assert_cast<const Self&>(rhs).data[row];
-    }
-
-    void replace_column_data_default(size_t self_row = 0) override {
-        DCHECK(size() > self_row);
-        data[self_row] = T();
+        data[self_row] = assert_cast<const Self&, TypeCheckOnRelease::DISABLE>(rhs).data[row];
     }
 
 private:
@@ -316,18 +253,24 @@ ColumnPtr ColumnComplexType<T>::filter(const IColumn::Filter& filt,
     size_t size = data.size();
     column_match_filter_size(size, filt.size());
 
-    if (data.size() == 0) return this->create();
+    if (data.size() == 0) {
+        return this->create();
+    }
     auto res = this->create();
     Container& res_data = res->get_data();
 
-    if (result_size_hint) res_data.reserve(result_size_hint > 0 ? result_size_hint : size);
+    if (result_size_hint) {
+        res_data.reserve(result_size_hint > 0 ? result_size_hint : size);
+    }
 
     const UInt8* filt_pos = filt.data();
     const UInt8* filt_end = filt_pos + size;
     const T* data_pos = data.data();
 
     while (filt_pos < filt_end) {
-        if (*filt_pos) res_data.push_back(*data_pos);
+        if (*filt_pos) {
+            res_data.push_back(*data_pos);
+        }
 
         ++filt_pos;
         ++data_pos;
@@ -373,7 +316,9 @@ ColumnPtr ColumnComplexType<T>::permute(const IColumn::Permutation& perm, size_t
     limit = limit ? std::min(size, limit) : size;
 
     if (perm.size() < limit) {
-        LOG(FATAL) << "Size of permutation is less than required.";
+        throw doris::Exception(ErrorCode::INTERNAL_ERROR,
+                               "Size of permutation is less than required.");
+        __builtin_unreachable();
     }
 
     auto res = this->create(limit);
@@ -390,7 +335,9 @@ ColumnPtr ColumnComplexType<T>::replicate(const IColumn::Offsets& offsets) const
     size_t size = data.size();
     column_match_offsets_size(size, offsets.size());
 
-    if (0 == size) return this->create();
+    if (0 == size) {
+        return this->create();
+    }
 
     auto res = this->create();
     typename Self::Container& res_data = res->get_data();
@@ -409,34 +356,9 @@ ColumnPtr ColumnComplexType<T>::replicate(const IColumn::Offsets& offsets) const
     return res;
 }
 
-template <typename T>
-void ColumnComplexType<T>::replicate(const uint32_t* counts, size_t target_size, IColumn& column,
-                                     size_t begin, int count_sz) const {
-    size_t size = count_sz < 0 ? data.size() : count_sz;
-    if (0 == size) return;
-
-    auto& res = reinterpret_cast<ColumnComplexType<T>&>(column);
-    typename Self::Container& res_data = res.get_data();
-    res_data.reserve(target_size);
-
-    size_t end = size + begin;
-    for (size_t i = begin; i < end; ++i) {
-        size_t size_to_replicate = counts[i];
-        for (size_t j = 0; j < size_to_replicate; ++j) {
-            res_data.push_back(data[i]);
-        }
-    }
-}
-
 using ColumnBitmap = ColumnComplexType<BitmapValue>;
 using ColumnHLL = ColumnComplexType<HyperLogLog>;
-
-template <typename T>
-using ColumnQuantileState = ColumnComplexType<QuantileState<T>>;
-
-using ColumnQuantileStateDouble = ColumnQuantileState<double>;
-
-//template class ColumnQuantileState<double>;
+using ColumnQuantileState = ColumnComplexType<QuantileState>;
 
 template <typename T>
 struct is_complex : std::false_type {};
@@ -450,8 +372,8 @@ struct is_complex<HyperLogLog> : std::true_type {};
 //DataTypeHLL::FieldType = HyperLogLog
 
 template <>
-struct is_complex<QuantileState<double>> : std::true_type {};
-//DataTypeQuantileState::FieldType = QuantileState<double>
+struct is_complex<QuantileState> : std::true_type {};
+//DataTypeQuantileState::FieldType = QuantileState
 
 template <class T>
 constexpr bool is_complex_v = is_complex<T>::value;

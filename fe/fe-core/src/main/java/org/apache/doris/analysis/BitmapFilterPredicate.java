@@ -19,22 +19,17 @@ package org.apache.doris.analysis;
 
 
 import org.apache.doris.common.AnalysisException;
-import org.apache.doris.common.util.VectorizedUtil;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.thrift.TExprNode;
 import org.apache.doris.thrift.TRuntimeFilterType;
 
 import com.google.common.base.Preconditions;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 
 /**
  * Only used to plan the in bitmap syntax into join + bitmap filter.
  * This predicate not need to be sent to BE.
  */
 public class BitmapFilterPredicate extends Predicate {
-
-    private static final Logger LOG = LogManager.getLogger(BitmapFilterPredicate.class);
 
     private boolean notIn = false;
 
@@ -81,10 +76,6 @@ public class BitmapFilterPredicate extends Predicate {
             throw new AnalysisException(
                     "Please enable the session variable 'enable_projection' through `set enable_projection = true;`");
         }
-
-        if (!VectorizedUtil.isVectorized()) {
-            throw new AnalysisException("In bitmap syntax is currently only supported in the vectorization engine.");
-        }
     }
 
     @Override
@@ -101,5 +92,10 @@ public class BitmapFilterPredicate extends Predicate {
     @Override
     public Expr clone() {
         return new BitmapFilterPredicate(this);
+    }
+
+    @Override
+    public boolean supportSerializable() {
+        return false;
     }
 }

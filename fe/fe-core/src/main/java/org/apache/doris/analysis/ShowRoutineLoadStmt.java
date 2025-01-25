@@ -19,7 +19,6 @@ package org.apache.doris.analysis;
 
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.ScalarType;
-import org.apache.doris.cluster.ClusterNamespace;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
@@ -63,7 +62,7 @@ import java.util.List;
         show routine load in all of database
         please use show proc
  */
-public class ShowRoutineLoadStmt extends ShowStmt {
+public class ShowRoutineLoadStmt extends ShowStmt implements NotFallbackInParser {
 
     private static final ImmutableList<String> TITLE_NAMES =
             new ImmutableList.Builder<String>()
@@ -74,6 +73,7 @@ public class ShowRoutineLoadStmt extends ShowStmt {
                     .add("EndTime")
                     .add("DbName")
                     .add("TableName")
+                    .add("IsMultiTable")
                     .add("State")
                     .add("DataSourceType")
                     .add("CurrentTaskNum")
@@ -125,14 +125,12 @@ public class ShowRoutineLoadStmt extends ShowStmt {
     }
 
     private void checkLabelName(Analyzer analyzer) throws AnalysisException {
-        String dbName = labelName == null ? null : labelName.getDbName();
-        if (Strings.isNullOrEmpty(dbName)) {
+        dbFullName = labelName == null ? null : labelName.getDbName();
+        if (Strings.isNullOrEmpty(dbFullName)) {
             dbFullName = analyzer.getContext().getDatabase();
             if (Strings.isNullOrEmpty(dbFullName)) {
                 ErrorReport.reportAnalysisException(ErrorCode.ERR_NO_DB_ERROR);
             }
-        } else {
-            dbFullName = ClusterNamespace.getFullName(getClusterName(), dbName);
         }
         name = labelName == null ? null : labelName.getLabelName();
     }

@@ -27,7 +27,7 @@ import org.apache.doris.qe.ConnectContext;
 
 import java.util.Map;
 
-public class CreateRepositoryStmt extends DdlStmt {
+public class CreateRepositoryStmt extends DdlStmt implements NotFallbackInParser {
     private boolean isReadOnly;
     private String name;
     private StorageBackend storage;
@@ -82,5 +82,15 @@ public class CreateRepositoryStmt extends DdlStmt {
         }
         sb.append("REPOSITORY `").append(name).append("` WITH ").append(storage.toSql());
         return sb.toString();
+    }
+
+    @Override
+    public boolean needAuditEncryption() {
+        return true;
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.CREATE;
     }
 }

@@ -17,30 +17,77 @@
 
 #pragma once
 
-#include <stdint.h>
-
 #include "operator.h"
-#include "vec/sink/vresult_file_sink.h"
+#include "vec/sink/writer/vfile_result_writer.h"
 
-namespace doris {
-class DataSink;
+namespace doris::vectorized {
+#include "common/compile_check_begin.h"
+class BroadcastPBlockHolder;
+} // namespace doris::vectorized
 
-namespace pipeline {
+namespace doris::pipeline {
 
-class ResultFileSinkOperatorBuilder final
-        : public DataSinkOperatorBuilder<vectorized::VResultFileSink> {
+class ResultFileSinkOperatorX;
+class ResultFileSinkLocalState final
+        : public AsyncWriterSink<vectorized::VFileResultWriter, ResultFileSinkOperatorX> {
 public:
-    ResultFileSinkOperatorBuilder(int32_t id, DataSink* sink);
+    using Base = AsyncWriterSink<vectorized::VFileResultWriter, ResultFileSinkOperatorX>;
+    ENABLE_FACTORY_CREATOR(ResultFileSinkLocalState);
+    ResultFileSinkLocalState(DataSinkOperatorXBase* parent, RuntimeState* state);
+    ~ResultFileSinkLocalState() override;
 
-    OperatorPtr build_operator() override;
+    Status init(RuntimeState* state, LocalSinkStateInfo& info) override;
+    Status close(RuntimeState* state, Status exec_status) override;
+
+    [[nodiscard]] int sender_id() const { return _sender_id; }
+
+private:
+    friend class ResultFileSinkOperatorX;
+
+    std::shared_ptr<BufferControlBlock> _sender;
+
+    std::shared_ptr<vectorized::BroadcastPBlockHolder> _block_holder;
+    int _sender_id;
 };
 
-class ResultFileSinkOperator final : public DataSinkOperator<ResultFileSinkOperatorBuilder> {
+class ResultFileSinkOperatorX final : public DataSinkOperatorX<ResultFileSinkLocalState> {
 public:
-    ResultFileSinkOperator(OperatorBuilderBase* operator_builder, DataSink* sink);
+    ResultFileSinkOperatorX(int operator_id, const RowDescriptor& row_desc,
+                            const std::vector<TExpr>& t_output_expr);
+    ResultFileSinkOperatorX(int operator_id, const RowDescriptor& row_desc,
+                            const TResultFileSink& sink,
+                            const std::vector<TPlanFragmentDestination>& destinations,
+                            const std::vector<TExpr>& t_output_expr, DescriptorTbl& descs);
+    Status init(const TDataSink& thrift_sink) override;
 
-    bool can_write() override { return true; }
+    Status open(RuntimeState* state) override;
+
+    Status sink(RuntimeState* state, vectorized::Block* in_block, bool eos) override;
+
+private:
+    friend class ResultFileSinkLocalState;
+    template <typename Writer, typename Parent>
+        requires(std::is_base_of_v<vectorized::AsyncResultWriter, Writer>)
+    friend class AsyncWriterSink;
+
+    const RowDescriptor& _row_desc;
+    const std::vector<TExpr>& _t_output_expr;
+
+    const std::vector<TPlanFragmentDestination> _dests;
+
+    // set file options when sink type is FILE
+    std::unique_ptr<ResultFileOptions> _file_opts;
+    TStorageBackendType::type _storage_type;
+
+    // Owned by the RuntimeState.
+    RowDescriptor _output_row_descriptor;
+    int _buf_size = 4096; // Allocated from _pool
+    std::string _header;
+    std::string _header_type;
+
+    vectorized::VExprContextSPtrs _output_vexpr_ctxs;
+    std::shared_ptr<BufferControlBlock> _sender = nullptr;
 };
 
-} // namespace pipeline
-} // namespace doris
+#include "common/compile_check_end.h"
+} // namespace doris::pipeline

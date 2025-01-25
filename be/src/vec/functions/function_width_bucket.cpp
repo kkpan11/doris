@@ -28,6 +28,7 @@
 #include "vec/columns/column.h"
 #include "vec/columns/column_vector.h"
 #include "vec/columns/columns_number.h"
+#include "vec/common/assert_cast.h"
 #include "vec/core/block.h"
 #include "vec/core/column_numbers.h"
 #include "vec/core/column_with_type_and_name.h"
@@ -60,7 +61,7 @@ public:
     }
 
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t input_rows_count) override {
+                        uint32_t result, size_t input_rows_count) const override {
         ColumnPtr expr_ptr =
                 block.get_by_position(arguments[0]).column->convert_to_full_column_if_const();
         ColumnPtr min_value_ptr =
@@ -70,6 +71,12 @@ public:
         ColumnPtr num_buckets_ptr =
                 block.get_by_position(arguments[3]).column->convert_to_full_column_if_const();
         int64_t num_buckets = num_buckets_ptr->get_int(0);
+
+        if (num_buckets <= 0) {
+            return Status::InternalError(
+                    "The desired number({}) of buckets must be a positive integer value.",
+                    num_buckets);
+        }
 
         auto nested_column_ptr = ColumnInt64::create(input_rows_count, 0);
         DataTypePtr expr_type = block.get_by_position(arguments[0]).type;
@@ -85,19 +92,18 @@ private:
     template <typename ColumnType>
     void _execute(const IColumn& expr_column, const IColumn& min_value_column,
                   const IColumn& max_value_column, const int64_t num_buckets,
-                  IColumn& nested_column) {
-        const ColumnType& expr_column_concrete = reinterpret_cast<const ColumnType&>(expr_column);
-        const ColumnType& min_value_column_concrete =
-                reinterpret_cast<const ColumnType&>(min_value_column);
-        const ColumnType& max_value_column_concrete =
-                reinterpret_cast<const ColumnType&>(max_value_column);
-        ColumnInt64& nested_column_concrete = reinterpret_cast<ColumnInt64&>(nested_column);
+                  IColumn& nested_column) const {
+        const auto& expr_column_concrete = assert_cast<const ColumnType&>(expr_column);
+        const auto& min_value_column_concrete = assert_cast<const ColumnType&>(min_value_column);
+        const auto& max_value_column_concrete = assert_cast<const ColumnType&>(max_value_column);
+        auto& nested_column_concrete = assert_cast<ColumnInt64&>(nested_column);
 
         size_t input_rows_count = expr_column.size();
 
         for (size_t i = 0; i < input_rows_count; ++i) {
             auto min_value = min_value_column_concrete.get_data()[i];
             auto max_value = max_value_column_concrete.get_data()[i];
+            auto average_value = (max_value - min_value) / (1.0 * num_buckets);
             if (expr_column_concrete.get_data()[i] < min_value) {
                 continue;
             } else if (expr_column_concrete.get_data()[i] >= max_value) {
@@ -107,15 +113,15 @@ private:
                     continue;
                 }
                 nested_column_concrete.get_data()[i] =
-                        (int64_t)(1 + (expr_column_concrete.get_data()[i] - min_value) /
-                                              ((max_value - min_value) / num_buckets));
+                        (int64_t)(1 +
+                                  (expr_column_concrete.get_data()[i] - min_value) / average_value);
             }
         }
     }
 
     void _execute_by_type(const IColumn& expr_column, const IColumn& min_value_column,
                           const IColumn& max_value_column, const int64_t num_buckets,
-                          IColumn& nested_column_column, DataTypePtr& expr_type) {
+                          IColumn& nested_column_column, DataTypePtr& expr_type) const {
         WhichDataType which(remove_nullable(expr_type));
         if (which.is_int8()) {
             _execute<ColumnInt8>(expr_column, min_value_column, max_value_column, num_buckets,
@@ -135,18 +141,21 @@ private:
         } else if (which.is_float64()) {
             _execute<ColumnFloat64>(expr_column, min_value_column, max_value_column, num_buckets,
                                     nested_column_column);
-        } else if (which.is_decimal128()) {
-            _execute<ColumnDecimal128>(expr_column, min_value_column, max_value_column, num_buckets,
-                                       nested_column_column);
+        } else if (which.is_decimal128v2()) {
+            _execute<ColumnDecimal128V2>(expr_column, min_value_column, max_value_column,
+                                         num_buckets, nested_column_column);
         } else if (which.is_decimal32()) {
             _execute<ColumnDecimal32>(expr_column, min_value_column, max_value_column, num_buckets,
                                       nested_column_column);
         } else if (which.is_decimal64()) {
             _execute<ColumnDecimal64>(expr_column, min_value_column, max_value_column, num_buckets,
                                       nested_column_column);
-        } else if (which.is_decimal128i()) {
-            _execute<ColumnDecimal128I>(expr_column, min_value_column, max_value_column,
-                                        num_buckets, nested_column_column);
+        } else if (which.is_decimal128v3()) {
+            _execute<ColumnDecimal128V3>(expr_column, min_value_column, max_value_column,
+                                         num_buckets, nested_column_column);
+        } else if (which.is_decimal256()) {
+            _execute<ColumnDecimal256>(expr_column, min_value_column, max_value_column, num_buckets,
+                                       nested_column_column);
         } else if (which.is_date()) {
             _execute<ColumnDate>(expr_column, min_value_column, max_value_column, num_buckets,
                                  nested_column_column);

@@ -18,12 +18,18 @@
 package org.apache.doris.nereids.trees.expressions;
 
 import org.apache.doris.nereids.exceptions.UnboundException;
-import org.apache.doris.nereids.trees.expressions.shape.LeafExpression;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
+import org.apache.doris.nereids.trees.plans.Plan;
+import org.apache.doris.nereids.trees.plans.logical.LogicalAggregate;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
+import org.apache.doris.nereids.trees.plans.logical.LogicalProject;
+import org.apache.doris.nereids.trees.plans.logical.LogicalSort;
+import org.apache.doris.nereids.trees.plans.logical.LogicalSubQueryAlias;
 import org.apache.doris.nereids.types.DataType;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 
 import java.util.List;
 import java.util.Objects;
@@ -32,32 +38,54 @@ import java.util.Optional;
 /**
  * A subquery that will return only one row and one column.
  */
-public class ScalarSubquery extends SubqueryExpr implements LeafExpression {
+public class ScalarSubquery extends SubqueryExpr {
+
+    private final boolean hasTopLevelScalarAgg;
+
     public ScalarSubquery(LogicalPlan subquery) {
-        super(Objects.requireNonNull(subquery, "subquery can not be null"));
+        this(subquery, ImmutableList.of());
     }
 
     public ScalarSubquery(LogicalPlan subquery, List<Slot> correlateSlots) {
-        this(Objects.requireNonNull(subquery, "subquery can not be null"),
-                Objects.requireNonNull(correlateSlots, "correlateSlots can not be null"),
-                Optional.empty());
+        this(subquery, correlateSlots, Optional.empty());
     }
 
     public ScalarSubquery(LogicalPlan subquery, List<Slot> correlateSlots, Optional<Expression> typeCoercionExpr) {
         super(Objects.requireNonNull(subquery, "subquery can not be null"),
                 Objects.requireNonNull(correlateSlots, "correlateSlots can not be null"),
                 typeCoercionExpr);
+        hasTopLevelScalarAgg = findTopLevelScalarAgg(subquery, ImmutableSet.copyOf(correlateSlots)) != null;
+    }
+
+    public boolean hasTopLevelScalarAgg() {
+        return hasTopLevelScalarAgg;
+    }
+
+    /**
+    * getTopLevelScalarAggFunction
+    */
+    public Optional<NamedExpression> getTopLevelScalarAggFunction() {
+        Plan plan = findTopLevelScalarAgg(queryPlan, ImmutableSet.copyOf(correlateSlots));
+        if (plan != null) {
+            LogicalAggregate aggregate = (LogicalAggregate) plan;
+            Preconditions.checkState(aggregate.getAggregateFunctions().size() == 1,
+                    "in scalar subquery, should only return 1 column 1 row, "
+                            + "but we found multiple columns ", aggregate.getOutputExpressions());
+            return Optional.of((NamedExpression) aggregate.getOutputExpressions().get(0));
+        } else {
+            return Optional.empty();
+        }
     }
 
     @Override
     public DataType getDataType() throws UnboundException {
         Preconditions.checkArgument(queryPlan.getOutput().size() == 1);
-        return queryPlan.getOutput().get(0).getDataType();
+        return typeCoercionExpr.orElse(queryPlan.getOutput().get(0)).getDataType();
     }
 
     @Override
-    public String toSql() {
-        return " (SCALARSUBQUERY) " + super.toSql();
+    public String computeToSql() {
+        return " (SCALARSUBQUERY) " + super.computeToSql();
     }
 
     @Override
@@ -75,5 +103,36 @@ public class ScalarSubquery extends SubqueryExpr implements LeafExpression {
                 dataType == queryPlan.getOutput().get(0).getDataType()
                     ? Optional.of(queryPlan.getOutput().get(0))
                     : Optional.of(new Cast(queryPlan.getOutput().get(0), dataType)));
+    }
+
+    @Override
+    public ScalarSubquery withSubquery(LogicalPlan subquery) {
+        return new ScalarSubquery(subquery, correlateSlots, typeCoercionExpr);
+    }
+
+    /**
+     * for correlated subquery, we define top level scalar agg as if it meets the both 2 conditions:
+     * 1. The agg or its child contains correlated slots
+     * 2. only project, sort and subquery alias node can be agg's parent
+     */
+    public static Plan findTopLevelScalarAgg(Plan plan, ImmutableSet<Slot> slots) {
+        if (plan instanceof LogicalAggregate) {
+            if (((LogicalAggregate<?>) plan).getGroupByExpressions().isEmpty() && plan.containsSlots(slots)) {
+                return plan;
+            } else {
+                return null;
+            }
+        } else if (plan instanceof LogicalProject || plan instanceof LogicalSubQueryAlias
+                || plan instanceof LogicalSort) {
+            for (Plan child : plan.children()) {
+                Plan result = findTopLevelScalarAgg(child, slots);
+                if (result != null) {
+                    return result;
+                }
+            }
+            return null;
+        } else {
+            return null;
+        }
     }
 }

@@ -32,15 +32,15 @@ import org.apache.doris.transaction.BeginTransactionException;
 import org.apache.doris.transaction.GlobalTransactionMgr;
 
 import com.google.common.collect.Maps;
-import com.google.common.collect.Queues;
 import mockit.Expectations;
 import mockit.Injectable;
 import mockit.Mocked;
 import org.junit.Test;
 
 import java.util.Map;
-import java.util.Queue;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.LinkedBlockingDeque;
 
 public class RoutineLoadTaskSchedulerTest {
 
@@ -62,16 +62,16 @@ public class RoutineLoadTaskSchedulerTest {
             MetaNotFoundException, AnalysisException, LabelAlreadyUsedException, BeginTransactionException {
         long beId = 100L;
 
-        Map<Integer, Long> partitionIdToOffset = Maps.newHashMap();
+        ConcurrentMap<Integer, Long> partitionIdToOffset = Maps.newConcurrentMap();
         partitionIdToOffset.put(1, 100L);
         partitionIdToOffset.put(2, 200L);
         KafkaProgress kafkaProgress = new KafkaProgress();
         Deencapsulation.setField(kafkaProgress, "partitionIdToOffset", partitionIdToOffset);
 
-        Queue<RoutineLoadTaskInfo> routineLoadTaskInfoQueue = Queues.newLinkedBlockingQueue();
-        KafkaTaskInfo routineLoadTaskInfo1 = new KafkaTaskInfo(new UUID(1, 1), 1L, "default_cluster", 20000,
-                partitionIdToOffset);
-        routineLoadTaskInfoQueue.add(routineLoadTaskInfo1);
+        LinkedBlockingDeque<RoutineLoadTaskInfo> routineLoadTaskInfoQueue = new LinkedBlockingDeque<>();
+        KafkaTaskInfo routineLoadTaskInfo1 = new KafkaTaskInfo(new UUID(1, 1), 1L, 20000,
+                partitionIdToOffset, false, -1, false);
+        routineLoadTaskInfoQueue.addFirst(routineLoadTaskInfo1);
 
         Map<Long, RoutineLoadTaskInfo> idToRoutineLoadTask = Maps.newHashMap();
         idToRoutineLoadTask.put(1L, routineLoadTaskInfo1);

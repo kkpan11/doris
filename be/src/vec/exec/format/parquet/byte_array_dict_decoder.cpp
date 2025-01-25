@@ -29,11 +29,12 @@
 
 namespace doris::vectorized {
 
-constexpr int MAX_STRINGS_OVERFLOW_SIZE = 128;
-
 Status ByteArrayDictDecoder::set_dict(std::unique_ptr<uint8_t[]>& dict, int32_t length,
                                       size_t num_values) {
     _dict = std::move(dict);
+    if (_dict == nullptr) {
+        return Status::Corruption("Wrong dictionary data for byte array type, dict is null.");
+    }
     _dict_items.reserve(num_values);
     uint32_t offset_cursor = 0;
     char* dict_item_address = reinterpret_cast<char*>(_dict.get());
@@ -46,9 +47,8 @@ Status ByteArrayDictDecoder::set_dict(std::unique_ptr<uint8_t[]>& dict, int32_t 
         total_length += l;
     }
 
-    _dict_value_to_code.reserve(num_values);
     // For insert_many_strings_overflow
-    _dict_data.resize(total_length + MAX_STRINGS_OVERFLOW_SIZE);
+    _dict_data.resize(total_length + ColumnString::MAX_STRINGS_OVERFLOW_SIZE);
     _max_value_length = 0;
     size_t offset = 0;
     offset_cursor = 0;
@@ -57,7 +57,6 @@ Status ByteArrayDictDecoder::set_dict(std::unique_ptr<uint8_t[]>& dict, int32_t 
         offset_cursor += 4;
         memcpy(&_dict_data[offset], dict_item_address + offset_cursor, l);
         _dict_items.emplace_back(&_dict_data[offset], l);
-        _dict_value_to_code[StringRef(&_dict_data[offset], l)] = i;
         offset_cursor += l;
         offset += l;
         if (offset_cursor > length) {
@@ -74,17 +73,8 @@ Status ByteArrayDictDecoder::set_dict(std::unique_ptr<uint8_t[]>& dict, int32_t 
 }
 
 Status ByteArrayDictDecoder::read_dict_values_to_column(MutableColumnPtr& doris_column) {
-    doris_column->insert_many_strings_overflow(&_dict_items[0], _dict_items.size(),
+    doris_column->insert_many_strings_overflow(_dict_items.data(), _dict_items.size(),
                                                _max_value_length);
-    return Status::OK();
-}
-
-Status ByteArrayDictDecoder::get_dict_codes(const ColumnString* string_column,
-                                            std::vector<int32_t>* dict_codes) {
-    for (int i = 0; i < string_column->size(); ++i) {
-        StringRef dict_value = string_column->get_data_at(i);
-        dict_codes->emplace_back(_dict_value_to_code[dict_value]);
-    }
     return Status::OK();
 }
 
@@ -96,7 +86,7 @@ MutableColumnPtr ByteArrayDictDecoder::convert_dict_column_to_string_column(
     for (size_t i = 0; i < dict_column->size(); ++i) {
         dict_values[i] = _dict_items[data[i]];
     }
-    res->insert_many_strings_overflow(&dict_values[0], dict_values.size(), _max_value_length);
+    res->insert_many_strings_overflow(dict_values.data(), dict_values.size(), _max_value_length);
     return res;
 }
 
@@ -117,65 +107,45 @@ Status ByteArrayDictDecoder::_decode_values(MutableColumnPtr& doris_column, Data
     if (doris_column->is_column_dictionary()) {
         ColumnDictI32& dict_column = assert_cast<ColumnDictI32&>(*doris_column);
         if (dict_column.dict_size() == 0) {
-            dict_column.insert_many_dict_data(&_dict_items[0], _dict_items.size());
+            dict_column.insert_many_dict_data(_dict_items.data(), _dict_items.size());
         }
     }
     _indexes.resize(non_null_size);
-    _index_batch_decoder->GetBatch(&_indexes[0], non_null_size);
+    _index_batch_decoder->GetBatch(_indexes.data(), non_null_size);
 
     if (doris_column->is_column_dictionary() || is_dict_filter) {
         return _decode_dict_values<has_filter>(doris_column, select_vector, is_dict_filter);
     }
 
-    TypeIndex logical_type = remove_nullable(data_type)->get_type_id();
-    switch (logical_type) {
-    case TypeIndex::String:
-        [[fallthrough]];
-    case TypeIndex::FixedString: {
-        size_t dict_index = 0;
+    size_t dict_index = 0;
 
-        ColumnSelectVector::DataReadType read_type;
-        while (size_t run_length = select_vector.get_next_run<has_filter>(&read_type)) {
-            switch (read_type) {
-            case ColumnSelectVector::CONTENT: {
-                std::vector<StringRef> string_values;
-                string_values.reserve(run_length);
-                for (size_t i = 0; i < run_length; ++i) {
-                    string_values.emplace_back(_dict_items[_indexes[dict_index++]]);
-                }
-                doris_column->insert_many_strings_overflow(&string_values[0], run_length,
-                                                           _max_value_length);
-                break;
+    ColumnSelectVector::DataReadType read_type;
+    while (size_t run_length = select_vector.get_next_run<has_filter>(&read_type)) {
+        switch (read_type) {
+        case ColumnSelectVector::CONTENT: {
+            std::vector<StringRef> string_values;
+            string_values.reserve(run_length);
+            for (size_t i = 0; i < run_length; ++i) {
+                string_values.emplace_back(_dict_items[_indexes[dict_index++]]);
             }
-            case ColumnSelectVector::NULL_DATA: {
-                doris_column->insert_many_defaults(run_length);
-                break;
-            }
-            case ColumnSelectVector::FILTERED_CONTENT: {
-                dict_index += run_length;
-                break;
-            }
-            case ColumnSelectVector::FILTERED_NULL: {
-                // do nothing
-                break;
-            }
-            }
+            doris_column->insert_many_strings_overflow(string_values.data(), run_length,
+                                                       _max_value_length);
+            break;
         }
-        return Status::OK();
+        case ColumnSelectVector::NULL_DATA: {
+            doris_column->insert_many_defaults(run_length);
+            break;
+        }
+        case ColumnSelectVector::FILTERED_CONTENT: {
+            dict_index += run_length;
+            break;
+        }
+        case ColumnSelectVector::FILTERED_NULL: {
+            // do nothing
+            break;
+        }
+        }
     }
-    case TypeIndex::Decimal32:
-        return _decode_binary_decimal<Int32, has_filter>(doris_column, data_type, select_vector);
-    case TypeIndex::Decimal64:
-        return _decode_binary_decimal<Int64, has_filter>(doris_column, data_type, select_vector);
-    case TypeIndex::Decimal128:
-        return _decode_binary_decimal<Int128, has_filter>(doris_column, data_type, select_vector);
-    case TypeIndex::Decimal128I:
-        return _decode_binary_decimal<Int128, has_filter>(doris_column, data_type, select_vector);
-    default:
-        break;
-    }
-    return Status::InvalidArgument(
-            "Can't decode parquet physical type BYTE_ARRAY to doris logical type {}",
-            getTypeName(logical_type));
+    return Status::OK();
 }
 } // namespace doris::vectorized

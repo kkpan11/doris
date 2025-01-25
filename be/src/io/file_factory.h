@@ -23,23 +23,18 @@
 
 #include <map>
 #include <memory>
-#include <ostream>
 #include <string>
-#include <vector>
 
 #include "common/factory_creator.h"
 #include "common/status.h"
-#include "io/fs/file_reader_options.h"
+#include "io/fs/file_reader.h"
 #include "io/fs/file_reader_writer_fwd.h"
+#include "io/fs/file_system.h"
 
 namespace doris {
 namespace io {
 class FileSystem;
 class FileWriter;
-} // namespace io
-class ExecEnv;
-class RuntimeProfile;
-class RuntimeState;
 
 struct FileSystemProperties {
     TFileType::type system_type;
@@ -48,53 +43,69 @@ struct FileSystemProperties {
     std::vector<TNetworkAddress> broker_addresses;
 };
 
+struct FSPropertiesRef {
+    TFileType::type type;
+    const std::map<std::string, std::string>* properties {nullptr};
+    const THdfsParams* hdfs_params {nullptr};
+    const std::vector<TNetworkAddress>* broker_addresses {nullptr};
+
+    FSPropertiesRef(TFileType::type type_) : type(type_) {}
+
+    FSPropertiesRef(const FileSystemProperties& fs_properties)
+            : type(fs_properties.system_type),
+              properties(&fs_properties.properties),
+              hdfs_params(&fs_properties.hdfs_params),
+              broker_addresses(&fs_properties.broker_addresses) {}
+};
+
 struct FileDescription {
     std::string path;
-    int64_t start_offset;
-    int64_t file_size;
+    // length of the file in bytes.
+    // -1 means unset.
+    // If the file length is not set, the file length will be fetched from the file system.
+    int64_t file_size = -1;
+    // modification time of this file.
+    // 0 means unset.
+    int64_t mtime = 0;
+    // for hdfs, eg: hdfs://nameservices1/
+    // because for a hive table, differenet partitions may have different
+    // locations(or fs), so different files may have different fs.
+    std::string fs_name;
 };
+
+} // namespace io
+class ExecEnv;
+class RuntimeProfile;
+class RuntimeState;
 
 class FileFactory {
     ENABLE_FACTORY_CREATOR(FileFactory);
 
 public:
-    static io::FileReaderOptions get_reader_options(RuntimeState* state);
-    static io::FileReaderOptions NO_CACHE_READER_OPTIONS;
+    static io::FileReaderOptions get_reader_options(RuntimeState* state,
+                                                    const io::FileDescription& fd);
 
-    /// Create FileWriter
-    static Status create_file_writer(TFileType::type type, ExecEnv* env,
-                                     const std::vector<TNetworkAddress>& broker_addresses,
-                                     const std::map<std::string, std::string>& properties,
-                                     const std::string& path, int64_t start_offset,
-                                     std::unique_ptr<io::FileWriter>& file_writer);
+    /// Create a temporary FileSystem for accessing file corresponding to `file_description`
+    /// FIXME(plat1ko): Declare the path formats supported by each file system
+    static Result<io::FileSystemSPtr> create_fs(const io::FSPropertiesRef& fs_properties,
+                                                const io::FileDescription& file_description);
 
-    /// Create FileReader
-    static Status create_file_reader(
-            RuntimeProfile* profile, const FileSystemProperties& system_properties,
-            const FileDescription& file_description, std::shared_ptr<io::FileSystem>* file_system,
-            io::FileReaderSPtr* file_reader,
-            io::FileReaderOptions reader_options = NO_CACHE_READER_OPTIONS);
+    /// Create FileWriter without FS
+    static Result<io::FileWriterPtr> create_file_writer(
+            TFileType::type type, ExecEnv* env,
+            const std::vector<TNetworkAddress>& broker_addresses,
+            const std::map<std::string, std::string>& properties, const std::string& path,
+            const io::FileWriterOptions& options);
+
+    /// Create FileReader without FS
+    static Result<io::FileReaderSPtr> create_file_reader(
+            const io::FileSystemProperties& system_properties,
+            const io::FileDescription& file_description,
+            const io::FileReaderOptions& reader_options, RuntimeProfile* profile = nullptr);
 
     // Create FileReader for stream load pipe
-    static Status create_pipe_reader(const TUniqueId& load_id, io::FileReaderSPtr* file_reader);
-
-    static Status create_hdfs_reader(const THdfsParams& hdfs_params, const std::string& path,
-                                     std::shared_ptr<io::FileSystem>* hdfs_file_system,
-                                     io::FileReaderSPtr* reader,
-                                     const io::FileReaderOptions& reader_options);
-
-    static Status create_s3_reader(const std::map<std::string, std::string>& prop,
-                                   const std::string& path,
-                                   std::shared_ptr<io::FileSystem>* s3_file_system,
-                                   io::FileReaderSPtr* reader,
-                                   const io::FileReaderOptions& reader_options);
-
-    static Status create_broker_reader(const TNetworkAddress& broker_addr,
-                                       const std::map<std::string, std::string>& prop,
-                                       const FileDescription& file_description,
-                                       std::shared_ptr<io::FileSystem>* hdfs_file_system,
-                                       io::FileReaderSPtr* reader,
-                                       const io::FileReaderOptions& reader_options);
+    static Status create_pipe_reader(const TUniqueId& load_id, io::FileReaderSPtr* file_reader,
+                                     RuntimeState* runtime_state, bool need_schema);
 
     static TFileType::type convert_storage_type(TStorageBackendType::type type) {
         switch (type) {
@@ -107,9 +118,9 @@ public:
         case TStorageBackendType::HDFS:
             return TFileType::FILE_HDFS;
         default:
-            LOG(FATAL) << "not match type to convert, from type:" << type;
+            throw Exception(Status::FatalError("not match type to convert, from type:{}", type));
         }
-        __builtin_unreachable();
+        throw Exception(Status::FatalError("__builtin_unreachable"));
     }
 };
 

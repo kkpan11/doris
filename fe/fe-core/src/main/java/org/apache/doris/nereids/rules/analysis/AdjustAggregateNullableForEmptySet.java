@@ -22,6 +22,8 @@ import org.apache.doris.nereids.rules.RuleType;
 import org.apache.doris.nereids.rules.rewrite.RewriteRuleFactory;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
+import org.apache.doris.nereids.trees.expressions.OrderExpression;
+import org.apache.doris.nereids.trees.expressions.WindowExpression;
 import org.apache.doris.nereids.trees.expressions.functions.agg.NullableAggregateFunction;
 import org.apache.doris.nereids.trees.expressions.visitor.DefaultExpressionRewriter;
 import org.apache.doris.nereids.trees.plans.logical.LogicalHaving;
@@ -31,6 +33,7 @@ import com.google.common.collect.ImmutableSet;
 
 import java.util.List;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * adjust aggregate nullable when: group expr list is empty and function is NullableAggregateFunction,
@@ -43,21 +46,30 @@ public class AdjustAggregateNullableForEmptySet implements RewriteRuleFactory {
                 RuleType.ADJUST_NULLABLE_FOR_AGGREGATE_SLOT.build(
                         logicalAggregate()
                                 .then(agg -> {
-                                    List<NamedExpression> output = agg.getOutputExpressions().stream()
-                                            .map(ne -> ((NamedExpression) FunctionReplacer.INSTANCE.replace(ne,
-                                                    agg.getGroupByExpressions().isEmpty())))
-                                            .collect(ImmutableList.toImmutableList());
-                                    return agg.withAggOutput(output);
+                                    List<NamedExpression> outputExprs = agg.getOutputExpressions();
+                                    boolean noGroupBy = agg.getGroupByExpressions().isEmpty();
+                                    ImmutableList.Builder<NamedExpression> newOutput
+                                            = ImmutableList.builderWithExpectedSize(outputExprs.size());
+                                    for (NamedExpression ne : outputExprs) {
+                                        NamedExpression newExpr =
+                                                ((NamedExpression) FunctionReplacer.INSTANCE.replace(ne, noGroupBy));
+                                        newOutput.add(newExpr);
+                                    }
+                                    return agg.withAggOutput(newOutput.build());
                                 })
                 ),
                 RuleType.ADJUST_NULLABLE_FOR_HAVING_SLOT.build(
                         logicalHaving(logicalAggregate())
                                 .then(having -> {
-                                    Set<Expression> newConjuncts = having.getConjuncts().stream()
-                                            .map(ne -> FunctionReplacer.INSTANCE.replace(ne,
-                                                    having.child().getGroupByExpressions().isEmpty()))
-                                            .collect(ImmutableSet.toImmutableSet());
-                                    return new LogicalHaving<>(newConjuncts, having.child());
+                                    Set<Expression> conjuncts = having.getConjuncts();
+                                    boolean noGroupBy = having.child().getGroupByExpressions().isEmpty();
+                                    ImmutableSet.Builder<Expression> newConjuncts
+                                            = ImmutableSet.builderWithExpectedSize(conjuncts.size());
+                                    for (Expression expr : conjuncts) {
+                                        Expression newExpr = FunctionReplacer.INSTANCE.replace(expr, noGroupBy);
+                                        newConjuncts.add(newExpr);
+                                    }
+                                    return new LogicalHaving<>(newConjuncts.build(), having.child());
                                 })
                 )
         );
@@ -71,10 +83,23 @@ public class AdjustAggregateNullableForEmptySet implements RewriteRuleFactory {
         }
 
         @Override
+        public Expression visitWindow(WindowExpression windowExpression, Boolean alwaysNullable) {
+            return windowExpression.withPartitionKeysOrderKeys(
+                    windowExpression.getPartitionKeys().stream()
+                            .map(k -> k.accept(INSTANCE, alwaysNullable))
+                            .collect(Collectors.toList()),
+                    windowExpression.getOrderKeys().stream()
+                            .map(k -> (OrderExpression) k.withChildren(k.children().stream()
+                                    .map(c -> c.accept(INSTANCE, alwaysNullable))
+                                    .collect(Collectors.toList())))
+                            .collect(Collectors.toList())
+            );
+        }
+
+        @Override
         public Expression visitNullableAggregateFunction(NullableAggregateFunction nullableAggregateFunction,
                 Boolean alwaysNullable) {
-            return nullableAggregateFunction.isDistinct() ? nullableAggregateFunction
-                    : nullableAggregateFunction.withAlwaysNullable(alwaysNullable);
+            return nullableAggregateFunction.withAlwaysNullable(alwaysNullable);
         }
     }
 }

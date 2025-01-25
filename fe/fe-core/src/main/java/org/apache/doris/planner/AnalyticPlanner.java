@@ -313,9 +313,10 @@ public class AnalyticPlanner {
                 SlotDescriptor sortSlotDesc = analyzer.getDescTbl().addSlotDescriptor(sortTupleDesc);
                 if (inputSlotDesc.getColumn() != null) {
                     sortSlotDesc.setColumn(inputSlotDesc.getColumn());
-                } else {
-                    sortSlotDesc.setType(inputSlotDesc.getType());
                 }
+                // always set type as inputSlotDesc's type
+                sortSlotDesc.setType(inputSlotDesc.getType());
+
                 // all output slots need to be materialized
                 sortSlotDesc.setIsMaterialized(true);
                 sortSlotDesc.setIsNullable(inputSlotDesc.getIsNullable());
@@ -412,7 +413,6 @@ public class AnalyticPlanner {
 
             SortInfo sortInfo = createSortInfo(newRoot, sortExprs, isAsc, nullsFirst);
             SortNode sortNode = new SortNode(ctx.getNextNodeId(), newRoot, sortInfo, false);
-            sortNode.setDefaultLimit(false);
 
             // if this sort group does not have partitioning exprs, we want the sort
             // to be executed like a regular distributed sort

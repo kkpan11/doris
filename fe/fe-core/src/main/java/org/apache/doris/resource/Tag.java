@@ -66,6 +66,19 @@ public class Tag implements Writable {
     public static final String VALUE_DEFAULT_TAG = "default";
     public static final String VALUE_INVALID_TAG = "invalid";
 
+    public static final String CLOUD_CLUSTER_NAME = "cloud_cluster_name";
+    public static final String CLOUD_CLUSTER_ID = "cloud_cluster_id";
+    public static final String CLOUD_UNIQUE_ID = "cloud_unique_id";
+    public static final String CLOUD_CLUSTER_PUBLIC_ENDPOINT = "cloud_cluster_public_endpoint";
+    public static final String CLOUD_CLUSTER_PRIVATE_ENDPOINT = "cloud_cluster_private_endpoint";
+    public static final String CLOUD_CLUSTER_STATUS = "cloud_cluster_status";
+
+    public static final String COMPUTE_GROUP_NAME = "compute_group_name";
+
+    public static final String VALUE_DEFAULT_COMPUTE_GROUP_NAME = "default_compute_group";
+
+    public static final String WORKLOAD_GROUP = "workload_group";
+
     public static final ImmutableSet<String> RESERVED_TAG_TYPE = ImmutableSet.of(
             TYPE_ROLE, TYPE_FUNCTION, TYPE_LOCATION);
     public static final ImmutableSet<String> RESERVED_TAG_VALUES = ImmutableSet.of(

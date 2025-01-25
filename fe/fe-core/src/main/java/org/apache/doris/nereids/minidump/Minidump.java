@@ -18,15 +18,8 @@
 package org.apache.doris.nereids.minidump;
 
 import org.apache.doris.catalog.ColocateTableIndex;
-import org.apache.doris.catalog.Env;
-import org.apache.doris.catalog.Table;
-import org.apache.doris.nereids.NereidsPlanner;
+import org.apache.doris.catalog.TableIf;
 import org.apache.doris.nereids.StatementContext;
-import org.apache.doris.nereids.glue.LogicalPlanAdapter;
-import org.apache.doris.nereids.parser.NereidsParser;
-import org.apache.doris.nereids.trees.plans.AbstractPlan;
-import org.apache.doris.nereids.trees.plans.commands.ExplainCommand;
-import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.OriginStatement;
 import org.apache.doris.qe.SessionVariable;
@@ -35,7 +28,6 @@ import org.apache.doris.statistics.Histogram;
 
 import org.json.JSONObject;
 
-import java.io.IOException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -58,10 +50,8 @@ public class Minidump {
 
     private String dbName;
 
-    private String catalogName;
-
     // metadata objects
-    private List<Table> tables;
+    private Map<List<String>, TableIf> tables;
 
     private Map<String, ColumnStatistic> totalColumnStatisticMap = new HashMap<>();
 
@@ -71,15 +61,14 @@ public class Minidump {
 
     /** Minidump class used to save environment messages */
     public Minidump(String sql, SessionVariable sessionVariable,
-                    String parsedPlanJson, String resultPlanJson, List<Table> tables,
-                    String catalogName, String dbName, Map<String, ColumnStatistic> totalColumnStatisticMap,
+                    String parsedPlanJson, String resultPlanJson, Map<List<String>, TableIf> tables,
+                    String dbName, Map<String, ColumnStatistic> totalColumnStatisticMap,
                     Map<String, Histogram> totalHistogramMap, ColocateTableIndex colocateTableIndex) {
         this.sql = sql;
         this.sessionVariable = sessionVariable;
         this.parsedPlanJson = parsedPlanJson;
         this.resultPlanJson = resultPlanJson;
         this.tables = tables;
-        this.catalogName = catalogName;
         this.dbName = dbName;
         this.totalColumnStatisticMap = totalColumnStatisticMap;
         this.totalHistogramMap = totalHistogramMap;
@@ -98,16 +87,12 @@ public class Minidump {
         return resultPlanJson;
     }
 
-    public List<Table> getTables() {
+    public Map<List<String>, TableIf> getTables() {
         return tables;
     }
 
     public String getSql() {
         return sql;
-    }
-
-    public String getCatalogName() {
-        return catalogName;
     }
 
     public String getDbName() {
@@ -131,40 +116,29 @@ public class Minidump {
         assert (args.length == 1);
         Minidump minidump = null;
         try {
-            minidump = MinidumpUtils.jsonMinidumpLoad(args[0]);
-        } catch (IOException e) {
-            throw new RuntimeException(e);
+            minidump = MinidumpUtils.loadMinidumpInputs(args[0]);
+        } catch (Exception e) {
+            e.printStackTrace();
         }
-        ConnectContext connectContext = new ConnectContext();
-        connectContext.setSessionVariable(minidump.getSessionVariable());
-        connectContext.setTables(minidump.getTables());
-        connectContext.getSessionVariable().setEnableMinidump(false);
-        connectContext.setDatabase(minidump.getDbName());
-        connectContext.getSessionVariable().setPlanNereidsDump(true);
-        connectContext.getSessionVariable().enableNereidsTimeout = false;
-        connectContext.getSessionVariable().setEnableNereidsPlanner(true);
-        connectContext.getSessionVariable().setEnableNereidsTrace(false);
-        connectContext.getSessionVariable().setNereidsTraceEventMode("all");
-        connectContext.getTotalColumnStatisticMap().putAll(minidump.getTotalColumnStatisticMap());
-        connectContext.getTotalHistogramMap().putAll(minidump.getTotalHistogramMap());
-        connectContext.setThreadLocalInfo();
-        Env.getCurrentEnv().setColocateTableIndex(minidump.getColocateTableIndex());
-        NereidsParser nereidsParser = new NereidsParser();
-        LogicalPlan parsed = nereidsParser.parseSingle(minidump.getSql());
-        if (parsed instanceof ExplainCommand) {
-            parsed = ((ExplainCommand) parsed).getLogicalPlan();
-        }
-        NereidsPlanner nereidsPlanner = new NereidsPlanner(
-                new StatementContext(connectContext, new OriginStatement(minidump.getSql(), 0)));
-        nereidsPlanner.plan(LogicalPlanAdapter.of(parsed));
-        JSONObject resultPlan = ((AbstractPlan) nereidsPlanner.getOptimizedPlan()).toJson();
+
+        StatementContext statementContext = new StatementContext(ConnectContext.get(),
+                new OriginStatement(minidump.getSql(), 0));
+        statementContext.setTables(minidump.getTables());
+        ConnectContext.get().setStatementContext(statementContext);
+        JSONObject resultPlan = MinidumpUtils.executeSql(minidump.getSql());
         JSONObject minidumpResult = new JSONObject(minidump.getResultPlanJson());
-        String resultString = resultPlan.toString();
-        String minidumpResultString = minidumpResult.toString();
-        if (!resultString.equals(minidumpResultString)) {
-            throw new AssertionError("result not equal");
+
+        List<String> differences = MinidumpUtils.compareJsonObjects(minidumpResult, resultPlan, "");
+
+        if (differences.isEmpty()) {
+            System.out.println(minidump.sql);
+        } else {
+            System.out.println(minidump.sql + "\n" + "Result plan are not expected. Differences:");
+            System.out.println("----------------------------Result plan--------------------------");
+            System.out.println(resultPlan + "\n");
+            System.out.println("----------------------------Minidump plan--------------------------");
+            System.out.println(minidumpResult + "\n");
         }
-        System.out.println("execute success");
         System.exit(0);
     }
 }

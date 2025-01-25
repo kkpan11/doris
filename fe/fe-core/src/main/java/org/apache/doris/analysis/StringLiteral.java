@@ -24,8 +24,7 @@ import org.apache.doris.catalog.PrimitiveType;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.DdlException;
-import org.apache.doris.common.ErrorCode;
-import org.apache.doris.common.ErrorReport;
+import org.apache.doris.common.FormatOptions;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.qe.VariableVarConverters;
 import org.apache.doris.thrift.TExprNode;
@@ -33,24 +32,26 @@ import org.apache.doris.thrift.TExprNodeType;
 import org.apache.doris.thrift.TStringLiteral;
 
 import com.google.common.base.Preconditions;
+import com.google.gson.annotations.SerializedName;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.math.BigDecimal;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.Objects;
 
 public class StringLiteral extends LiteralExpr {
     private static final Logger LOG = LogManager.getLogger(StringLiteral.class);
+    @SerializedName("v")
     private String value;
     // Means the converted session variable need to be cast to int, such as "cast 'STRICT_TRANS_TABLES' to Integer".
     private String beConverted = "";
 
-    public StringLiteral() {
+    private StringLiteral() {
         super();
         type = Type.VARCHAR;
     }
@@ -78,6 +79,9 @@ public class StringLiteral extends LiteralExpr {
 
     @Override
     public int compareLiteral(LiteralExpr expr) {
+        if (expr instanceof PlaceHolderExpr) {
+            return this.compareLiteral(((PlaceHolderExpr) expr).getLiteral());
+        }
         if (expr instanceof NullLiteral) {
             return 1;
         }
@@ -136,15 +140,12 @@ public class StringLiteral extends LiteralExpr {
 
     @Override
     protected void toThrift(TExprNode msg) {
-        msg.node_type = TExprNodeType.STRING_LITERAL;
-        msg.string_literal = new TStringLiteral(getUnescapedValue());
-    }
-
-    // FIXME: modify by zhaochun
-    public String getUnescapedValue() {
-        // Unescape string exactly like Hive does. Hive's method assumes
-        // quotes so we add them here to reuse Hive's code.
-        return value;
+        if (value == null) {
+            msg.node_type = TExprNodeType.NULL_LITERAL;
+        } else {
+            msg.string_literal = new TStringLiteral(value);
+            msg.node_type = TExprNodeType.STRING_LITERAL;
+        }
     }
 
     @Override
@@ -153,8 +154,8 @@ public class StringLiteral extends LiteralExpr {
     }
 
     @Override
-    public String getStringValueForArray() {
-        return "\"" + getStringValue() + "\"";
+    public String getStringValueForArray(FormatOptions options) {
+        return options.getNestedStringWrapper() + getStringValue() + options.getNestedStringWrapper();
     }
 
     @Override
@@ -170,6 +171,40 @@ public class StringLiteral extends LiteralExpr {
     @Override
     public String getRealValue() {
         return getStringValue();
+    }
+
+    /**
+     * Convert a string literal to a IPv4 literal
+     *
+     * @return new converted literal (not null)
+     * @throws AnalysisException when entire given string cannot be transformed into a date
+     */
+    public LiteralExpr convertToIPv4() throws AnalysisException {
+        LiteralExpr newLiteral;
+        newLiteral = new IPv4Literal(value);
+        try {
+            newLiteral.checkValueValid();
+        } catch (AnalysisException e) {
+            return NullLiteral.create(newLiteral.getType());
+        }
+        return newLiteral;
+    }
+
+    /**
+     * Convert a string literal to a IPv6 literal
+     *
+     * @return new converted literal (not null)
+     * @throws AnalysisException when entire given string cannot be transformed into a date
+     */
+    public LiteralExpr convertToIPv6() throws AnalysisException {
+        LiteralExpr newLiteral;
+        newLiteral = new IPv6Literal(value);
+        try {
+            newLiteral.checkValueValid();
+        } catch (AnalysisException e) {
+            return NullLiteral.create(newLiteral.getType());
+        }
+        return newLiteral;
     }
 
     /**
@@ -202,9 +237,9 @@ public class StringLiteral extends LiteralExpr {
         return newLiteral;
     }
 
-    public boolean canConvertToDateV2(Type targetType) {
+    public boolean canConvertToDateType(Type targetType) {
         try {
-            Preconditions.checkArgument(targetType.isDateV2());
+            Preconditions.checkArgument(targetType.isDateType());
             new DateLiteral(value, targetType);
             return true;
         } catch (AnalysisException e) {
@@ -227,14 +262,7 @@ public class StringLiteral extends LiteralExpr {
                             throw new AnalysisException(e.getMessage());
                         }
                     }
-                    // MySQL will try to parse string as bigint, if failed, will cast string as 0.
-                    long longValue;
-                    try {
-                        longValue = Long.parseLong(value);
-                    } catch (NumberFormatException e) {
-                        longValue = 0L;
-                    }
-                    return new IntLiteral(longValue, targetType);
+                    return new IntLiteral(value, targetType);
                 case LARGEINT:
                     if (VariableVarConverters.hasConverter(beConverted)) {
                         try {
@@ -250,15 +278,16 @@ public class StringLiteral extends LiteralExpr {
                     try {
                         return new FloatLiteral(Double.valueOf(value), targetType);
                     } catch (NumberFormatException e) {
-                        ErrorReport.reportAnalysisException(ErrorCode.ERR_BAD_NUMBER, value);
+                        // consistent with CastExpr's getResultValue() method
+                        return NullLiteral.create(targetType);
                     }
-                    break;
                 case DECIMALV2:
                 case DECIMAL32:
                 case DECIMAL64:
                 case DECIMAL128:
+                case DECIMAL256:
                     try {
-                        DecimalLiteral res = new DecimalLiteral(new BigDecimal(value));
+                        DecimalLiteral res = new DecimalLiteral(new BigDecimal(value).stripTrailingZeros());
                         res.setType(targetType);
                         return res;
                     } catch (Exception e) {
@@ -271,12 +300,16 @@ public class StringLiteral extends LiteralExpr {
         } else if (targetType.isDateType()) {
             // FE only support 'yyyy-MM-dd hh:mm:ss' && 'yyyy-MM-dd' format
             // so if FE unchecked cast fail, we also build CastExpr for BE
-            // BE support other format suck as 'yyyyMMdd'...
+            // BE support other format such as 'yyyyMMdd'...
             try {
                 return convertToDate(targetType);
             } catch (AnalysisException e) {
                 // pass;
             }
+        } else if (targetType.isIPv4()) {
+            return convertToIPv4();
+        } else if (targetType.isIPv6()) {
+            return convertToIPv6();
         } else if (targetType.equals(type)) {
             return this;
         } else if (targetType.isStringType()) {
@@ -287,12 +320,6 @@ public class StringLiteral extends LiteralExpr {
             return new JsonLiteral(value);
         }
         return super.uncheckedCastTo(targetType);
-    }
-
-    @Override
-    public void write(DataOutput out) throws IOException {
-        super.write(out);
-        Text.writeString(out, value);
     }
 
     public void readFields(DataInput in) throws IOException {
@@ -312,16 +339,19 @@ public class StringLiteral extends LiteralExpr {
     }
 
     @Override
-    public void setupParamFromBinary(ByteBuffer data) {
+    public void setupParamFromBinary(ByteBuffer data, boolean isUnsigned) {
         int strLen = getParmLen(data);
         if (strLen > data.remaining()) {
             strLen = data.remaining();
         }
         byte[] bytes = new byte[strLen];
         data.get(bytes);
-        value = new String(bytes);
+        // ATTN: use fixed StandardCharsets.UTF_8 to avoid unexpected charset in
+        // different environment
+        value = new String(bytes, StandardCharsets.UTF_8);
         if (LOG.isDebugEnabled()) {
             LOG.debug("parsed value '{}'", value);
         }
+        type = Type.VARCHAR;
     }
 }

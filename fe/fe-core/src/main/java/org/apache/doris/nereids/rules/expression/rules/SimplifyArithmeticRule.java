@@ -17,20 +17,27 @@
 
 package org.apache.doris.nereids.rules.expression.rules;
 
-import org.apache.doris.nereids.rules.expression.AbstractExpressionRewriteRule;
-import org.apache.doris.nereids.rules.expression.ExpressionRewriteContext;
+import org.apache.doris.nereids.rules.expression.ExpressionPatternMatcher;
+import org.apache.doris.nereids.rules.expression.ExpressionPatternRuleFactory;
+import org.apache.doris.nereids.rules.expression.ExpressionRuleType;
 import org.apache.doris.nereids.trees.expressions.Add;
 import org.apache.doris.nereids.trees.expressions.BinaryArithmetic;
+import org.apache.doris.nereids.trees.expressions.Cast;
 import org.apache.doris.nereids.trees.expressions.Divide;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.Multiply;
 import org.apache.doris.nereids.trees.expressions.Subtract;
+import org.apache.doris.nereids.types.DataType;
+import org.apache.doris.nereids.util.TypeCoercionUtils;
 import org.apache.doris.nereids.util.TypeUtils;
+import org.apache.doris.nereids.util.Utils;
 
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Predicate;
 
 /**
  * Simplify arithmetic rule.
@@ -42,27 +49,25 @@ import java.util.Optional;
  *
  * TODO: handle cases like: '1 - IA < 1' to 'IA > 0'
  */
-public class SimplifyArithmeticRule extends AbstractExpressionRewriteRule {
+public class SimplifyArithmeticRule implements ExpressionPatternRuleFactory {
     public static final SimplifyArithmeticRule INSTANCE = new SimplifyArithmeticRule();
 
     @Override
-    public Expression visitAdd(Add add, ExpressionRewriteContext context) {
-        return process(add, true);
+    public List<ExpressionPatternMatcher<? extends Expression>> buildRules() {
+        return ImmutableList.of(
+                matchesTopType(BinaryArithmetic.class).then(SimplifyArithmeticRule::simplify)
+                        .toRule(ExpressionRuleType.SIMPLIFY_ARITHMETIC)
+        );
     }
 
-    @Override
-    public Expression visitSubtract(Subtract subtract, ExpressionRewriteContext context) {
-        return process(subtract, true);
-    }
-
-    @Override
-    public Expression visitDivide(Divide divide, ExpressionRewriteContext context) {
-        return process(divide, false);
-    }
-
-    @Override
-    public Expression visitMultiply(Multiply multiply, ExpressionRewriteContext context) {
-        return process(multiply, false);
+    /** simplify */
+    public static Expression simplify(BinaryArithmetic binaryArithmetic) {
+        if (binaryArithmetic instanceof Add || binaryArithmetic instanceof Subtract) {
+            return process(binaryArithmetic, true);
+        } else if (binaryArithmetic instanceof Multiply || binaryArithmetic instanceof Divide) {
+            return process(binaryArithmetic, false);
+        }
+        return binaryArithmetic;
     }
 
     /**
@@ -74,7 +79,7 @@ public class SimplifyArithmeticRule extends AbstractExpressionRewriteRule {
      * 3.build new arithmetic expression.
      *   (a + b - c + d) + (1 - 2 - 1)
      */
-    private Expression process(BinaryArithmetic arithmetic, boolean isAddOrSub) {
+    private static Expression process(BinaryArithmetic arithmetic, boolean isAddOrSub) {
         // 1. flatten the arithmetic expression.
         List<Operand> flattedExpressions = flatten(arithmetic, isAddOrSub);
 
@@ -82,22 +87,27 @@ public class SimplifyArithmeticRule extends AbstractExpressionRewriteRule {
         List<Operand> constants = Lists.newArrayList();
 
         // TODO currently we don't process decimal for simplicity.
-        if (flattedExpressions.stream().anyMatch(operand -> operand.expression.getDataType().isDecimalLikeType())) {
-            return arithmetic;
+        for (Operand operand : flattedExpressions) {
+            if (operand.expression.getDataType().isDecimalLikeType()) {
+                return arithmetic;
+            }
         }
         // 2. move variables to left side and move constants to right sid.
-        flattedExpressions.forEach(operand -> {
+        for (Operand operand : flattedExpressions) {
+            if (operand.expression instanceof BinaryArithmetic) {
+                operand.expression = simplify((BinaryArithmetic) operand.expression);
+            }
             if (operand.expression.isConstant()) {
                 constants.add(operand);
             } else {
                 variables.add(operand);
             }
-        });
+        }
 
         // 3. build new arithmetic expression.
         if (!constants.isEmpty()) {
             boolean isOpposite = !constants.get(0).flag;
-            Optional<Operand> c = constants.stream().reduce((x, y) -> {
+            Optional<Operand> c = Utils.fastReduce(constants, (x, y) -> {
                 Expression expr;
                 if (isOpposite && y.flag || !isOpposite && !y.flag) {
                     expr = getSubOrDivide(isAddOrSub, x, y);
@@ -114,66 +124,94 @@ public class SimplifyArithmeticRule extends AbstractExpressionRewriteRule {
             }
         }
 
-        Optional<Operand> result = variables.stream().reduce((x, y) -> !y.flag
+        Optional<Operand> result = Utils.fastReduce(variables, (x, y) -> !y.flag
                 ? Operand.of(true, getSubOrDivide(isAddOrSub, x, y))
-                : Operand.of(true, getAddOrMultiply(isAddOrSub, x, y)));
-
+                : Operand.of(true, getAddOrMultiply(isAddOrSub, x, y))
+        );
         if (result.isPresent()) {
-            return result.get().expression;
+            return TypeCoercionUtils.castIfNotSameType(result.get().expression, arithmetic.getDataType());
         } else {
             return arithmetic;
         }
     }
 
-    private List<Operand> flatten(Expression expr, boolean isAddOrSub) {
+    // isAddOrSub: true for extract only "+" or "-" sub expressions, false for extract only "*" or "/" sub expressions
+    private static List<Operand> flatten(Expression expr, boolean isAddOrSub) {
         List<Operand> result = Lists.newArrayList();
-        if (isAddOrSub) {
-            flattenAddSubtract(true, expr, result);
-        } else {
-            flattenMultiplyDivide(true, expr, result);
-        }
+        doFlatten(true, expr, isAddOrSub, result, Optional.empty());
         return result;
     }
 
-    private void flattenAddSubtract(boolean flag, Expression expr, List<Operand> result) {
-        if (TypeUtils.isAddOrSubtract(expr)) {
-            BinaryArithmetic arithmetic = (BinaryArithmetic) expr;
-            flattenAddSubtract(flag, arithmetic.left(), result);
-            if (TypeUtils.isSubtract(expr) && !flag) {
-                flattenAddSubtract(true, arithmetic.right(), result);
-            } else if (TypeUtils.isAdd(expr) && !flag) {
-                flattenAddSubtract(false, arithmetic.right(), result);
+    // flag: true for '+' or '*', false for '-' or '/'
+    // isAddOrSub: true for extract only "+" or "-" sub expressions, false for extract only "*" or "/" sub expressions
+    private static void doFlatten(boolean flag, Expression expr, boolean isAddOrSub, List<Operand> result,
+            Optional<DataType> castType) {
+        // cast (a * 10 as double)  *  (cast 20 as double)
+        // => cast(a as double) * (cast 10 as double) * (cast 20 as double)
+        BinaryArithmetic arithmetic = null;
+        Predicate<Expression> isPositiveArithmetic = isAddOrSub
+                ? TypeUtils::isAdd : TypeUtils::isMultiply;
+        Predicate<Expression> isNegativeArithmetic = isAddOrSub
+                ? TypeUtils::isSubtract : TypeUtils::isDivide;
+        Predicate<Expression> isPosNegArithmetic = isPositiveArithmetic.or(isNegativeArithmetic);
+        if (isPosNegArithmetic.test(expr)) {
+            arithmetic = (BinaryArithmetic) expr;
+        } else if (expr instanceof Cast && hasConstantOperand(expr, isAddOrSub)) {
+            Cast cast = (Cast) expr;
+            if (isPosNegArithmetic.test(cast.child())) {
+                arithmetic = (BinaryArithmetic) cast.child();
+                castType = Optional.of(cast.getDataType());
+            }
+        }
+        if (arithmetic != null) {
+            doFlatten(flag, arithmetic.left(), isAddOrSub, result, castType);
+            if (isNegativeArithmetic.test(arithmetic) && !flag) {
+                doFlatten(true, arithmetic.right(), isAddOrSub, result, castType);
+            } else if (isPositiveArithmetic.test(arithmetic) && !flag) {
+                doFlatten(false, arithmetic.right(), isAddOrSub, result, castType);
             } else {
-                flattenAddSubtract(!TypeUtils.isSubtract(expr), arithmetic.right(), result);
+                doFlatten(!isNegativeArithmetic.test(arithmetic), arithmetic.right(), isAddOrSub, result, castType);
             }
         } else {
-            result.add(Operand.of(flag, expr));
+            if (castType.isPresent()) {
+                result.add(Operand.of(flag, TypeCoercionUtils.castIfNotSameType(expr, castType.get())));
+            } else {
+                result.add(Operand.of(flag, expr));
+            }
         }
     }
 
-    private void flattenMultiplyDivide(boolean flag, Expression expr, List<Operand> result) {
-        if (TypeUtils.isMultiplyOrDivide(expr)) {
-            BinaryArithmetic arithmetic = (BinaryArithmetic) expr;
-            flattenMultiplyDivide(flag, arithmetic.left(), result);
-            if (TypeUtils.isDivide(expr) && !flag) {
-                flattenMultiplyDivide(true, arithmetic.right(), result);
-            } else if (TypeUtils.isMultiply(expr) && !flag) {
-                flattenMultiplyDivide(false, arithmetic.right(), result);
-            } else {
-                flattenMultiplyDivide(!TypeUtils.isDivide(expr), arithmetic.right(), result);
+    private static boolean hasConstantOperand(Expression expr, boolean isAddOrSub) {
+        if (expr.isConstant()) {
+            return true;
+        }
+
+        Predicate<Expression> checkArithmetic = isAddOrSub
+                ? TypeUtils::isAddOrSubtract : TypeUtils::isMultiplyOrDivide;
+        BinaryArithmetic arithmetic = null;
+        if (checkArithmetic.test(expr)) {
+            arithmetic = (BinaryArithmetic) expr;
+        } else if (expr instanceof Cast) {
+            Cast cast = (Cast) expr;
+            if (checkArithmetic.test(cast.child())) {
+                arithmetic = (BinaryArithmetic) cast.child();
             }
+        }
+        if (arithmetic != null) {
+            return hasConstantOperand(arithmetic.left(), isAddOrSub)
+                    || hasConstantOperand(arithmetic.right(), isAddOrSub);
         } else {
-            result.add(Operand.of(flag, expr));
+            return false;
         }
     }
 
-    private Expression getSubOrDivide(boolean isAddOrSub, Operand x, Operand y) {
-        return isAddOrSub ? new Subtract(x.expression, y.expression)
+    private static Expression getSubOrDivide(boolean isSubOrDivide, Operand x, Operand y) {
+        return isSubOrDivide ? new Subtract(x.expression, y.expression)
                 : new Divide(x.expression, y.expression);
     }
 
-    private Expression getAddOrMultiply(boolean isAddOrSub, Operand x, Operand y) {
-        return isAddOrSub ? new Add(x.expression, y.expression)
+    private static Expression getAddOrMultiply(boolean isAddOrMultiply, Operand x, Operand y) {
+        return isAddOrMultiply ? new Add(x.expression, y.expression)
                 : new Multiply(x.expression, y.expression);
     }
 
@@ -203,3 +241,4 @@ public class SimplifyArithmeticRule extends AbstractExpressionRewriteRule {
         }
     }
 }
+

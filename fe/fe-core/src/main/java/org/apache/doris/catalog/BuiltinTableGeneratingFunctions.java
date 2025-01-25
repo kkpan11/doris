@@ -17,18 +17,29 @@
 
 package org.apache.doris.catalog;
 
+import org.apache.doris.nereids.trees.expressions.functions.generator.Explode;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeBitmap;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeBitmapOuter;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeJsonArrayDouble;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeJsonArrayDoubleOuter;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeJsonArrayInt;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeJsonArrayIntOuter;
+import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeJsonArrayJson;
+import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeJsonArrayJsonOuter;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeJsonArrayString;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeJsonArrayStringOuter;
+import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeJsonObject;
+import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeJsonObjectOuter;
+import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeMap;
+import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeMapOuter;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeNumbers;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeNumbersOuter;
+import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeOuter;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeSplit;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeSplitOuter;
+import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeVariantArray;
+import org.apache.doris.nereids.trees.expressions.functions.generator.PosExplode;
+import org.apache.doris.nereids.trees.expressions.functions.generator.PosExplodeOuter;
 
 import com.google.common.collect.ImmutableList;
 
@@ -42,6 +53,12 @@ import java.util.List;
  */
 public class BuiltinTableGeneratingFunctions implements FunctionHelper {
     public final List<TableGeneratingFunc> tableGeneratingFunctions = ImmutableList.of(
+            tableGenerating(Explode.class, "explode"),
+            tableGenerating(ExplodeOuter.class, "explode_outer"),
+            tableGenerating(ExplodeMap.class, "explode_map"),
+            tableGenerating(ExplodeMapOuter.class, "explode_map_outer"),
+            tableGenerating(ExplodeJsonObject.class, "explode_json_object"),
+            tableGenerating(ExplodeJsonObjectOuter.class, "explode_json_object_outer"),
             tableGenerating(ExplodeNumbers.class, "explode_numbers"),
             tableGenerating(ExplodeNumbersOuter.class, "explode_numbers_outer"),
             tableGenerating(ExplodeBitmap.class, "explode_bitmap"),
@@ -53,7 +70,12 @@ public class BuiltinTableGeneratingFunctions implements FunctionHelper {
             tableGenerating(ExplodeJsonArrayDouble.class, "explode_json_array_double"),
             tableGenerating(ExplodeJsonArrayDoubleOuter.class, "explode_json_array_double_outer"),
             tableGenerating(ExplodeJsonArrayString.class, "explode_json_array_string"),
-            tableGenerating(ExplodeJsonArrayStringOuter.class, "explode_json_array_string_outer")
+            tableGenerating(ExplodeJsonArrayStringOuter.class, "explode_json_array_string_outer"),
+            tableGenerating(ExplodeJsonArrayJson.class, "explode_json_array_json"),
+            tableGenerating(ExplodeJsonArrayJsonOuter.class, "explode_json_array_json_outer"),
+            tableGenerating(ExplodeVariantArray.class, "explode_variant_array"),
+            tableGenerating(PosExplode.class, "posexplode"),
+            tableGenerating(PosExplodeOuter.class, "posexplode_outer")
     );
 
     public static final BuiltinTableGeneratingFunctions INSTANCE = new BuiltinTableGeneratingFunctions();

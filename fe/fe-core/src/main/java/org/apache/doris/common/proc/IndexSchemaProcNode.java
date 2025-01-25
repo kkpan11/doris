@@ -48,10 +48,8 @@ public class IndexSchemaProcNode implements ProcNodeInterface {
         this.bfColumns = bfColumns;
     }
 
-    @Override
-    public ProcResult fetchResult() throws AnalysisException {
+    public static ProcResult createResult(List<Column> schema, Set<String> bfColumns) throws AnalysisException {
         Preconditions.checkNotNull(schema);
-
         BaseProcResult result = new BaseProcResult();
         result.setNames(TITLE_NAMES);
 
@@ -64,25 +62,28 @@ public class IndexSchemaProcNode implements ProcNodeInterface {
             if (bfColumns != null && bfColumns.contains(column.getName())) {
                 extras.add("BLOOM_FILTER");
             }
+            if (column.isAutoInc()) {
+                extras.add("AUTO_INCREMENT");
+            }
+            if (column.getGeneratedColumnInfo() != null) {
+                extras.add("STORED GENERATED");
+            }
             String extraStr = StringUtils.join(extras, ",");
 
             List<String> rowList = Arrays.asList(column.getDisplayName(),
-                                                 column.getOriginType().toString(),
+                                                 column.getOriginType().hideVersionForVersionColumn(true),
                                                  column.isAllowNull() ? "Yes" : "No",
                                                  ((Boolean) column.isKey()).toString(),
                                                  column.getDefaultValue() == null
                                                          ? FeConstants.null_string : column.getDefaultValue(),
                                                  extraStr);
-
-            if (column.getOriginType().isDateV2()) {
-                rowList.set(1, "DATE");
-            }
-            if (column.getOriginType().isDatetimeV2()) {
-                rowList.set(1, "DATETIME");
-            }
             result.addRow(rowList);
         }
         return result;
     }
 
+    @Override
+    public ProcResult fetchResult() throws AnalysisException {
+        return createResult(this.schema, this.bfColumns);
+    }
 }

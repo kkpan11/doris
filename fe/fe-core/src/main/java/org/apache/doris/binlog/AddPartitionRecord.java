@@ -18,9 +18,11 @@
 package org.apache.doris.binlog;
 
 import org.apache.doris.catalog.DataProperty;
+import org.apache.doris.catalog.ListPartitionItem;
 import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.PartitionItem;
 import org.apache.doris.catalog.PartitionKey;
+import org.apache.doris.catalog.RangePartitionItem;
 import org.apache.doris.catalog.ReplicaAllocation;
 import org.apache.doris.persist.PartitionPersistInfo;
 import org.apache.doris.persist.gson.GsonUtils;
@@ -51,6 +53,8 @@ public class AddPartitionRecord {
     private boolean isTempPartition = false;
     @SerializedName(value = "isMutable")
     private boolean isMutable = true;
+    @SerializedName(value = "sql")
+    private String sql;
 
     public AddPartitionRecord(long commitSeq, PartitionPersistInfo partitionPersistInfo) {
         this.commitSeq = commitSeq;
@@ -64,6 +68,37 @@ public class AddPartitionRecord {
         this.isInMemory = partitionPersistInfo.isInMemory();
         this.isTempPartition = partitionPersistInfo.isTempPartition();
         this.isMutable = partitionPersistInfo.isMutable();
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("ADD ");
+        if (isTempPartition) {
+            sb.append("TEMPORARY ");
+        }
+        sb.append("PARTITION `");
+        sb.append(partition.getName());
+        sb.append("` ");
+
+        // See fe/fe-core/src/main/java/org/apache/doris/datasource/InternalCatalog.java:addPartition for details.
+        if (!this.range.equals(RangePartitionItem.DUMMY_RANGE)) {
+            // range
+            sb.append("VALUES [");
+            sb.append(range.lowerEndpoint().toSql());
+            sb.append(", ");
+            sb.append(range.upperEndpoint().toSql());
+            sb.append(") (\"version_info\" = \"");
+            sb.append(partition.getVisibleVersion());
+            sb.append("\");");
+        } else if (!this.listPartitionItem.equals(ListPartitionItem.DUMMY_ITEM)) {
+            // list
+            sb.append("VALUES IN ");
+            sb.append(((ListPartitionItem) listPartitionItem).toSql());
+            sb.append(" (\"version_info\" = \"");
+            sb.append(partition.getVisibleVersion());
+            sb.append("\");");
+        } else {
+            // unpartitioned.
+        }
+        this.sql = sb.toString();
     }
 
     public long getCommitSeq() {

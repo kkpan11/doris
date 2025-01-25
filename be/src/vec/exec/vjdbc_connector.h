@@ -43,6 +43,8 @@ class IColumn;
 class VExprContext;
 
 struct JdbcConnectorParam {
+    // use -1 as default value to find error earlier.
+    int64_t catalog_id = -1;
     std::string driver_path;
     std::string driver_class;
     std::string resource_name;
@@ -51,9 +53,16 @@ struct JdbcConnectorParam {
     std::string user;
     std::string passwd;
     std::string query_string;
+    std::string table_name;
+    bool use_transaction = false;
     TOdbcTableType::type table_type;
+    int32_t connection_pool_min_size = -1;
+    int32_t connection_pool_max_size = -1;
+    int32_t connection_pool_max_wait_time = -1;
+    int32_t connection_pool_max_life_time = -1;
+    bool connection_pool_keep_alive = false;
 
-    const TupleDescriptor* tuple_desc;
+    const TupleDescriptor* tuple_desc = nullptr;
 };
 
 class JdbcConnector : public TableConnector {
@@ -62,6 +71,12 @@ public:
         int64_t _load_jar_timer = 0;
         int64_t _init_connector_timer = 0;
         int64_t _get_data_timer = 0;
+        int64_t _read_and_fill_vector_table_timer = 0;
+        int64_t _jni_setup_timer = 0;
+        int64_t _has_next_timer = 0;
+        int64_t _prepare_params_timer = 0;
+        int64_t _fill_block_timer = 0;
+        int64_t _cast_timer = 0;
         int64_t _check_type_timer = 0;
         int64_t _execte_read_timer = 0;
         int64_t _connector_close_timer = 0;
@@ -71,9 +86,15 @@ public:
 
     ~JdbcConnector() override;
 
-    Status open(RuntimeState* state, bool read = false) override;
+    Status open(RuntimeState* state, bool read = false);
 
     Status query() override;
+
+    Status get_next(bool* eos, Block* block, int batch_size);
+
+    Status append(vectorized::Block* block, const vectorized::VExprContextSPtrs& _output_vexpr_ctxs,
+                  uint32_t start_send_row, uint32_t* num_rows_sent,
+                  TOdbcTableType::type table_type = TOdbcTableType::MYSQL) override;
 
     Status exec_write_sql(const std::u16string& insert_stmt,
                           const fmt::memory_buffer& insert_stmt_buffer) override {
@@ -83,74 +104,66 @@ public:
     Status exec_stmt_write(Block* block, const VExprContextSPtrs& output_vexpr_ctxs,
                            uint32_t* num_rows_sent) override;
 
-    Status get_next(bool* eos, std::vector<MutableColumnPtr>& columns, Block* block,
-                    int batch_size);
-
     // use in JDBC transaction
     Status begin_trans() override; // should be call after connect and before query or init_to_write
     Status abort_trans() override; // should be call after transaction abort
     Status finish_trans() override; // should be call after transaction commit
 
+    Status init_to_write(doris::RuntimeProfile* profile) override {
+        init_profile(profile);
+        return Status::OK();
+    }
+
     JdbcStatistic& get_jdbc_statistic() { return _jdbc_statistic; }
 
-    Status close() override;
+    Status close(Status s = Status::OK()) override;
+
+    Status test_connection();
+    Status clean_datasource();
+
+protected:
+    JdbcConnectorParam _conn_param;
 
 private:
     Status _register_func_id(JNIEnv* env);
-    Status _check_column_type();
-    Status _check_type(SlotDescriptor*, const std::string& type_str, int column_index);
-    std::string _jobject_to_string(JNIEnv* env, jobject jobj);
-    Status _cast_string_to_array(const SlotDescriptor* slot_desc, Block* block, int column_index,
-                                 int rows);
-    Status _convert_batch_result_set(JNIEnv* env, jobject jobj, const SlotDescriptor* slot_desc,
-                                     vectorized::IColumn* column_ptr, int num_rows,
-                                     int column_index);
 
-    const JdbcConnectorParam& _conn_param;
+    jobject _get_reader_params(Block* block, JNIEnv* env, size_t column_size);
+
+    Status _cast_string_to_special(Block* block, JNIEnv* env, size_t column_size);
+    Status _cast_string_to_hll(const SlotDescriptor* slot_desc, Block* block, int column_index,
+                               int rows);
+    Status _cast_string_to_bitmap(const SlotDescriptor* slot_desc, Block* block, int column_index,
+                                  int rows);
+    Status _cast_string_to_json(const SlotDescriptor* slot_desc, Block* block, int column_index,
+                                int rows);
+    jobject _get_java_table_type(JNIEnv* env, TOdbcTableType::type tableType);
+
     bool _closed = false;
+    jclass _executor_factory_clazz;
     jclass _executor_clazz;
-    jclass _executor_list_clazz;
-    jclass _executor_object_clazz;
-    jclass _executor_string_clazz;
     jobject _executor_obj;
+    jmethodID _executor_factory_ctor_id;
     jmethodID _executor_ctor_id;
-    jmethodID _executor_write_id;
     jmethodID _executor_stmt_write_id;
     jmethodID _executor_read_id;
     jmethodID _executor_has_next_id;
+    jmethodID _executor_get_block_address_id;
     jmethodID _executor_block_rows_id;
-    jmethodID _executor_get_blocks_id;
-    jmethodID _executor_get_boolean_result;
-    jmethodID _executor_get_tinyint_result;
-    jmethodID _executor_get_smallint_result;
-    jmethodID _executor_get_int_result;
-    jmethodID _executor_get_bigint_result;
-    jmethodID _executor_get_largeint_result;
-    jmethodID _executor_get_float_result;
-    jmethodID _executor_get_double_result;
-    jmethodID _executor_get_char_result;
-    jmethodID _executor_get_string_result;
-    jmethodID _executor_get_date_result;
-    jmethodID _executor_get_datev2_result;
-    jmethodID _executor_get_datetime_result;
-    jmethodID _executor_get_datetimev2_result;
-    jmethodID _executor_get_decimalv2_result;
-    jmethodID _executor_get_decimal32_result;
-    jmethodID _executor_get_decimal64_result;
-    jmethodID _executor_get_decimal128_result;
-    jmethodID _executor_get_array_result;
-    jmethodID _executor_get_types_id;
     jmethodID _executor_close_id;
-    jmethodID _executor_get_list_id;
-    jmethodID _get_bytes_id;
-    jmethodID _to_string_id;
     jmethodID _executor_begin_trans_id;
     jmethodID _executor_finish_trans_id;
     jmethodID _executor_abort_trans_id;
-    std::map<int, int> _map_column_idx_to_cast_idx;
-    std::vector<DataTypePtr> _input_array_string_types;
-    std::vector<MutableColumnPtr>
-            str_array_cols; // for array type to save data like big string [1,2,3]
+    jmethodID _executor_test_connection_id;
+    jmethodID _executor_clean_datasource_id;
+
+    std::map<int, int> _map_column_idx_to_cast_idx_hll;
+    std::vector<DataTypePtr> _input_hll_string_types;
+
+    std::map<int, int> _map_column_idx_to_cast_idx_bitmap;
+    std::vector<DataTypePtr> _input_bitmap_string_types;
+
+    std::map<int, int> _map_column_idx_to_cast_idx_json;
+    std::vector<DataTypePtr> _input_json_string_types;
 
     JdbcStatistic _jdbc_statistic;
 };

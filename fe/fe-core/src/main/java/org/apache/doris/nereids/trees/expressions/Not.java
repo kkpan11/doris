@@ -24,7 +24,6 @@ import org.apache.doris.nereids.trees.expressions.typecoercion.ExpectsInputTypes
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
 import org.apache.doris.nereids.types.BooleanType;
 import org.apache.doris.nereids.types.DataType;
-import org.apache.doris.nereids.types.coercion.AbstractDataType;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
@@ -37,10 +36,31 @@ import java.util.Objects;
  */
 public class Not extends Expression implements UnaryExpression, ExpectsInputTypes, PropagateNullable {
 
-    public static final List<AbstractDataType> EXPECTS_INPUT_TYPES = ImmutableList.of(BooleanType.INSTANCE);
+    public static final List<DataType> EXPECTS_INPUT_TYPES = ImmutableList.of(BooleanType.INSTANCE);
+
+    private final boolean isGeneratedIsNotNull;
 
     public Not(Expression child) {
+        this(child, false);
+    }
+
+    public Not(List<Expression> child, boolean isGeneratedIsNotNull, boolean inferred) {
+        super(child, inferred);
+        this.isGeneratedIsNotNull = isGeneratedIsNotNull;
+    }
+
+    public Not(Expression child, boolean isGeneratedIsNotNull) {
+        super(ImmutableList.of(child));
+        this.isGeneratedIsNotNull = isGeneratedIsNotNull;
+    }
+
+    private Not(List<Expression> child, boolean isGeneratedIsNotNull) {
         super(child);
+        this.isGeneratedIsNotNull = isGeneratedIsNotNull;
+    }
+
+    public boolean isGeneratedIsNotNull() {
+        return isGeneratedIsNotNull;
     }
 
     @Override
@@ -67,12 +87,13 @@ public class Not extends Expression implements UnaryExpression, ExpectsInputType
             return false;
         }
         Not other = (Not) o;
-        return Objects.equals(child(), other.child());
+        return Objects.equals(child(), other.child())
+                && isGeneratedIsNotNull == other.isGeneratedIsNotNull;
     }
 
     @Override
-    public int hashCode() {
-        return child().hashCode();
+    public int computeHashCode() {
+        return Objects.hash(child().hashCode(), isGeneratedIsNotNull);
     }
 
     @Override
@@ -81,20 +102,27 @@ public class Not extends Expression implements UnaryExpression, ExpectsInputType
     }
 
     @Override
-    public String toSql() {
+    public String computeToSql() {
         return "( not " + child().toSql() + ")";
     }
 
     @Override
     public Not withChildren(List<Expression> children) {
         Preconditions.checkArgument(children.size() == 1);
-        Not not = new Not(children.get(0));
-        not.isGeneratedIsNotNull = this.isGeneratedIsNotNull;
-        return not;
+        return new Not(children, isGeneratedIsNotNull);
+    }
+
+    public Not withGeneratedIsNotNull(boolean isGeneratedIsNotNull) {
+        return new Not(children, isGeneratedIsNotNull);
     }
 
     @Override
-    public List<AbstractDataType> expectedInputTypes() {
+    public List<DataType> expectedInputTypes() {
         return EXPECTS_INPUT_TYPES;
+    }
+
+    @Override
+    public Expression withInferred(boolean inferred) {
+        return new Not(this.children, false, inferred);
     }
 }

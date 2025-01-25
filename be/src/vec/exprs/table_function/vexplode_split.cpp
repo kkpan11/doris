@@ -34,6 +34,7 @@
 #include "vec/exprs/vexpr_context.h"
 
 namespace doris::vectorized {
+#include "common/compile_check_begin.h"
 
 VExplodeSplitTableFunction::VExplodeSplitTableFunction() {
     _fn_name = "vexplode_split";
@@ -43,7 +44,7 @@ Status VExplodeSplitTableFunction::open() {
     return Status::OK();
 }
 
-Status VExplodeSplitTableFunction::process_init(Block* block) {
+Status VExplodeSplitTableFunction::process_init(Block* block, RuntimeState* state) {
     CHECK(_expr_context->root()->children().size() == 2)
             << "VExplodeSplitTableFunction must be have 2 children but have "
             << _expr_context->root()->children().size();
@@ -71,6 +72,10 @@ Status VExplodeSplitTableFunction::process_init(Block* block) {
     auto& delimiter_const_column = block->get_by_position(delimiter_column_idx).column;
     if (is_column_const(*delimiter_const_column)) {
         _delimiter = delimiter_const_column->get_data_at(0);
+        if (_delimiter.empty()) {
+            return Status::InvalidArgument(
+                    "explode_split(test, delimiter) delimiter column must be not empty");
+        }
     } else {
         return Status::NotSupported(
                 "explode_split(test, delimiter) delimiter column must be const");
@@ -79,22 +84,23 @@ Status VExplodeSplitTableFunction::process_init(Block* block) {
     return Status::OK();
 }
 
-Status VExplodeSplitTableFunction::process_row(size_t row_idx) {
-    RETURN_IF_ERROR(TableFunction::process_row(row_idx));
+void VExplodeSplitTableFunction::process_row(size_t row_idx) {
+    TableFunction::process_row(row_idx);
 
     if (!(_test_null_map && _test_null_map[row_idx]) && _delimiter.data != nullptr) {
         // TODO: use the function to be better string_view/StringRef split
         auto split = [](std::string_view strv, std::string_view delims = " ") {
-            std::vector<std::string_view> output;
-            auto first = strv.begin();
-            auto last = strv.end();
+            std::vector<StringRef> output;
+            const auto* first = strv.begin();
+            const auto* last = strv.end();
 
             do {
-                const auto second =
+                const auto* second =
                         std::search(first, last, std::cbegin(delims), std::cend(delims));
                 if (first != second) {
-                    output.emplace_back(strv.substr(std::distance(strv.begin(), first),
-                                                    std::distance(first, second)));
+                    auto view = strv.substr(std::distance(strv.begin(), first),
+                                            std::distance(first, second));
+                    output.emplace_back(view.data(), view.length());
                 } else {
                     output.emplace_back("", 0);
                 }
@@ -111,24 +117,47 @@ Status VExplodeSplitTableFunction::process_row(size_t row_idx) {
 
         _cur_size = _backup.size();
     }
-    return Status::OK();
 }
 
-Status VExplodeSplitTableFunction::process_close() {
+void VExplodeSplitTableFunction::process_close() {
     _text_column = nullptr;
     _real_text_column = nullptr;
     _test_null_map = nullptr;
     _delimiter = {};
-    return Status::OK();
 }
 
-void VExplodeSplitTableFunction::get_value(MutableColumnPtr& column) {
+void VExplodeSplitTableFunction::get_same_many_values(MutableColumnPtr& column, int length) {
     if (current_empty()) {
-        column->insert_default();
+        column->insert_many_defaults(length);
     } else {
-        column->insert_data(const_cast<char*>(_backup[_cur_offset].data()),
-                            _backup[_cur_offset].length());
+        column->insert_data_repeatedly(_backup[_cur_offset].data, _backup[_cur_offset].size,
+                                       length);
     }
 }
 
+int VExplodeSplitTableFunction::get_value(doris::vectorized::MutableColumnPtr& column,
+                                          int max_step) {
+    max_step = std::min(max_step, (int)(_cur_size - _cur_offset));
+    // should dispose the empty status, forward one step
+    if (current_empty()) {
+        column->insert_default();
+        max_step = 1;
+    } else {
+        ColumnString* target = nullptr;
+        if (_is_nullable) {
+            target = assert_cast<ColumnString*>(
+                    assert_cast<ColumnNullable*>(column.get())->get_nested_column_ptr().get());
+            assert_cast<ColumnUInt8*>(
+                    assert_cast<ColumnNullable*>(column.get())->get_null_map_column_ptr().get())
+                    ->insert_many_defaults(max_step);
+        } else {
+            target = assert_cast<ColumnString*>(column.get());
+        }
+        target->insert_many_strings(_backup.data() + _cur_offset, max_step);
+    }
+    TableFunction::forward(max_step);
+    return max_step;
+}
+
+#include "common/compile_check_end.h"
 } // namespace doris::vectorized

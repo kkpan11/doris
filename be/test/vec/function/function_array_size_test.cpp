@@ -40,21 +40,21 @@ TEST(function_array_size_test, size) {
         Array vec = {Int32(1), Int32(2), Int32(3)};
         DataSet data_set = {{{vec}, Int64(3)}, {{Null()}, Null()}, {{empty_arr}, Int64(0)}};
 
-        check_function<DataTypeInt64, true>(func_name, input_types, data_set);
+        static_cast<void>(check_function<DataTypeInt64, true>(func_name, input_types, data_set));
     }
 
     // size(Array<String>)
     {
         InputTypeSet input_types = {TypeIndex::Array, TypeIndex::String};
 
-        Array vec1 = {Field("abc", 3), Field("", 0), Field("def", 3)};
-        Array vec2 = {Field("abc", 3), Field("123", 0), Field("def", 3)};
+        Array vec1 = {Field(String("abc", 3)), Field(String("", 0)), Field(String("def", 3))};
+        Array vec2 = {Field(String("abc", 3)), Field(String("123", 0)), Field(String("def", 3))};
         DataSet data_set = {{{vec1}, Int64(3)},
                             {{vec2}, Int64(3)},
                             {{Null()}, Null()},
                             {{empty_arr}, Int64(0)}};
 
-        check_function<DataTypeInt64, true>(func_name, input_types, data_set);
+        static_cast<void>(check_function<DataTypeInt64, true>(func_name, input_types, data_set));
     }
 }
 
@@ -69,21 +69,21 @@ TEST(function_array_size_test, cardinality) {
         Array vec = {Int32(1), Int32(2), Int32(3)};
         DataSet data_set = {{{vec}, Int64(3)}, {{Null()}, Null()}, {{empty_arr}, Int64(0)}};
 
-        check_function<DataTypeInt64, true>(func_name, input_types, data_set);
+        static_cast<void>(check_function<DataTypeInt64, true>(func_name, input_types, data_set));
     }
 
     // cardinality(Array<String>)
     {
         InputTypeSet input_types = {TypeIndex::Array, TypeIndex::String};
 
-        Array vec1 = {Field("abc", 3), Field("", 0), Field("def", 3)};
-        Array vec2 = {Field("abc", 3), Field("123", 0), Field("def", 3)};
+        Array vec1 = {Field(String("abc", 3)), Field(String("", 0)), Field(String("def", 3))};
+        Array vec2 = {Field(String("abc", 3)), Field(String("123", 0)), Field(String("def", 3))};
         DataSet data_set = {{{vec1}, Int64(3)},
                             {{vec2}, Int64(3)},
                             {{Null()}, Null()},
                             {{empty_arr}, Int64(0)}};
 
-        check_function<DataTypeInt64, true>(func_name, input_types, data_set);
+        static_cast<void>(check_function<DataTypeInt64, true>(func_name, input_types, data_set));
     }
 }
 
@@ -98,21 +98,21 @@ TEST(function_array_size_test, array_size) {
         Array vec = {Int32(1), Int32(2), Int32(3)};
         DataSet data_set = {{{vec}, Int64(3)}, {{Null()}, Null()}, {{empty_arr}, Int64(0)}};
 
-        check_function<DataTypeInt64, true>(func_name, input_types, data_set);
+        static_cast<void>(check_function<DataTypeInt64, true>(func_name, input_types, data_set));
     }
 
     // array_size(Array<String>)
     {
         InputTypeSet input_types = {TypeIndex::Array, TypeIndex::String};
 
-        Array vec1 = {Field("abc", 3), Field("", 0), Field("def", 3)};
-        Array vec2 = {Field("abc", 3), Field("123", 0), Field("def", 3)};
+        Array vec1 = {Field(String("abc", 3)), Field(String("", 0)), Field(String("def", 3))};
+        Array vec2 = {Field(String("abc", 3)), Field(String("123", 0)), Field(String("def", 3))};
         DataSet data_set = {{{vec1}, Int64(3)},
                             {{vec2}, Int64(3)},
                             {{Null()}, Null()},
                             {{empty_arr}, Int64(0)}};
 
-        check_function<DataTypeInt64, true>(func_name, input_types, data_set);
+        static_cast<void>(check_function<DataTypeInt64, true>(func_name, input_types, data_set));
     }
 }
 

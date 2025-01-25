@@ -27,17 +27,20 @@
  */
 suite("load") {
     restore {
-        location "s3://${getS3BucketName()}/regression_backup/clickhouse/github_events"
+        location "s3://${getS3BucketName()}/regression/clickhouse/github_events"
         ak "${getS3AK()}"
         sk "${getS3SK()}"
         endpoint "http://${getS3Endpoint()}"
-        region "ap-beijing"
+        region "${getS3Region()}"
         repository "regression_test_github_events"
         snapshot "github_events"
         timestamp "2022-03-23-12-19-51"
         replicationNum 1
         timeout 72000
     }
+    sql "sync"
+    sql """ ANALYZE TABLE github_events """;
+    qt_sql_select_count """ select count(*) from github_events; """
 }
 /**
  *

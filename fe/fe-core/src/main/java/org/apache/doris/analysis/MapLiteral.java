@@ -20,19 +20,22 @@ package org.apache.doris.analysis;
 import org.apache.doris.catalog.MapType;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.FormatOptions;
+import org.apache.doris.qe.SessionVariable;
 import org.apache.doris.thrift.TExprNode;
 import org.apache.doris.thrift.TExprNodeType;
 import org.apache.doris.thrift.TTypeDesc;
 import org.apache.doris.thrift.TTypeNode;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
 import org.apache.commons.lang3.StringUtils;
 
 import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
 
 // INSERT INTO table_map VALUES ({'key1':1, 'key2':10, 'k3':100}), ({'key1':2,'key2':20}), ({'key1':3,'key2':30});
@@ -44,6 +47,15 @@ public class MapLiteral extends LiteralExpr {
         children = new ArrayList<>();
     }
 
+    public MapLiteral(Type type, List<LiteralExpr> keys, List<LiteralExpr> values) {
+        this.type = type;
+        children = Lists.newArrayList();
+        for (int i = 0; i < keys.size(); i++) {
+            children.add(keys.get(i));
+            children.add(values.get(i));
+        }
+    }
+
     public MapLiteral(LiteralExpr... exprs) throws AnalysisException {
         Type keyType = Type.NULL;
         Type valueType = Type.NULL;
@@ -52,11 +64,15 @@ public class MapLiteral extends LiteralExpr {
         // 1. limit key type with map-key support
         // 2. check type can be assigment for cast
         for (int idx = 0; idx < exprs.length && idx + 1 < exprs.length; idx += 2) {
-            if (!MapType.MAP.supportSubType(exprs[idx].getType())) {
+            if (exprs[idx].getType().isComplexType() || !MapType.MAP.supportSubType(exprs[idx].getType())) {
                 throw new AnalysisException("Invalid key type in Map, not support " + exprs[idx].getType());
             }
-            keyType = Type.getAssignmentCompatibleType(keyType, exprs[idx].getType(), true);
-            valueType = Type.getAssignmentCompatibleType(valueType, exprs[idx + 1].getType(), true);
+            if (!MapType.MAP.supportSubType(exprs[idx + 1].getType())) {
+                throw new AnalysisException("Invalid value type in Map, not support " + exprs[idx + 1].getType());
+            }
+            boolean enableDecimal256 = SessionVariable.getEnableDecimal256();
+            keyType = Type.getAssignmentCompatibleType(keyType, exprs[idx].getType(), true, enableDecimal256);
+            valueType = Type.getAssignmentCompatibleType(valueType, exprs[idx + 1].getType(), true, enableDecimal256);
         }
 
         if (keyType == Type.INVALID) {
@@ -139,14 +155,45 @@ public class MapLiteral extends LiteralExpr {
     public String getStringValue() {
         List<String> list = new ArrayList<>(children.size());
         for (int i = 0; i < children.size() && i + 1 < children.size(); i += 2) {
-            list.add(children.get(i).getStringValue() + ":" + children.get(i + 1).getStringValue());
+            list.add(getStringValue(children.get(i)) + ":" + getStringValue(children.get(i + 1)));
+        }
+        return "{" + StringUtils.join(list, ", ") + "}";
+    }
+
+    private String getStringValue(Expr expr) {
+        if (expr instanceof NullLiteral) {
+            return "null";
+        }
+        if (expr instanceof StringLiteral) {
+            return "\"" + expr.getStringValue() + "\"";
+        }
+        return expr.getStringValue();
+    }
+
+    @Override
+    public String getStringValueForArray(FormatOptions options) {
+        List<String> list = new ArrayList<>(children.size());
+        for (int i = 0; i < children.size() && i + 1 < children.size(); i += 2) {
+            list.add(children.get(i).getStringValueForArray(options)
+                    + options.getMapKeyDelim()
+                    + children.get(i + 1).getStringValueForArray(options));
         }
         return "{" + StringUtils.join(list, ", ") + "}";
     }
 
     @Override
-    public String getStringValueForArray() {
-        return null;
+    public String getStringValueInFe(FormatOptions options) {
+        List<String> list = new ArrayList<>(children.size());
+        for (int i = 0; i < children.size() && i + 1 < children.size(); i += 2) {
+            // we should use type to decide we output array is suitable for json format
+            if (children.get(i).getType().isComplexType()) {
+                // map key type do not support complex type
+                throw new UnsupportedOperationException("Unsupported key type for MAP: " + children.get(i).getType());
+            }
+            list.add(getStringLiteralForComplexType(children.get(i), options)
+                    + options.getMapKeyDelim() + getStringLiteralForComplexType(children.get(i + 1), options));
+        }
+        return "{" + StringUtils.join(list, ", ") + "}";
     }
 
     @Override
@@ -199,11 +246,20 @@ public class MapLiteral extends LiteralExpr {
     }
 
     @Override
-    public void write(DataOutput out) throws IOException {
-        super.write(out);
-        out.writeInt(children.size());
-        for (Expr e : children) {
-            Expr.writeTo(e, out);
+    public int hashCode() {
+        return Objects.hashCode(children);
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (!(o instanceof MapLiteral)) {
+            return false;
         }
+        if (this == o) {
+            return true;
+        }
+
+        MapLiteral that = (MapLiteral) o;
+        return Objects.equals(children, that.children);
     }
 }

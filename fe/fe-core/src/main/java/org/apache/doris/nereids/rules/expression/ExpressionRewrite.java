@@ -17,11 +17,15 @@
 
 package org.apache.doris.nereids.rules.expression;
 
+import org.apache.doris.common.Pair;
+import org.apache.doris.nereids.pattern.ExpressionPatternRules;
+import org.apache.doris.nereids.pattern.ExpressionPatternTraverseListeners;
 import org.apache.doris.nereids.properties.OrderKey;
 import org.apache.doris.nereids.rules.Rule;
 import org.apache.doris.nereids.rules.RuleType;
 import org.apache.doris.nereids.rules.rewrite.OneRewriteRuleFactory;
 import org.apache.doris.nereids.rules.rewrite.RewriteRuleFactory;
+import org.apache.doris.nereids.trees.expressions.EqualPredicate;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
 import org.apache.doris.nereids.trees.expressions.functions.Function;
@@ -31,6 +35,7 @@ import org.apache.doris.nereids.trees.plans.logical.LogicalFilter;
 import org.apache.doris.nereids.trees.plans.logical.LogicalGenerate;
 import org.apache.doris.nereids.trees.plans.logical.LogicalHaving;
 import org.apache.doris.nereids.trees.plans.logical.LogicalJoin;
+import org.apache.doris.nereids.trees.plans.logical.LogicalOlapTableSink;
 import org.apache.doris.nereids.trees.plans.logical.LogicalOneRowRelation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalProject;
 import org.apache.doris.nereids.trees.plans.logical.LogicalRepeat;
@@ -38,12 +43,13 @@ import org.apache.doris.nereids.trees.plans.logical.LogicalSort;
 import org.apache.doris.nereids.util.ExpressionUtils;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableList.Builder;
 import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.Lists;
 
-import java.util.ArrayList;
-import java.util.HashSet;
+import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
@@ -51,7 +57,7 @@ import java.util.Set;
  * expression of plan rewrite rule.
  */
 public class ExpressionRewrite implements RewriteRuleFactory {
-    private final ExpressionRuleExecutor rewriter;
+    protected final ExpressionRuleExecutor rewriter;
 
     public ExpressionRewrite(ExpressionRewriteRule... rules) {
         this.rewriter = new ExpressionRuleExecutor(ImmutableList.copyOf(rules));
@@ -76,10 +82,12 @@ public class ExpressionRewrite implements RewriteRuleFactory {
                 new JoinExpressionRewrite().build(),
                 new SortExpressionRewrite().build(),
                 new LogicalRepeatRewrite().build(),
-                new HavingExpressionRewrite().build());
+                new HavingExpressionRewrite().build(),
+                new OlapTableSinkExpressionRewrite().build());
     }
 
-    private class GenerateExpressionRewrite extends OneRewriteRuleFactory {
+    /** GenerateExpressionRewrite */
+    public class GenerateExpressionRewrite extends OneRewriteRuleFactory {
         @Override
         public Rule build() {
             return logicalGenerate().thenApply(ctx -> {
@@ -97,7 +105,8 @@ public class ExpressionRewrite implements RewriteRuleFactory {
         }
     }
 
-    private class OneRowRelationExpressionRewrite extends OneRewriteRuleFactory {
+    /** OneRowRelationExpressionRewrite */
+    public class OneRowRelationExpressionRewrite extends OneRewriteRuleFactory {
         @Override
         public Rule build() {
             return logicalOneRowRelation().thenApply(ctx -> {
@@ -105,28 +114,32 @@ public class ExpressionRewrite implements RewriteRuleFactory {
                 List<NamedExpression> projects = oneRowRelation.getProjects();
                 ExpressionRewriteContext context = new ExpressionRewriteContext(ctx.cascadesContext);
 
-                List<NamedExpression> newProjects = projects
-                        .stream()
-                        .map(expr -> (NamedExpression) rewriter.rewrite(expr, context))
-                        .collect(ImmutableList.toImmutableList());
-                if (projects.equals(newProjects)) {
-                    return oneRowRelation;
+                Builder<NamedExpression> rewrittenExprs
+                        = ImmutableList.builderWithExpectedSize(projects.size());
+                boolean changed = false;
+                for (NamedExpression project : projects) {
+                    NamedExpression newProject = (NamedExpression) rewriter.rewrite(project, context);
+                    if (!changed && !project.deepEquals(newProject)) {
+                        changed = true;
+                    }
+                    rewrittenExprs.add(newProject);
                 }
-                return new LogicalOneRowRelation(newProjects);
+                return changed
+                        ? new LogicalOneRowRelation(oneRowRelation.getRelationId(), rewrittenExprs.build())
+                        : oneRowRelation;
             }).toRule(RuleType.REWRITE_ONE_ROW_RELATION_EXPRESSION);
         }
     }
 
-    private class ProjectExpressionRewrite extends OneRewriteRuleFactory {
+    /** ProjectExpressionRewrite */
+    public class ProjectExpressionRewrite extends OneRewriteRuleFactory {
         @Override
         public Rule build() {
             return logicalProject().thenApply(ctx -> {
                 LogicalProject<Plan> project = ctx.root;
                 ExpressionRewriteContext context = new ExpressionRewriteContext(ctx.cascadesContext);
                 List<NamedExpression> projects = project.getProjects();
-                List<NamedExpression> newProjects = projects.stream()
-                        .map(expr -> (NamedExpression) rewriter.rewrite(expr, context))
-                        .collect(ImmutableList.toImmutableList());
+                List<NamedExpression> newProjects = rewriteAll(projects, rewriter, context);
                 if (projects.equals(newProjects)) {
                     return project;
                 }
@@ -135,7 +148,8 @@ public class ExpressionRewrite implements RewriteRuleFactory {
         }
     }
 
-    private class FilterExpressionRewrite extends OneRewriteRuleFactory {
+    /** FilterExpressionRewrite */
+    public class FilterExpressionRewrite extends OneRewriteRuleFactory {
         @Override
         public Rule build() {
             return logicalFilter().thenApply(ctx -> {
@@ -151,7 +165,31 @@ public class ExpressionRewrite implements RewriteRuleFactory {
         }
     }
 
-    private class AggExpressionRewrite extends OneRewriteRuleFactory {
+    /** OlapTableSinkExpressionRewrite */
+    public class OlapTableSinkExpressionRewrite extends OneRewriteRuleFactory {
+        @Override
+        public Rule build() {
+            return logicalOlapTableSink().thenApply(ctx -> {
+                LogicalOlapTableSink<Plan> olapTableSink = ctx.root;
+                ExpressionRewriteContext context = new ExpressionRewriteContext(ctx.cascadesContext);
+                List<Expression> partitionExprList = olapTableSink.getPartitionExprList();
+                List<Expression> newPartitionExprList = rewriteAll(partitionExprList, rewriter, context);
+                Map<Long, Expression> syncMvWhereClauses = olapTableSink.getSyncMvWhereClauses();
+                Map<Long, Expression> newSyncMvWhereClauses = new HashMap<>();
+                for (Map.Entry<Long, Expression> entry : syncMvWhereClauses.entrySet()) {
+                    newSyncMvWhereClauses.put(entry.getKey(), rewriter.rewrite(entry.getValue(), context));
+                }
+                if (partitionExprList.equals(newPartitionExprList)
+                        && syncMvWhereClauses.equals(newSyncMvWhereClauses)) {
+                    return olapTableSink;
+                }
+                return olapTableSink.withPartitionExprAndMvWhereClause(newPartitionExprList, newSyncMvWhereClauses);
+            }).toRule(RuleType.REWRITE_OLAP_TABLE_SINK_EXPRESSION);
+        }
+    }
+
+    /** AggExpressionRewrite */
+    public class AggExpressionRewrite extends OneRewriteRuleFactory {
         @Override
         public Rule build() {
             return logicalAggregate().thenApply(ctx -> {
@@ -161,9 +199,7 @@ public class ExpressionRewrite implements RewriteRuleFactory {
                 List<Expression> newGroupByExprs = rewriter.rewrite(groupByExprs, context);
 
                 List<NamedExpression> outputExpressions = agg.getOutputExpressions();
-                List<NamedExpression> newOutputExpressions = outputExpressions.stream()
-                        .map(expr -> (NamedExpression) rewriter.rewrite(expr, context))
-                        .collect(ImmutableList.toImmutableList());
+                List<NamedExpression> newOutputExpressions = rewriteAll(outputExpressions, rewriter, context);
                 if (outputExpressions.equals(newOutputExpressions)) {
                     return agg;
                 }
@@ -173,77 +209,95 @@ public class ExpressionRewrite implements RewriteRuleFactory {
         }
     }
 
-    private class JoinExpressionRewrite extends OneRewriteRuleFactory {
+    /** JoinExpressionRewrite */
+    public class JoinExpressionRewrite extends OneRewriteRuleFactory {
         @Override
         public Rule build() {
             return logicalJoin().thenApply(ctx -> {
                 LogicalJoin<Plan, Plan> join = ctx.root;
                 List<Expression> hashJoinConjuncts = join.getHashJoinConjuncts();
                 List<Expression> otherJoinConjuncts = join.getOtherJoinConjuncts();
-                if (otherJoinConjuncts.isEmpty() && hashJoinConjuncts.isEmpty()) {
+                List<Expression> markJoinConjuncts = join.getMarkJoinConjuncts();
+                if (otherJoinConjuncts.isEmpty() && hashJoinConjuncts.isEmpty()
+                        && markJoinConjuncts.isEmpty()) {
                     return join;
                 }
+
                 ExpressionRewriteContext context = new ExpressionRewriteContext(ctx.cascadesContext);
-                List<Expression> rewriteHashJoinConjuncts = Lists.newArrayList();
-                boolean hashJoinConjunctsChanged = false;
-                for (Expression expr : hashJoinConjuncts) {
-                    Expression newExpr = rewriter.rewrite(expr, context);
-                    hashJoinConjunctsChanged = hashJoinConjunctsChanged || !newExpr.equals(expr);
-                    rewriteHashJoinConjuncts.add(newExpr);
-                }
+                Pair<Boolean, List<Expression>> newHashJoinConjuncts = rewriteConjuncts(hashJoinConjuncts, context);
+                Pair<Boolean, List<Expression>> newOtherJoinConjuncts = rewriteConjuncts(otherJoinConjuncts, context);
+                Pair<Boolean, List<Expression>> newMarkJoinConjuncts = rewriteConjuncts(markJoinConjuncts, context);
 
-                List<Expression> rewriteOtherJoinConjuncts = Lists.newArrayList();
-                boolean otherJoinConjunctsChanged = false;
-                for (Expression expr : otherJoinConjuncts) {
-                    Expression newExpr = rewriter.rewrite(expr, context);
-                    otherJoinConjunctsChanged = otherJoinConjunctsChanged || !newExpr.equals(expr);
-                    rewriteOtherJoinConjuncts.add(newExpr);
-                }
-
-                if (!hashJoinConjunctsChanged && !otherJoinConjunctsChanged) {
+                if (!newHashJoinConjuncts.first && !newOtherJoinConjuncts.first
+                        && !newMarkJoinConjuncts.first) {
                     return join;
                 }
-                return new LogicalJoin<>(join.getJoinType(), rewriteHashJoinConjuncts,
-                        rewriteOtherJoinConjuncts, join.getHint(), join.getMarkJoinSlotReference(),
-                        join.left(), join.right());
+
+                return new LogicalJoin<>(join.getJoinType(), newHashJoinConjuncts.second,
+                        newOtherJoinConjuncts.second, newMarkJoinConjuncts.second,
+                        join.getDistributeHint(), join.getMarkJoinSlotReference(), join.children(),
+                        join.getJoinReorderContext());
             }).toRule(RuleType.REWRITE_JOIN_EXPRESSION);
+        }
+
+        private Pair<Boolean, List<Expression>> rewriteConjuncts(List<Expression> conjuncts,
+                ExpressionRewriteContext context) {
+            boolean isChanged = false;
+            ImmutableList.Builder<Expression> rewrittenConjuncts = new ImmutableList.Builder<>();
+            for (Expression expr : conjuncts) {
+                Expression newExpr = rewriter.rewrite(expr, context);
+                newExpr = newExpr.isNullLiteral() && expr instanceof EqualPredicate
+                                ? expr.withChildren(rewriter.rewrite(expr.child(0), context),
+                                        rewriter.rewrite(expr.child(1), context))
+                                : newExpr;
+                isChanged = isChanged || !newExpr.equals(expr);
+                rewrittenConjuncts.addAll(ExpressionUtils.extractConjunction(newExpr));
+            }
+            return Pair.of(isChanged, rewrittenConjuncts.build());
         }
     }
 
-    private class SortExpressionRewrite extends OneRewriteRuleFactory {
+    /** SortExpressionRewrite */
+    public class SortExpressionRewrite extends OneRewriteRuleFactory {
 
         @Override
         public Rule build() {
             return logicalSort().thenApply(ctx -> {
                 LogicalSort<Plan> sort = ctx.root;
                 List<OrderKey> orderKeys = sort.getOrderKeys();
-                List<OrderKey> rewrittenOrderKeys = new ArrayList<>();
+                ImmutableList.Builder<OrderKey> rewrittenOrderKeys
+                        = ImmutableList.builderWithExpectedSize(orderKeys.size());
                 ExpressionRewriteContext context = new ExpressionRewriteContext(ctx.cascadesContext);
+                boolean changed = false;
                 for (OrderKey k : orderKeys) {
                     Expression expression = rewriter.rewrite(k.getExpr(), context);
+                    changed |= expression != k.getExpr();
                     rewrittenOrderKeys.add(new OrderKey(expression, k.isAsc(), k.isNullFirst()));
                 }
-                return sort.withOrderKeys(rewrittenOrderKeys);
+                return changed ? sort.withOrderKeys(rewrittenOrderKeys.build()) : sort;
             }).toRule(RuleType.REWRITE_SORT_EXPRESSION);
         }
     }
 
-    private class HavingExpressionRewrite extends OneRewriteRuleFactory {
+    /** HavingExpressionRewrite */
+    public class HavingExpressionRewrite extends OneRewriteRuleFactory {
         @Override
         public Rule build() {
             return logicalHaving().thenApply(ctx -> {
                 LogicalHaving<Plan> having = ctx.root;
-                Set<Expression> rewrittenExpr = new HashSet<>();
                 ExpressionRewriteContext context = new ExpressionRewriteContext(ctx.cascadesContext);
-                for (Expression e : having.getExpressions()) {
-                    rewrittenExpr.add(rewriter.rewrite(e, context));
+                Set<Expression> newConjuncts = ImmutableSet.copyOf(ExpressionUtils.extractConjunction(
+                        rewriter.rewrite(having.getPredicate(), context)));
+                if (newConjuncts.equals(having.getConjuncts())) {
+                    return having;
                 }
-                return having.withExpressions(rewrittenExpr);
+                return having.withExpressions(newConjuncts);
             }).toRule(RuleType.REWRITE_HAVING_EXPRESSION);
         }
     }
 
-    private class LogicalRepeatRewrite extends OneRewriteRuleFactory {
+    /** LogicalRepeatRewrite */
+    public class LogicalRepeatRewrite extends OneRewriteRuleFactory {
         @Override
         public Rule build() {
             return logicalRepeat().thenApply(ctx -> {
@@ -263,5 +317,37 @@ public class ExpressionRewrite implements RewriteRuleFactory {
                                 .collect(ImmutableList.toImmutableList()));
             }).toRule(RuleType.REWRITE_REPEAT_EXPRESSION);
         }
+    }
+
+    /** bottomUp */
+    public static ExpressionBottomUpRewriter bottomUp(ExpressionPatternRuleFactory... ruleFactories) {
+        ImmutableList.Builder<ExpressionPatternMatchRule> rules = ImmutableList.builder();
+        ImmutableList.Builder<ExpressionTraverseListenerMapping> listeners = ImmutableList.builder();
+        for (ExpressionPatternRuleFactory ruleFactory : ruleFactories) {
+            if (ruleFactory instanceof ExpressionTraverseListenerFactory) {
+                List<ExpressionListenerMatcher<? extends Expression>> listenersMatcher
+                        = ((ExpressionTraverseListenerFactory) ruleFactory).buildListeners();
+                for (ExpressionListenerMatcher<? extends Expression> listenerMatcher : listenersMatcher) {
+                    listeners.add(new ExpressionTraverseListenerMapping(listenerMatcher));
+                }
+            }
+            for (ExpressionPatternMatcher<? extends Expression> patternMatcher : ruleFactory.buildRules()) {
+                rules.add(new ExpressionPatternMatchRule(patternMatcher));
+            }
+        }
+
+        return new ExpressionBottomUpRewriter(
+                new ExpressionPatternRules(rules.build()),
+                new ExpressionPatternTraverseListeners(listeners.build())
+        );
+    }
+
+    public static <E extends Expression> List<E> rewriteAll(
+            Collection<E> exprs, ExpressionRuleExecutor rewriter, ExpressionRewriteContext context) {
+        ImmutableList.Builder<E> result = ImmutableList.builderWithExpectedSize(exprs.size());
+        for (E expr : exprs) {
+            result.add((E) rewriter.rewrite(expr, context));
+        }
+        return result.build();
     }
 }

@@ -120,7 +120,7 @@ public:
                   << "(" << data_types[0]->get_name() << ")";
 
         AggregateFunctionSimpleFactory factory = AggregateFunctionSimpleFactory::instance();
-        auto agg_function = factory.get("histogram", data_types);
+        auto agg_function = factory.get("histogram", data_types, false, -1);
         EXPECT_NE(agg_function, nullptr);
 
         std::unique_ptr<char[]> memory(new char[agg_function->size_of_data()]);
@@ -218,7 +218,7 @@ TEST_F(VAggHistogramTest, test_empty) {
     test_agg_histogram<DataTypeDate>();
     test_agg_histogram<DataTypeDateTime>();
     test_agg_histogram<DataTypeString>();
-    test_agg_histogram<DataTypeDecimal<Decimal128>>();
+    test_agg_histogram<DataTypeDecimal<Decimal128V2>>();
 }
 
 TEST_F(VAggHistogramTest, test_with_data) {
@@ -238,7 +238,7 @@ TEST_F(VAggHistogramTest, test_with_data) {
     test_agg_histogram<DataTypeDateTime>(100, 5);
     test_agg_histogram<DataTypeDateTimeV2>(100, 5);
 
-    test_agg_histogram<DataTypeDecimal<Decimal128>>(100, 5);
+    test_agg_histogram<DataTypeDecimal<Decimal128V2>>(100, 5);
 }
 
 } // namespace doris::vectorized

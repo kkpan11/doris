@@ -22,11 +22,13 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
+#include <ranges>
 #include <utility>
 #include <vector>
 
-// IWYU pragma: no_include <opentelemetry/common/threadlocal.h>
 #include "common/compiler_util.h" // IWYU pragma: keep
+#include "common/status.h"
 #include "gutil/integral_types.h"
 #include "vec/aggregate_functions/aggregate_function.h"
 #include "vec/columns/column.h"
@@ -54,7 +56,7 @@ using namespace FunctionsLogicalDetail;
 template <class Op>
 void vector_const(const IColumn* left, const ColumnConst* right, IColumn* res, size_t rows) {
     const auto* __restrict l_datas = assert_cast<const ColumnUInt8*>(left)->get_data().data();
-    auto r_data = (uint8)right->get_uint(0);
+    auto r_data = (uint8_t)right->get_bool(0);
     auto* __restrict res_datas = assert_cast<ColumnUInt8*>(res)->get_data().data();
 
     for (size_t i = 0; i < rows; ++i) {
@@ -139,11 +141,11 @@ void basic_execute_impl(ColumnRawPtrs arguments, ColumnWithTypeAndName& result_i
                         size_t input_rows_count) {
     auto col_res = ColumnUInt8::create(input_rows_count);
     if (auto l = check_and_get_column<ColumnConst>(arguments[0])) {
-        vector_const<Op>(arguments[1], l, col_res, input_rows_count);
+        vector_const<Op>(arguments[1], l, col_res.get(), input_rows_count);
     } else if (auto r = check_and_get_column<ColumnConst>(arguments[1])) {
-        vector_const<Op>(arguments[0], r, col_res, input_rows_count);
+        vector_const<Op>(arguments[0], r, col_res.get(), input_rows_count);
     } else {
-        vector_vector<Op>(arguments[0], arguments[1], col_res, input_rows_count);
+        vector_vector<Op>(arguments[0], arguments[1], col_res.get(), input_rows_count);
     }
     result_info.column = std::move(col_res);
 }
@@ -154,11 +156,12 @@ void null_execute_impl(ColumnRawPtrs arguments, ColumnWithTypeAndName& result_in
     auto col_nulls = ColumnUInt8::create(input_rows_count);
     auto col_res = ColumnUInt8::create(input_rows_count);
     if (auto l = check_and_get_column<ColumnConst>(arguments[0])) {
-        vector_const_null<Op>(arguments[1], l, col_res, col_nulls, input_rows_count);
+        vector_const_null<Op>(arguments[1], l, col_res.get(), col_nulls.get(), input_rows_count);
     } else if (auto r = check_and_get_column<ColumnConst>(arguments[1])) {
-        vector_const_null<Op>(arguments[0], r, col_res, col_nulls, input_rows_count);
+        vector_const_null<Op>(arguments[0], r, col_res.get(), col_nulls.get(), input_rows_count);
     } else {
-        vector_vector_null<Op>(arguments[0], arguments[1], col_res, col_nulls, input_rows_count);
+        vector_vector_null<Op>(arguments[0], arguments[1], col_res.get(), col_nulls.get(),
+                               input_rows_count);
     }
     result_info.column = ColumnNullable::create(std::move(col_res), std::move(col_nulls));
 }
@@ -169,7 +172,8 @@ template <typename Impl, typename Name>
 DataTypePtr FunctionAnyArityLogical<Impl, Name>::get_return_type_impl(
         const DataTypes& arguments) const {
     if (arguments.size() < 2) {
-        LOG(FATAL) << fmt::format(
+        throw doris::Exception(
+                ErrorCode::INVALID_ARGUMENT,
                 "Number of arguments for function \"{}\" should be at least 2: passed {}",
                 get_name(), arguments.size());
     }
@@ -188,11 +192,11 @@ DataTypePtr FunctionAnyArityLogical<Impl, Name>::get_return_type_impl(
             }
         }
 
-        if (!(is_native_number(arg_type) ||
-              (Impl::special_implementation_for_nulls() &&
-               (arg_type->only_null() || is_native_number(remove_nullable(arg_type)))))) {
-            LOG(FATAL) << fmt::format("Illegal type ({}) of {} argument of function {}",
-                                      arg_type->get_name(), i + 1, get_name());
+        if (!(is_native_number(arg_type) || (Impl::special_implementation_for_nulls() &&
+                                             is_native_number(remove_nullable(arg_type))))) {
+            throw doris::Exception(ErrorCode::INVALID_ARGUMENT,
+                                   "Illegal type ({}) of {} argument of function {}",
+                                   arg_type->get_name(), i + 1, get_name());
         }
     }
 
@@ -203,16 +207,21 @@ DataTypePtr FunctionAnyArityLogical<Impl, Name>::get_return_type_impl(
 template <typename Impl, typename Name>
 Status FunctionAnyArityLogical<Impl, Name>::execute_impl(FunctionContext* context, Block& block,
                                                          const ColumnNumbers& arguments,
-                                                         size_t result_index,
-                                                         size_t input_rows_count) {
+                                                         uint32_t result_index,
+                                                         size_t input_rows_count) const {
     ColumnRawPtrs args_in;
     for (const auto arg_index : arguments)
         args_in.push_back(block.get_by_position(arg_index).column.get());
 
     auto& result_info = block.get_by_position(result_index);
-    if (result_info.type->is_nullable()) {
-        null_execute_impl<Impl>(std::move(args_in), result_info, input_rows_count);
+    if constexpr (Impl::special_implementation_for_nulls()) {
+        if (result_info.type->is_nullable()) {
+            null_execute_impl<Impl>(std::move(args_in), result_info, input_rows_count);
+        } else {
+            basic_execute_impl<Impl>(std::move(args_in), result_info, input_rows_count);
+        }
     } else {
+        DCHECK(std::ranges::all_of(args_in, [](const auto& arg) { return !arg->is_nullable(); }));
         basic_execute_impl<Impl>(std::move(args_in), result_info, input_rows_count);
     }
     return Status::OK();
@@ -233,8 +242,9 @@ template <template <typename> class Impl, typename Name>
 DataTypePtr FunctionUnaryLogical<Impl, Name>::get_return_type_impl(
         const DataTypes& arguments) const {
     if (!is_native_number(arguments[0])) {
-        LOG(FATAL) << fmt::format("Illegal type ({}) of argument of function {}",
-                                  arguments[0]->get_name(), get_name());
+        throw doris::Exception(ErrorCode::INVALID_ARGUMENT,
+                               "Illegal type ({}) of argument of function {}",
+                               arguments[0]->get_name(), get_name());
     }
 
     return std::make_shared<DataTypeUInt8>();
@@ -259,12 +269,13 @@ bool functionUnaryExecuteType(Block& block, const ColumnNumbers& arguments, size
 
 template <template <typename> class Impl, typename Name>
 Status FunctionUnaryLogical<Impl, Name>::execute_impl(FunctionContext* context, Block& block,
-                                                      const ColumnNumbers& arguments, size_t result,
-                                                      size_t /*input_rows_count*/) {
+                                                      const ColumnNumbers& arguments,
+                                                      uint32_t result,
+                                                      size_t /*input_rows_count*/) const {
     if (!functionUnaryExecuteType<Impl, UInt8>(block, arguments, result)) {
-        LOG(FATAL) << fmt::format("Illegal column {} of argument of function {}",
-                                  block.get_by_position(arguments[0]).column->get_name(),
-                                  get_name());
+        throw doris::Exception(ErrorCode::INVALID_ARGUMENT,
+                               "Illegal column {} of argument of function {}",
+                               block.get_by_position(arguments[0]).column->get_name(), get_name());
     }
 
     return Status::OK();
@@ -274,6 +285,7 @@ void register_function_logical(SimpleFunctionFactory& instance) {
     instance.register_function<FunctionAnd>();
     instance.register_function<FunctionOr>();
     instance.register_function<FunctionNot>();
+    instance.register_function<FunctionXor>();
 }
 
 } // namespace doris::vectorized

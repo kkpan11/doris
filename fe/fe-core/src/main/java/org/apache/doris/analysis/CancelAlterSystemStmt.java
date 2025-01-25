@@ -17,49 +17,82 @@
 
 package org.apache.doris.analysis;
 
+import org.apache.doris.catalog.Env;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.ErrorCode;
+import org.apache.doris.common.ErrorReport;
+import org.apache.doris.mysql.privilege.PrivPredicate;
+import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.system.SystemInfoService;
 import org.apache.doris.system.SystemInfoService.HostInfo;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import lombok.Getter;
 
 import java.util.List;
 
-public class CancelAlterSystemStmt extends CancelStmt {
+public class CancelAlterSystemStmt extends CancelStmt implements NotFallbackInParser {
 
-    protected List<String> hostPorts;
-    private List<HostInfo> hostInfos;
+    protected List<String> params;
+    @Getter
+    private final List<HostInfo> hostInfos;
 
-    public CancelAlterSystemStmt(List<String> hostPorts) {
-        this.hostPorts = hostPorts;
+    @Getter
+    private final List<String> ids;
+
+    public CancelAlterSystemStmt(List<String> params) {
+        this.params = params;
         this.hostInfos = Lists.newArrayList();
-    }
-
-    public List<HostInfo> getHostInfos() {
-        return hostInfos;
+        this.ids = Lists.newArrayList();
     }
 
     @Override
     public void analyze(Analyzer analyzer) throws AnalysisException {
-        for (String hostPort : hostPorts) {
-            HostInfo hostInfo = SystemInfoService.getHostAndPort(hostPort);
-            this.hostInfos.add(hostInfo);
+        if (!Env.getCurrentEnv().getAccessManager().checkGlobalPriv(ConnectContext.get(), PrivPredicate.OPERATOR)) {
+            ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR,
+                    PrivPredicate.OPERATOR.getPrivs().toString());
         }
-        Preconditions.checkState(!this.hostInfos.isEmpty());
+        for (String param : params) {
+            if (!param.contains(":")) {
+                ids.add(param);
+            } else {
+                HostInfo hostInfo = SystemInfoService.getHostAndPort(param);
+                this.hostInfos.add(hostInfo);
+            }
+
+        }
+        Preconditions.checkState(!this.hostInfos.isEmpty() || !this.ids.isEmpty(),
+                "hostInfos or ids can not be empty");
+
     }
 
     @Override
     public String toSql() {
         StringBuilder sb = new StringBuilder();
         sb.append("CANCEL DECOMMISSION BACKEND ");
-        for (int i = 0; i < hostPorts.size(); i++) {
-            sb.append("\"").append(hostPorts.get(i)).append("\"");
-            if (i != hostPorts.size() - 1) {
-                sb.append(", ");
+        if (!ids.isEmpty()) {
+            for (int i = 0; i < hostInfos.size(); i++) {
+                sb.append("\"").append(hostInfos.get(i)).append("\"");
+                if (i != hostInfos.size() - 1) {
+                    sb.append(", ");
+                }
+            }
+        } else {
+            for (int i = 0; i < params.size(); i++) {
+                sb.append("\"").append(params.get(i)).append("\"");
+                if (i != params.size() - 1) {
+                    sb.append(", ");
+                }
             }
         }
 
+
         return sb.toString();
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.CANCEL;
     }
 }

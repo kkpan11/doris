@@ -17,34 +17,83 @@
 
 package org.apache.doris.common.util;
 
-import org.apache.doris.common.FeConstants;
+import org.apache.doris.common.credentials.CloudCredential;
 
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.AwsCredentials;
+import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.AwsCredentialsProviderChain;
+import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
+import software.amazon.awssdk.auth.credentials.EnvironmentVariableCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.InstanceProfileCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.ProfileCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.SystemPropertyCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.WebIdentityTokenFileCredentialsProvider;
+import software.amazon.awssdk.auth.signer.AwsS3V4Signer;
+import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
+import software.amazon.awssdk.core.client.config.SdkAdvancedClientOption;
+import software.amazon.awssdk.core.retry.RetryPolicy;
+import software.amazon.awssdk.core.retry.backoff.EqualJitterBackoffStrategy;
+import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.S3Configuration;
+
+import java.net.URI;
+import java.time.Duration;
 
 public class S3Util {
-    private static final Logger LOG = LogManager.getLogger(S3Util.class);
 
-    public static boolean isObjStorage(String location) {
-        return location.startsWith(FeConstants.FS_PREFIX_S3)
-            || location.startsWith(FeConstants.FS_PREFIX_S3A)
-            || location.startsWith(FeConstants.FS_PREFIX_S3N)
-            || location.startsWith(FeConstants.FS_PREFIX_GCS)
-            || location.startsWith(FeConstants.FS_PREFIX_BOS)
-            || location.startsWith(FeConstants.FS_PREFIX_COS)
-            || location.startsWith(FeConstants.FS_PREFIX_OSS)
-            || location.startsWith(FeConstants.FS_PREFIX_OBS);
-    }
-
-    public static  String convertToS3IfNecessary(String location) {
-        LOG.debug("try convert location to s3 prefix: " + location);
-        if (isObjStorage(location)) {
-            int pos = location.indexOf("://");
-            if (pos == -1) {
-                throw new RuntimeException("No '://' found in location: " + location);
-            }
-            return "s3" + location.substring(pos);
+    public static S3Client buildS3Client(URI endpoint, String region, CloudCredential credential,
+            boolean isUsePathStyle) {
+        AwsCredentialsProvider scp;
+        AwsCredentials awsCredential;
+        if (!credential.isTemporary()) {
+            awsCredential = AwsBasicCredentials.create(credential.getAccessKey(), credential.getSecretKey());
+        } else {
+            awsCredential = AwsSessionCredentials.create(credential.getAccessKey(), credential.getSecretKey(),
+                        credential.getSessionToken());
         }
-        return location;
+        if (!credential.isWhole()) {
+            scp = AwsCredentialsProviderChain.of(
+                    SystemPropertyCredentialsProvider.create(),
+                    EnvironmentVariableCredentialsProvider.create(),
+                    WebIdentityTokenFileCredentialsProvider.create(),
+                    ProfileCredentialsProvider.create(),
+                    InstanceProfileCredentialsProvider.create());
+        } else {
+            scp = StaticCredentialsProvider.create(awsCredential);
+        }
+        EqualJitterBackoffStrategy backoffStrategy = EqualJitterBackoffStrategy
+                .builder()
+                .baseDelay(Duration.ofSeconds(1))
+                .maxBackoffTime(Duration.ofMinutes(1))
+                .build();
+        // retry 3 time with Equal backoff
+        RetryPolicy retryPolicy = RetryPolicy
+                .builder()
+                .numRetries(3)
+                .backoffStrategy(backoffStrategy)
+                .build();
+        ClientOverrideConfiguration clientConf = ClientOverrideConfiguration
+                .builder()
+                // set retry policy
+                .retryPolicy(retryPolicy)
+                // using AwsS3V4Signer
+                .putAdvancedOption(SdkAdvancedClientOption.SIGNER, AwsS3V4Signer.create())
+                .build();
+        return S3Client.builder()
+                .httpClient(UrlConnectionHttpClient.create())
+                .endpointOverride(endpoint)
+                .credentialsProvider(scp)
+                .region(Region.of(region))
+                .overrideConfiguration(clientConf)
+                // disable chunkedEncoding because of bos not supported
+                .serviceConfiguration(S3Configuration.builder()
+                        .chunkedEncodingEnabled(false)
+                        .pathStyleAccessEnabled(isUsePathStyle)
+                        .build())
+                .build();
     }
 }

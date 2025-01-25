@@ -22,14 +22,18 @@ package org.apache.doris.rewrite;
 
 
 import org.apache.doris.analysis.Analyzer;
+import org.apache.doris.analysis.ArithmeticExpr;
 import org.apache.doris.analysis.BetweenPredicate;
 import org.apache.doris.analysis.CaseExpr;
 import org.apache.doris.analysis.CastExpr;
 import org.apache.doris.analysis.Expr;
+import org.apache.doris.analysis.FunctionCallExpr;
 import org.apache.doris.analysis.InformationFunction;
 import org.apache.doris.analysis.LiteralExpr;
 import org.apache.doris.analysis.NullLiteral;
-import org.apache.doris.analysis.SysVariableDesc;
+import org.apache.doris.analysis.SlotRef;
+import org.apache.doris.analysis.TimestampArithmeticExpr;
+import org.apache.doris.analysis.VariableExpr;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.PrimitiveType;
 import org.apache.doris.catalog.ScalarType;
@@ -38,7 +42,6 @@ import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.LoadException;
 import org.apache.doris.common.util.DebugUtil;
 import org.apache.doris.common.util.TimeUtils;
-import org.apache.doris.common.util.VectorizedUtil;
 import org.apache.doris.proto.InternalService;
 import org.apache.doris.proto.Types.PScalarType;
 import org.apache.doris.qe.ConnectContext;
@@ -96,7 +99,9 @@ public class FoldConstantsRule implements ExprRewriteRule {
         // of the Expr tree. Assumes the bottom-up application of this rule. Constant
         // children should have been folded at this point.
         for (Expr child : expr.getChildren()) {
-            if (!child.isLiteral() && !(child instanceof CastExpr)) {
+            if (!child.isLiteral() && !(child instanceof CastExpr) && !((child instanceof FunctionCallExpr
+                    || child instanceof ArithmeticExpr || child instanceof TimestampArithmeticExpr
+                    || child instanceof VariableExpr))) {
                 return expr;
             }
         }
@@ -109,6 +114,9 @@ public class FoldConstantsRule implements ExprRewriteRule {
         // cast-to-types and that can lead to query failures, e.g., CTAS
         if (expr instanceof CastExpr) {
             CastExpr castExpr = (CastExpr) expr;
+            if (castExpr.isNotFold()) {
+                return castExpr;
+            }
             if (castExpr.getChild(0) instanceof NullLiteral) {
                 return castExpr.getChild(0);
             }
@@ -122,7 +130,10 @@ public class FoldConstantsRule implements ExprRewriteRule {
                 return expr;
             }
         }
-        return expr.getResultValue(false);
+        // it may be wrong to fold constant value in inline view
+        // so pass the info to getResultValue method to let predicate itself
+        // to decide if it can fold constant value safely
+        return expr.getResultValue(expr instanceof SlotRef ? false : analyzer.isInlineViewAnalyzer());
     }
 
     /**
@@ -216,7 +227,7 @@ public class FoldConstantsRule implements ExprRewriteRule {
                 return;
             }
             // collect sysVariableDesc expr
-            if (expr.contains(Predicates.instanceOf(SysVariableDesc.class))) {
+            if (expr.contains(Predicates.instanceOf(VariableExpr.class))) {
                 getSysVarDescExpr(expr, sysVarMap);
                 return;
             }
@@ -244,14 +255,17 @@ public class FoldConstantsRule implements ExprRewriteRule {
     }
 
     private void getSysVarDescExpr(Expr expr, Map<String, Expr> sysVarMap) {
-        if (expr instanceof SysVariableDesc) {
-            Expr literalExpr = ((SysVariableDesc) expr).getLiteralExpr();
+        if (expr instanceof VariableExpr) {
+            Expr literalExpr = ((VariableExpr) expr).getLiteralExpr();
             if (literalExpr == null) {
                 try {
-                    VariableMgr.fillValue(ConnectContext.get().getSessionVariable(), (SysVariableDesc) expr);
-                    literalExpr = ((SysVariableDesc) expr).getLiteralExpr();
+                    VariableMgr.fillValue(ConnectContext.get().getSessionVariable(), (VariableExpr) expr);
+                    literalExpr = ((VariableExpr) expr).getLiteralExpr();
                 } catch (AnalysisException e) {
-                    LOG.warn("failed to get session variable value: " + ((SysVariableDesc) expr).getName());
+                    if (ConnectContext.get() != null) {
+                        ConnectContext.get().getState().reset();
+                    }
+                    LOG.warn("failed to get session variable value: " + ((VariableExpr) expr).getName());
                 }
             }
             sysVarMap.put(expr.getId().toString(), literalExpr);
@@ -277,6 +291,9 @@ public class FoldConstantsRule implements ExprRewriteRule {
                 literalExpr = LiteralExpr.create(str, type);
                 infoFnMap.put(expr.getId().toString(), literalExpr);
             } catch (AnalysisException e) {
+                if (ConnectContext.get() != null) {
+                    ConnectContext.get().getState().reset();
+                }
                 LOG.warn("failed to get const expr value from InformationFunction: {}", e.getMessage());
             }
 
@@ -344,7 +361,7 @@ public class FoldConstantsRule implements ExprRewriteRule {
         TNetworkAddress brpcAddress = null;
         Map<String, Map<String, Expr>> resultMap = new HashMap<>();
         try {
-            List<Long> backendIds = Env.getCurrentSystemInfo().getAllBackendIds(true);
+            List<Long> backendIds = Env.getCurrentSystemInfo().getAllBackendByCurrentCluster(true);
             if (backendIds.isEmpty()) {
                 throw new LoadException("Failed to get all partitions. No alive backends");
             }
@@ -353,7 +370,7 @@ public class FoldConstantsRule implements ExprRewriteRule {
             brpcAddress = new TNetworkAddress(be.getHost(), be.getBrpcPort());
 
             TQueryGlobals queryGlobals = new TQueryGlobals();
-            queryGlobals.setNowString(TimeUtils.DATETIME_FORMAT.format(LocalDateTime.now()));
+            queryGlobals.setNowString(TimeUtils.getDatetimeFormatWithTimeZone().format(LocalDateTime.now()));
             queryGlobals.setTimestampMs(System.currentTimeMillis());
             queryGlobals.setNanoSeconds(LocalDateTime.now().getNano());
             queryGlobals.setTimeZone(TimeUtils.DEFAULT_TIME_ZONE);
@@ -364,9 +381,10 @@ public class FoldConstantsRule implements ExprRewriteRule {
             }
 
             TFoldConstantParams tParams = new TFoldConstantParams(map, queryGlobals);
-            tParams.setVecExec(VectorizedUtil.isVectorized());
+            tParams.setVecExec(true);
             tParams.setQueryOptions(tQueryOptions);
             tParams.setQueryId(context.queryId());
+            tParams.setIsNereids(false);
 
             Future<InternalService.PConstantExprResult> future
                     = BackendServiceProxy.getInstance().foldConstantExpr(brpcAddress, tParams);
@@ -396,7 +414,8 @@ public class FoldConstantsRule implements ExprRewriteRule {
                                 type = ScalarType.createDatetimeV2Type(scalarType.getScale());
                             } else if (ttype == TPrimitiveType.DECIMAL32
                                     || ttype == TPrimitiveType.DECIMAL64
-                                    || ttype == TPrimitiveType.DECIMAL128I) {
+                                    || ttype == TPrimitiveType.DECIMAL128I
+                                    || ttype == TPrimitiveType.DECIMAL256) {
                                 type = ScalarType.createDecimalV3Type(scalarType.getPrecision(),
                                         scalarType.getScale());
                             } else {
@@ -408,7 +427,9 @@ public class FoldConstantsRule implements ExprRewriteRule {
                         } else {
                             retExpr = allConstMap.get(entry1.getKey());
                         }
-                        LOG.debug("retExpr: " + retExpr.toString());
+                        if (LOG.isDebugEnabled()) {
+                            LOG.debug("retExpr: " + retExpr.toString());
+                        }
                         tmp.put(entry1.getKey(), retExpr);
                     }
                     if (!tmp.isEmpty()) {

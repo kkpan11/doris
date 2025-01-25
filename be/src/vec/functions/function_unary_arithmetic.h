@@ -47,9 +47,6 @@ struct UnaryOperationImpl {
     static void constant(A a, ResultType& c) { c = Op::apply(a); }
 };
 
-template <typename FunctionName>
-struct FunctionUnaryArithmeticMonotonicity;
-
 template <typename>
 struct AbsImpl;
 template <typename>
@@ -60,7 +57,7 @@ struct PositiveImpl;
 /// Used to indicate undefined operation
 struct InvalidType;
 
-template <template <typename> class Op, typename Name, bool is_injective>
+template <template <typename> class Op, typename Name>
 class FunctionUnaryArithmetic : public IFunction {
     static constexpr bool allow_decimal = std::is_same_v<Op<Int8>, NegativeImpl<Int8>> ||
                                           std::is_same_v<Op<Int8>, AbsImpl<Int8>> ||
@@ -72,8 +69,8 @@ class FunctionUnaryArithmetic : public IFunction {
                                    DataTypeInt8, DataTypeInt16, DataTypeInt32, DataTypeInt64,
                                    DataTypeInt128, DataTypeFloat32, DataTypeFloat64,
                                    DataTypeDecimal<Decimal32>, DataTypeDecimal<Decimal64>,
-                                   DataTypeDecimal<Decimal128>, DataTypeDecimal<Decimal128I>>(
-                type, std::forward<F>(f));
+                                   DataTypeDecimal<Decimal128V2>, DataTypeDecimal<Decimal128V3>,
+                                   DataTypeDecimal<Decimal256>>(type, std::forward<F>(f));
     }
 
 public:
@@ -83,7 +80,6 @@ public:
     String get_name() const override { return name; }
 
     size_t get_number_of_arguments() const override { return 1; }
-    bool get_is_injective(const Block&) override { return is_injective; }
 
     DataTypePtr get_return_type_impl(const DataTypes& arguments) const override {
         DataTypePtr result;
@@ -100,14 +96,15 @@ public:
             return true;
         });
         if (!valid) {
-            LOG(FATAL) << fmt::format("Illegal type {} of argument of function {}",
-                                      arguments[0]->get_name(), get_name());
+            throw doris::Exception(ErrorCode::INVALID_ARGUMENT,
+                                   "Illegal type {} of argument of function {}",
+                                   arguments[0]->get_name(), get_name());
         }
         return result;
     }
 
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t input_rows_count) override {
+                        uint32_t result, size_t input_rows_count) const override {
         bool valid =
                 cast_type(block.get_by_position(arguments[0]).type.get(), [&](const auto& type) {
                     using DataType = std::decay_t<decltype(type)>;
@@ -146,13 +143,6 @@ public:
         }
         return Status::OK();
     }
-
-    bool has_information_about_monotonicity() const override { return false; }
-};
-
-struct PositiveMonotonicity {
-    static bool has() { return true; }
-    static IFunction::Monotonicity get(const Field&, const Field&) { return {true}; }
 };
 
 } // namespace doris::vectorized

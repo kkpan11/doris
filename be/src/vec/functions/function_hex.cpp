@@ -25,6 +25,7 @@
 #include <string_view>
 #include <utility>
 
+#include "common/cast_set.h"
 #include "common/status.h"
 #include "olap/hll.h"
 #include "util/simd/vstring_function.h" //place this header file at last to compile
@@ -46,6 +47,7 @@
 #include "vec/functions/simple_function_factory.h"
 
 namespace doris {
+#include "common/compile_check_begin.h"
 class FunctionContext;
 } // namespace doris
 
@@ -70,14 +72,15 @@ public:
     }
 
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t input_rows_count) override {
+                        uint32_t result, size_t input_rows_count) const override {
         ColumnPtr& argument_column = block.get_by_position(arguments[0]).column;
 
         auto result_data_column = ColumnString::create();
         auto& result_data = result_data_column->get_chars();
         auto& result_offset = result_data_column->get_offsets();
 
-        Impl::vector(argument_column, input_rows_count, result_data, result_offset);
+        RETURN_IF_ERROR(
+                Impl::vector(argument_column, input_rows_count, result_data, result_offset));
         block.replace_by_position(result, std::move(result_data_column));
         return Status::OK();
     }
@@ -110,7 +113,7 @@ struct HexStringImpl {
             auto source = reinterpret_cast<const unsigned char*>(&data[offsets[i - 1]]);
             size_t srclen = offsets[i] - offsets[i - 1];
             hex_encode(source, srclen, dst_data_ptr, offset);
-            dst_offsets[i] = offset;
+            dst_offsets[i] = cast_set<uint32_t>(offset);
         }
         return Status::OK();
     }
@@ -183,7 +186,7 @@ struct HexHLLImpl {
             dst_data_ptr = res_data.data() + offset;
             hex_encode(reinterpret_cast<const unsigned char*>(hll_str.data()), hll_str.length(),
                        dst_data_ptr, offset);
-            res_offsets[i] = offset;
+            res_offsets[i] = cast_set<uint32_t>(offset);
             hll_str.clear();
         }
         return Status::OK();

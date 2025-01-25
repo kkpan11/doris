@@ -21,7 +21,6 @@ import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.ScalarType;
-import org.apache.doris.cluster.ClusterNamespace;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
@@ -38,7 +37,7 @@ import com.google.common.base.Strings;
 import java.util.ArrayList;
 import java.util.List;
 
-public class ShowTabletStmt extends ShowStmt {
+public class ShowTabletStmt extends ShowStmt implements NotFallbackInParser {
     private TableName dbTableName;
     private String dbName;
     private String tableName;
@@ -165,8 +164,6 @@ public class ShowTabletStmt extends ShowStmt {
             if (Strings.isNullOrEmpty(dbName)) {
                 ErrorReport.reportAnalysisException(ErrorCode.ERR_NO_DB_ERROR);
             }
-        } else {
-            dbName = ClusterNamespace.getFullName(getClusterName(), dbName);
         }
 
         if (partitionNames != null) {

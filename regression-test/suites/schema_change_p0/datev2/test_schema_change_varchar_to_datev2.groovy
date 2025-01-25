@@ -16,6 +16,8 @@
 // under the License.
 
 import org.codehaus.groovy.runtime.IOGroovyMethods
+import java.util.concurrent.TimeUnit
+import org.awaitility.Awaitility
 
 suite("test_schema_change_varchar_to_datev2") {
     def tbName = "test_schema_change_varchar_to_datev2"
@@ -30,74 +32,12 @@ suite("test_schema_change_varchar_to_datev2") {
     getBackendIpHttpPort(backendId_to_backendIP, backendId_to_backendHttpPort);
 
     backend_id = backendId_to_backendIP.keySet()[0]
-    StringBuilder showConfigCommand = new StringBuilder();
-    showConfigCommand.append("curl -X GET http://")
-    showConfigCommand.append(backendId_to_backendIP.get(backend_id))
-    showConfigCommand.append(":")
-    showConfigCommand.append(backendId_to_backendHttpPort.get(backend_id))
-    showConfigCommand.append("/api/show_config")
-    logger.info(showConfigCommand.toString())
-    def process = showConfigCommand.toString().execute()
-    int code = process.waitFor()
-    String err = IOGroovyMethods.getText(new BufferedReader(new InputStreamReader(process.getErrorStream())));
-    String out = process.getText()
+    def (code, out, err) = show_be_config(backendId_to_backendIP.get(backend_id), backendId_to_backendHttpPort.get(backend_id))
     logger.info("Show config: code=" + code + ", out=" + out + ", err=" + err)
     assertEquals(code, 0)
     def configList = parseJson(out.trim())
     assert configList instanceof List
 
-    def do_compact = { tableName ->
-        String[][] tablets = sql """ show tablets from ${tableName}; """
-        for (String[] tablet in tablets) {
-            String tablet_id = tablet[0]
-            backend_id = tablet[2]
-            logger.info("run compaction:" + tablet_id)
-            StringBuilder sb = new StringBuilder();
-            sb.append("curl -X POST http://")
-            sb.append(backendId_to_backendIP.get(backend_id))
-            sb.append(":")
-            sb.append(backendId_to_backendHttpPort.get(backend_id))
-            sb.append("/api/compaction/run?tablet_id=")
-            sb.append(tablet_id)
-            sb.append("&compact_type=cumulative")
-
-            String command = sb.toString()
-            process = command.execute()
-            code = process.waitFor()
-            err = IOGroovyMethods.getText(new BufferedReader(new InputStreamReader(process.getErrorStream())));
-            out = process.getText()
-            logger.info("Run compaction: code=" + code + ", out=" + out + ", err=" + err)
-        }
-
-        // wait for all compactions done
-        for (String[] tablet in tablets) {
-            boolean running = true
-            do {
-                Thread.sleep(100)
-                String tablet_id = tablet[0]
-                backend_id = tablet[2]
-                StringBuilder sb = new StringBuilder();
-                sb.append("curl -X GET http://")
-                sb.append(backendId_to_backendIP.get(backend_id))
-                sb.append(":")
-                sb.append(backendId_to_backendHttpPort.get(backend_id))
-                sb.append("/api/compaction/run_status?tablet_id=")
-                sb.append(tablet_id)
-
-                String command = sb.toString()
-                process = command.execute()
-                code = process.waitFor()
-                err = IOGroovyMethods.getText(new BufferedReader(new InputStreamReader(process.getErrorStream())));
-                out = process.getText()
-                logger.info("Get compaction status: code=" + code + ", out=" + out + ", err=" + err)
-                assertEquals(code, 0)
-                def compactionStatus = parseJson(out.trim())
-                assertEquals("success", compactionStatus.status.toLowerCase())
-                running = compactionStatus.run_status
-            } while (running)
-        }
-    }
-    
     sql """ DROP TABLE IF EXISTS ${tbName} FORCE"""
     // Create table and disable light weight schema change
     sql """
@@ -119,23 +59,19 @@ suite("test_schema_change_varchar_to_datev2") {
     qt_sql_1 """select * from ${tbName} ORDER BY `k1`;"""
 
     sql """ alter table ${tbName} modify column `k3` date; """
-    int max_try_time = 1000
-    while (max_try_time--){
+    int max_try_secs = 300
+    Awaitility.await().atMost(max_try_secs, TimeUnit.SECONDS).with().pollDelay(100, TimeUnit.MILLISECONDS).await().until(() -> {
         String result = getJobState(tbName)
         if (result == "FINISHED") {
-            sleep(3000)
-            break
-        } else {
-            sleep(100)
-            if (max_try_time < 1){
-                assertEquals(1,2)
-            }
+            return true;
         }
-    }
+        return false;
+    });
+
 
     sql """sync"""
     qt_sql_2 """select * from ${tbName} ORDER BY `k1`;"""
-    do_compact(tbName)
+    trigger_and_wait_compaction(tbName, "cumulative")
     sql """sync"""
     qt_sql_3 """select * from ${tbName} ORDER BY `k1`;"""
     sql """delete from ${tbName} where `k3` = '2020-01-02';"""

@@ -28,12 +28,14 @@
 #include "common/status.h"
 #include "data_type_serde.h"
 #include "olap/olap_common.h"
+#include "runtime/define_primitive_type.h"
 #include "util/jsonb_document.h"
 #include "util/jsonb_writer.h"
 #include "vec/columns/column.h"
 #include "vec/columns/column_const.h"
 #include "vec/common/string_ref.h"
 #include "vec/core/types.h"
+#include "vec/core/wide_integer.h"
 
 namespace doris {
 
@@ -41,86 +43,109 @@ namespace vectorized {
 template <typename T>
 class ColumnDecimal;
 class Arena;
+#include "common/compile_check_begin.h"
 
 template <typename T>
 class DataTypeDecimalSerDe : public DataTypeSerDe {
     static_assert(IsDecimalNumber<T>);
 
 public:
-    DataTypeDecimalSerDe(int scale) : scale(scale) {};
+    static constexpr PrimitiveType get_primitive_type() {
+        if constexpr (std::is_same_v<TypeId<T>, TypeId<Decimal32>>) {
+            return TYPE_DECIMAL32;
+        }
+        if constexpr (std::is_same_v<TypeId<T>, TypeId<Decimal64>>) {
+            return TYPE_DECIMAL64;
+        }
+        if constexpr (std::is_same_v<TypeId<T>, TypeId<Decimal128V3>>) {
+            return TYPE_DECIMAL128I;
+        }
+        if constexpr (std::is_same_v<TypeId<T>, TypeId<Decimal128V2>>) {
+            return TYPE_DECIMALV2;
+        }
+        if constexpr (std::is_same_v<TypeId<T>, TypeId<Decimal256>>) {
+            return TYPE_DECIMAL256;
+        }
+        throw doris::Exception(ErrorCode::INTERNAL_ERROR,
+                               "get_primitive_type __builtin_unreachable");
+        __builtin_unreachable();
+    }
 
-    Status write_column_to_pb(const IColumn& column, PValues& result, int start,
-                              int end) const override;
+    DataTypeDecimalSerDe(int scale_, int precision_, int nesting_level = 1)
+            : DataTypeSerDe(nesting_level),
+              scale(scale_),
+              precision(precision_),
+              scale_multiplier(decimal_scale_multiplier<typename T::NativeType>(scale)) {}
+
+    Status serialize_one_cell_to_json(const IColumn& column, int64_t row_num, BufferWritable& bw,
+                                      FormatOptions& options) const override;
+
+    Status serialize_column_to_json(const IColumn& column, int64_t start_idx, int64_t end_idx,
+                                    BufferWritable& bw, FormatOptions& options) const override;
+
+    Status deserialize_one_cell_from_json(IColumn& column, Slice& slice,
+                                          const FormatOptions& options) const override;
+
+    Status deserialize_column_from_json_vector(IColumn& column, std::vector<Slice>& slices,
+                                               int* num_deserialized,
+                                               const FormatOptions& options) const override;
+
+    Status write_column_to_pb(const IColumn& column, PValues& result, int64_t start,
+                              int64_t end) const override;
     Status read_column_from_pb(IColumn& column, const PValues& arg) const override;
 
     void write_one_cell_to_jsonb(const IColumn& column, JsonbWriter& result, Arena* mem_pool,
-                                 int32_t col_id, int row_num) const override;
+                                 int32_t col_id, int64_t row_num) const override;
 
     void read_one_cell_from_jsonb(IColumn& column, const JsonbValue* arg) const override;
 
-    void write_column_to_arrow(const IColumn& column, const UInt8* null_map,
-                               arrow::ArrayBuilder* array_builder, int start,
-                               int end) const override;
+    void write_column_to_arrow(const IColumn& column, const NullMap* null_map,
+                               arrow::ArrayBuilder* array_builder, int64_t start, int64_t end,
+                               const cctz::time_zone& ctz) const override;
     void read_column_from_arrow(IColumn& column, const arrow::Array* arrow_array, int start,
                                 int end, const cctz::time_zone& ctz) const override;
-    Status write_column_to_mysql(const IColumn& column, bool return_object_data_as_binary,
-                                 std::vector<MysqlRowBuffer<false>>& result, int row_idx, int start,
-                                 int end, bool col_const) const override {
-        return _write_column_to_mysql(column, return_object_data_as_binary, result, row_idx, start,
-                                      end, col_const);
-    }
+    Status write_column_to_mysql(const IColumn& column, MysqlRowBuffer<true>& row_buffer,
+                                 int64_t row_idx, bool col_const,
+                                 const FormatOptions& options) const override;
+    Status write_column_to_mysql(const IColumn& column, MysqlRowBuffer<false>& row_buffer,
+                                 int64_t row_idx, bool col_const,
+                                 const FormatOptions& options) const override;
 
-    Status write_column_to_mysql(const IColumn& column, bool return_object_data_as_binary,
-                                 std::vector<MysqlRowBuffer<true>>& result, int row_idx, int start,
-                                 int end, bool col_const) const override {
-        return _write_column_to_mysql(column, return_object_data_as_binary, result, row_idx, start,
-                                      end, col_const);
-    }
+    Status write_column_to_orc(const std::string& timezone, const IColumn& column,
+                               const NullMap* null_map, orc::ColumnVectorBatch* orc_col_batch,
+                               int64_t start, int64_t end,
+                               std::vector<StringRef>& buffer_list) const override;
+
+    Status deserialize_column_from_fixed_json(IColumn& column, Slice& slice, int rows,
+                                              int* num_deserialized,
+                                              const FormatOptions& options) const override;
+
+    void insert_column_last_value_multiple_times(IColumn& column, int times) const override;
 
 private:
     template <bool is_binary_format>
-    Status _write_column_to_mysql(const IColumn& column, bool return_object_data_as_binary,
-                                  std::vector<MysqlRowBuffer<is_binary_format>>& result,
-                                  int row_idx, int start, int end, bool col_const) const;
+    Status _write_column_to_mysql(const IColumn& column, MysqlRowBuffer<is_binary_format>& result,
+                                  int64_t row_idx, bool col_const,
+                                  const FormatOptions& options) const;
 
     int scale;
+    int precision;
+    const typename T::NativeType scale_multiplier;
+    mutable char buf[T::max_string_length()];
 };
 
 template <typename T>
-template <bool is_binary_format>
-Status DataTypeDecimalSerDe<T>::_write_column_to_mysql(
-        const IColumn& column, bool return_object_data_as_binary,
-        std::vector<MysqlRowBuffer<is_binary_format>>& result, int row_idx, int start, int end,
-        bool col_const) const {
-    int buf_ret = 0;
-    auto& data = assert_cast<const ColumnDecimal<T>&>(column).get_data();
-    for (int i = start; i < end; ++i) {
-        if (0 != buf_ret) {
-            return Status::InternalError("pack mysql buffer failed.");
-        }
-        const auto col_index = index_check_const(i, col_const);
-        if constexpr (IsDecimalV2<T>) {
-            DecimalV2Value decimal_val(data[col_index]);
-            auto decimal_str = decimal_val.to_string(scale);
-            buf_ret = result[row_idx].push_string(decimal_str.c_str(), decimal_str.size());
-        } else {
-            std::string decimal_str = data[col_index].to_string(scale);
-            buf_ret = result[row_idx].push_string(decimal_str.c_str(), decimal_str.size());
-        }
-        ++row_idx;
-    }
-    return Status::OK();
-}
-template <typename T>
 Status DataTypeDecimalSerDe<T>::write_column_to_pb(const IColumn& column, PValues& result,
-                                                   int start, int end) const {
-    int row_count = end - start;
+                                                   int64_t start, int64_t end) const {
+    auto row_count = cast_set<int>(end - start);
     const auto* col = check_and_get_column<ColumnDecimal<T>>(column);
-    auto ptype = result.mutable_type();
+    auto* ptype = result.mutable_type();
     if constexpr (std::is_same_v<T, Decimal<Int128>>) {
         ptype->set_id(PGenericType::DECIMAL128);
-    } else if constexpr (std::is_same_v<T, Decimal<Int128I>>) {
+    } else if constexpr (std::is_same_v<T, Decimal128V3>) {
         ptype->set_id(PGenericType::DECIMAL128I);
+    } else if constexpr (std::is_same_v<T, Decimal256>) {
+        ptype->set_id(PGenericType::DECIMAL256);
     } else if constexpr (std::is_same_v<T, Decimal<Int32>>) {
         ptype->set_id(PGenericType::INT32);
     } else if constexpr (std::is_same_v<T, Decimal<Int64>>) {
@@ -138,12 +163,14 @@ Status DataTypeDecimalSerDe<T>::write_column_to_pb(const IColumn& column, PValue
 
 template <typename T>
 Status DataTypeDecimalSerDe<T>::read_column_from_pb(IColumn& column, const PValues& arg) const {
-    if constexpr (std::is_same_v<T, Decimal<Int128>> || std::is_same_v<T, Decimal<Int128I>> ||
-                  std::is_same_v<T, Decimal<Int16>> || std::is_same_v<T, Decimal<Int32>>) {
-        column.resize(arg.bytes_value_size());
+    if constexpr (std::is_same_v<T, Decimal<Int128>> || std::is_same_v<T, Decimal128V3> ||
+                  std::is_same_v<T, Decimal256> || std::is_same_v<T, Decimal<Int32>> ||
+                  std::is_same_v<T, Decimal<Int64>>) {
+        auto old_column_size = column.size();
+        column.resize(old_column_size + arg.bytes_value_size());
         auto& data = reinterpret_cast<ColumnDecimal<T>&>(column).get_data();
         for (int i = 0; i < arg.bytes_value_size(); ++i) {
-            data[i] = *(int128_t*)(arg.bytes_value(i).c_str());
+            data[old_column_size + i] = *(T*)(arg.bytes_value(i).c_str());
         }
         return Status::OK();
     }
@@ -154,16 +181,16 @@ Status DataTypeDecimalSerDe<T>::read_column_from_pb(IColumn& column, const PValu
 template <typename T>
 void DataTypeDecimalSerDe<T>::write_one_cell_to_jsonb(const IColumn& column, JsonbWriter& result,
                                                       Arena* mem_pool, int32_t col_id,
-                                                      int row_num) const {
+                                                      int64_t row_num) const {
     StringRef data_ref = column.get_data_at(row_num);
-    result.writeKey(col_id);
+    result.writeKey(cast_set<JsonbKeyValue::keyid_type>(col_id));
     if constexpr (std::is_same_v<T, Decimal<Int128>>) {
-        Decimal128::NativeType val =
-                *reinterpret_cast<const Decimal128::NativeType*>(data_ref.data);
+        Decimal128V2::NativeType val =
+                *reinterpret_cast<const Decimal128V2::NativeType*>(data_ref.data);
         result.writeInt128(val);
-    } else if constexpr (std::is_same_v<T, Decimal<Int128I>>) {
-        Decimal128I::NativeType val =
-                *reinterpret_cast<const Decimal128I::NativeType*>(data_ref.data);
+    } else if constexpr (std::is_same_v<T, Decimal128V3>) {
+        Decimal128V3::NativeType val =
+                *reinterpret_cast<const Decimal128V3::NativeType*>(data_ref.data);
         result.writeInt128(val);
     } else if constexpr (std::is_same_v<T, Decimal<Int32>>) {
         Decimal32::NativeType val = *reinterpret_cast<const Decimal32::NativeType*>(data_ref.data);
@@ -171,8 +198,14 @@ void DataTypeDecimalSerDe<T>::write_one_cell_to_jsonb(const IColumn& column, Jso
     } else if constexpr (std::is_same_v<T, Decimal<Int64>>) {
         Decimal64::NativeType val = *reinterpret_cast<const Decimal64::NativeType*>(data_ref.data);
         result.writeInt64(val);
+    } else if constexpr (std::is_same_v<T, Decimal256>) {
+        // use binary type, since jsonb does not support int256
+        result.writeStartBinary();
+        result.writeBinary(data_ref.data, data_ref.size);
+        result.writeEndBinary();
     } else {
-        LOG(FATAL) << "unknown Column " << column.get_name() << " for writing to jsonb";
+        throw doris::Exception(ErrorCode::NOT_IMPLEMENTED_ERROR,
+                               "write_one_cell_to_jsonb with type " + column.get_name());
     }
 }
 
@@ -182,15 +215,22 @@ void DataTypeDecimalSerDe<T>::read_one_cell_from_jsonb(IColumn& column,
     auto& col = reinterpret_cast<ColumnDecimal<T>&>(column);
     if constexpr (std::is_same_v<T, Decimal<Int128>>) {
         col.insert_value(static_cast<const JsonbInt128Val*>(arg)->val());
-    } else if constexpr (std::is_same_v<T, Decimal<Int128I>>) {
+    } else if constexpr (std::is_same_v<T, Decimal128V3>) {
         col.insert_value(static_cast<const JsonbInt128Val*>(arg)->val());
     } else if constexpr (std::is_same_v<T, Decimal<Int32>>) {
         col.insert_value(static_cast<const JsonbInt32Val*>(arg)->val());
     } else if constexpr (std::is_same_v<T, Decimal<Int64>>) {
         col.insert_value(static_cast<const JsonbInt64Val*>(arg)->val());
+    } else if constexpr (std::is_same_v<T, Decimal256>) {
+        // use binary type, since jsonb does not support int256
+        const wide::Int256 val = *reinterpret_cast<const wide::Int256*>(
+                static_cast<const JsonbBlobVal*>(arg)->getBlob());
+        col.insert_value(Decimal256(val));
     } else {
-        LOG(FATAL) << "unknown jsonb " << arg->typeName() << " for writing to column";
+        throw doris::Exception(ErrorCode::NOT_IMPLEMENTED_ERROR,
+                               "read_one_cell_from_jsonb with type " + column.get_name());
     }
 }
+#include "common/compile_check_end.h"
 } // namespace vectorized
 } // namespace doris

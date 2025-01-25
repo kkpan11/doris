@@ -91,7 +91,7 @@ public:
         DataTypes data_types = {(DataTypePtr)std::make_shared<DataType>()};
         LOG(INFO) << "test_agg_collect for " << fn_name << "(" << data_types[0]->get_name() << ")";
         AggregateFunctionSimpleFactory factory = AggregateFunctionSimpleFactory::instance();
-        auto agg_function = factory.get(fn_name, data_types);
+        auto agg_function = factory.get(fn_name, data_types, false, -1);
         EXPECT_NE(agg_function, nullptr);
 
         std::unique_ptr<char[]> memory(new char[agg_function->size_of_data()]);
@@ -147,8 +147,8 @@ TEST_F(VAggCollectTest, test_empty) {
     test_agg_collect<DataTypeInt128>("collect_list");
     test_agg_collect<DataTypeInt128>("collect_set");
 
-    test_agg_collect<DataTypeDecimal<Decimal128>>("collect_list");
-    test_agg_collect<DataTypeDecimal<Decimal128>>("collect_set");
+    test_agg_collect<DataTypeDecimal<Decimal128V2>>("collect_list");
+    test_agg_collect<DataTypeDecimal<Decimal128V2>>("collect_set");
 
     test_agg_collect<DataTypeDate>("collect_list");
     test_agg_collect<DataTypeDate>("collect_set");
@@ -163,8 +163,8 @@ TEST_F(VAggCollectTest, test_with_data) {
     test_agg_collect<DataTypeInt128>("collect_list", 20);
     test_agg_collect<DataTypeInt128>("collect_set", 30);
 
-    test_agg_collect<DataTypeDecimal<Decimal128>>("collect_list", 10);
-    test_agg_collect<DataTypeDecimal<Decimal128>>("collect_set", 11);
+    test_agg_collect<DataTypeDecimal<Decimal128V2>>("collect_list", 10);
+    test_agg_collect<DataTypeDecimal<Decimal128V2>>("collect_set", 11);
 
     test_agg_collect<DataTypeDateTime>("collect_list", 5);
     test_agg_collect<DataTypeDateTime>("collect_set", 6);

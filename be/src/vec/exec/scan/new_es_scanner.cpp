@@ -22,31 +22,28 @@
 #include <utility>
 
 #include "common/logging.h"
+#include "pipeline/exec/es_scan_operator.h"
 #include "runtime/descriptors.h"
 #include "runtime/runtime_state.h"
 #include "util/runtime_profile.h"
 #include "vec/columns/column.h"
 #include "vec/core/block.h"
 #include "vec/core/column_with_type_and_name.h"
-#include "vec/exec/scan/new_es_scan_node.h"
 
-namespace doris {
-namespace vectorized {
+namespace doris::vectorized {
 class VExprContext;
-class VScanNode;
-} // namespace vectorized
-} // namespace doris
+} // namespace doris::vectorized
 
 static const std::string NEW_SCANNER_TYPE = "NewEsScanner";
 
 namespace doris::vectorized {
 
-NewEsScanner::NewEsScanner(RuntimeState* state, NewEsScanNode* parent, int64_t limit,
-                           TupleId tuple_id, const std::map<std::string, std::string>& properties,
+NewEsScanner::NewEsScanner(RuntimeState* state, pipeline::ScanLocalStateBase* local_state,
+                           int64_t limit, TupleId tuple_id,
+                           const std::map<std::string, std::string>& properties,
                            const std::map<std::string, std::string>& docvalue_context,
                            bool doc_value_mode, RuntimeProfile* profile)
-        : VScanner(state, static_cast<VScanNode*>(parent), limit, profile),
-          _is_init(false),
+        : VScanner(state, local_state, limit, profile),
           _es_eof(false),
           _properties(properties),
           _line_eof(false),
@@ -56,7 +53,9 @@ NewEsScanner::NewEsScanner(RuntimeState* state, NewEsScanNode* parent, int64_t l
           _es_reader(nullptr),
           _es_scroll_parser(nullptr),
           _docvalue_context(docvalue_context),
-          _doc_value_mode(doc_value_mode) {}
+          _doc_value_mode(doc_value_mode) {
+    _is_init = false;
+}
 
 Status NewEsScanner::prepare(RuntimeState* state, const VExprContextSPtrs& conjuncts) {
     VLOG_CRITICAL << NEW_SCANNER_TYPE << "::prepare";
@@ -133,7 +132,7 @@ Status NewEsScanner::_get_block_impl(RuntimeState* state, Block* block, bool* eo
         columns.resize(column_size);
         for (auto i = 0; i < column_size; i++) {
             if (mem_reuse) {
-                columns[i] = std::move(*block->get_by_position(i).column).mutate();
+                columns[i] = block->get_by_position(i).column->assume_mutable();
             } else {
                 columns[i] = _tuple_desc->slots()[i]->get_empty_mutable_column();
             }
@@ -170,8 +169,7 @@ Status NewEsScanner::_get_block_impl(RuntimeState* state, Block* block, bool* eo
 }
 
 Status NewEsScanner::_get_next(std::vector<vectorized::MutableColumnPtr>& columns) {
-    NewEsScanNode* new_es_scan_node = static_cast<NewEsScanNode*>(_parent);
-    SCOPED_TIMER(new_es_scan_node->_read_timer);
+    SCOPED_TIMER(_local_state->cast<pipeline::EsScanLocalState>()._read_timer);
     if (_line_eof && _batch_eof) {
         _es_eof = true;
         return Status::OK();
@@ -186,10 +184,10 @@ Status NewEsScanner::_get_next(std::vector<vectorized::MutableColumnPtr>& column
             }
         }
 
-        COUNTER_UPDATE(new_es_scan_node->_rows_read_counter, 1);
-        SCOPED_TIMER(new_es_scan_node->_materialize_timer);
+        COUNTER_UPDATE(_local_state->cast<pipeline::EsScanLocalState>()._blocks_read_counter, 1);
+        SCOPED_TIMER(_local_state->cast<pipeline::EsScanLocalState>()._materialize_timer);
         RETURN_IF_ERROR(_es_scroll_parser->fill_columns(_tuple_desc, columns, &_line_eof,
-                                                        _docvalue_context));
+                                                        _docvalue_context, _state->timezone_obj()));
         if (!_line_eof) {
             break;
         }
@@ -204,7 +202,7 @@ Status NewEsScanner::close(RuntimeState* state) {
     }
 
     if (_es_reader != nullptr) {
-        _es_reader->close();
+        RETURN_IF_ERROR(_es_reader->close());
     }
 
     RETURN_IF_ERROR(VScanner::close(state));

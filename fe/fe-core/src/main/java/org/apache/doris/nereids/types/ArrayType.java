@@ -18,13 +18,14 @@
 package org.apache.doris.nereids.types;
 
 import org.apache.doris.catalog.Type;
+import org.apache.doris.nereids.types.coercion.ComplexDataType;
 
 import java.util.Objects;
 
 /**
  * Array type in Nereids.
  */
-public class ArrayType extends DataType {
+public class ArrayType extends DataType implements ComplexDataType {
 
     public static final ArrayType SYSTEM_DEFAULT = new ArrayType(NullType.INSTANCE, true);
 
@@ -33,7 +34,7 @@ public class ArrayType extends DataType {
     private final DataType itemType;
     private final boolean containsNull;
 
-    public ArrayType(DataType itemType, boolean containsNull) {
+    private ArrayType(DataType itemType, boolean containsNull) {
         this.itemType = Objects.requireNonNull(itemType, "itemType can not be null");
         this.containsNull = containsNull;
     }
@@ -47,6 +48,11 @@ public class ArrayType extends DataType {
             return SYSTEM_DEFAULT;
         }
         return new ArrayType(itemType, containsNull);
+    }
+
+    @Override
+    public DataType conversion() {
+        return new ArrayType(itemType.conversion(), containsNull);
     }
 
     public DataType getItemType() {
@@ -65,11 +71,6 @@ public class ArrayType extends DataType {
     @Override
     public String simpleString() {
         return "array";
-    }
-
-    @Override
-    public DataType defaultConcreteType() {
-        return SYSTEM_DEFAULT;
     }
 
     @Override

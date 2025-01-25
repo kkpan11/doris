@@ -17,6 +17,7 @@
 
 package org.apache.doris.analysis;
 
+import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.DatabaseIf;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.TableIf;
@@ -32,14 +33,30 @@ import org.apache.doris.qe.ConnectContext;
 import java.util.List;
 
 // Alter view statement
-public class AlterViewStmt extends BaseViewStmt {
+@Deprecated
+public class AlterViewStmt extends BaseViewStmt implements NotFallbackInParser {
+
+    private final String comment;
+
+    public AlterViewStmt(TableName tbl, String comment) {
+        this(tbl, null, null, comment);
+    }
 
     public AlterViewStmt(TableName tbl, List<ColWithComment> cols, QueryStmt queryStmt) {
+        this(tbl, cols, queryStmt, null);
+    }
+
+    public AlterViewStmt(TableName tbl, List<ColWithComment> cols, QueryStmt queryStmt, String comment) {
         super(tbl, cols, queryStmt);
+        this.comment = comment;
     }
 
     public TableName getTbl() {
         return tableName;
+    }
+
+    public String getComment() {
+        return comment;
     }
 
     @Override
@@ -60,10 +77,10 @@ public class AlterViewStmt extends BaseViewStmt {
         }
 
         if (!Env.getCurrentEnv().getAccessManager()
-                .checkTblPriv(ConnectContext.get(), tableName.getDb(), tableName.getTbl(), PrivPredicate.ALTER)) {
-            ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "ALTER VIEW",
-                    ConnectContext.get().getQualifiedUser(), ConnectContext.get().getRemoteIP(),
-                    tableName.getDb() + ": " + tableName.getTbl());
+                .checkTblPriv(ConnectContext.get(), tableName.getCtl(), tableName.getDb(), tableName.getTbl(),
+                        PrivPredicate.ALTER)) {
+            ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLE_ACCESS_DENIED_ERROR,
+                    PrivPredicate.ALTER.getPrivs().toString(), tableName.getTbl());
         }
 
         if (cols != null) {
@@ -73,8 +90,16 @@ public class AlterViewStmt extends BaseViewStmt {
         viewDefStmt.setNeedToSql(true);
         Analyzer viewAnalyzer = new Analyzer(analyzer);
         viewDefStmt.analyze(viewAnalyzer);
-
+        checkQueryAuth();
         createColumnAndViewDefs(analyzer);
+    }
+
+    public void setInlineViewDef(String querySql) {
+        inlineViewDef = querySql;
+    }
+
+    public void setFinalColumns(List<Column> columns) {
+        finalCols.addAll(columns);
     }
 
     @Override
@@ -100,5 +125,10 @@ public class AlterViewStmt extends BaseViewStmt {
     @Override
     public String toString() {
         return toSql();
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.ALTER;
     }
 }

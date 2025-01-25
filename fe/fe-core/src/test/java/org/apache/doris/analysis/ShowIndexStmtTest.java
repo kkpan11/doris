@@ -41,25 +41,25 @@ public class ShowIndexStmtTest {
 
     @Before
     public void setUp() {
-        analyzer = AccessTestUtil.fetchAdminAnalyzer(true);
         MockedAuth.mockedAccess(accessManager);
-        MockedAuth.mockedConnectContext(ctx, "root", "192.168.1.1");
+        MockedAuth.mockedConnectContext(ctx, "root", "%");
+        analyzer = AccessTestUtil.fetchAdminAnalyzer(true);
     }
 
     @Test
     public void testNormal() throws UserException {
         ShowIndexStmt stmt = new ShowIndexStmt("testDb", new TableName(internalCtl, "", "testTbl"));
         stmt.analyze(analyzer);
-        Assert.assertEquals("SHOW INDEX FROM `testCluster:testDb`.`testTbl`", stmt.toSql());
+        Assert.assertEquals("SHOW INDEX FROM `testDb`.`testTbl`", stmt.toSql());
         stmt = new ShowIndexStmt("", new TableName(internalCtl, "", "testTbl"));
         stmt.analyze(analyzer);
-        Assert.assertEquals("SHOW INDEX FROM `testCluster:testDb`.`testTbl`", stmt.toSql());
+        Assert.assertEquals("SHOW INDEX FROM `testDb`.`testTbl`", stmt.toSql());
         stmt = new ShowIndexStmt(null, new TableName(internalCtl, "testDb", "testTbl"));
         stmt.analyze(analyzer);
-        Assert.assertEquals("SHOW INDEX FROM `testCluster:testDb`.`testTbl`", stmt.toSql());
+        Assert.assertEquals("SHOW INDEX FROM `testDb`.`testTbl`", stmt.toSql());
         stmt = new ShowIndexStmt("testDb", new TableName(internalCtl, "testDb2", "testTbl"));
         stmt.analyze(analyzer);
-        Assert.assertEquals("SHOW INDEX FROM `testCluster:testDb`.`testTbl`", stmt.toSql());
+        Assert.assertEquals("SHOW INDEX FROM `testDb`.`testTbl`", stmt.toSql());
     }
 
     @Test(expected = AnalysisException.class)

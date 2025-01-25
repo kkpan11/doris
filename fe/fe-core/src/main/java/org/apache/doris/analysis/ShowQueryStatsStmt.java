@@ -21,7 +21,6 @@ import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.ScalarType;
-import org.apache.doris.cluster.ClusterNamespace;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
@@ -40,7 +39,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 
-public class ShowQueryStatsStmt extends ShowStmt {
+public class ShowQueryStatsStmt extends ShowStmt implements NotFallbackInParser {
 
     private static final ShowResultSetMetaData SHOW_QUERY_STATS_CATALOG_META_DATA = ShowResultSetMetaData.builder()
             .addColumn(new Column("Database", ScalarType.createVarchar(20)))
@@ -111,8 +110,6 @@ public class ShowQueryStatsStmt extends ShowStmt {
         }
         if (Strings.isNullOrEmpty(dbName)) {
             dbName = analyzer.getDefaultDb();
-        } else {
-            dbName = ClusterNamespace.getFullName(getClusterName(), dbName);
         }
         String catalog = Env.getCurrentEnv().getCurrentCatalog().getName();
         if (tableName == null && StringUtils.isEmpty(dbName)) {
@@ -131,6 +128,7 @@ public class ShowQueryStatsStmt extends ShowStmt {
             dbName = tableName.getDb();
         }
         Database db = (Database) Env.getCurrentEnv().getCurrentCatalog().getDbOrDdlException(dbName);
+        String ctlName = db.getCatalog().getName();
         if (tableName != null) {
             db.getTableOrDdlException(tableName.getTbl());
         }
@@ -138,7 +136,7 @@ public class ShowQueryStatsStmt extends ShowStmt {
             Map<String, Long> stats = QueryStatsUtil.getMergedDatabaseStats(catalog, dbName);
             stats.forEach((tableName, queryHit) -> {
                 if (Env.getCurrentEnv().getAccessManager()
-                        .checkTblPriv(ConnectContext.get(), dbName, tableName, PrivPredicate.SHOW)) {
+                        .checkTblPriv(ConnectContext.get(), ctlName, dbName, tableName, PrivPredicate.SHOW)) {
                     totalRows.add(Arrays.asList(tableName, String.valueOf(queryHit)));
                 }
             });

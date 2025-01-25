@@ -17,7 +17,7 @@
 
 package org.apache.doris.qe;
 
-import org.apache.doris.common.util.RuntimeProfile;
+import org.apache.doris.common.profile.RuntimeProfile;
 import org.apache.doris.thrift.TNetworkAddress;
 import org.apache.doris.thrift.TUniqueId;
 
@@ -74,7 +74,11 @@ public final class QueryStatisticsItem {
 
     public String getQueryExecTime() {
         final long currentTime = System.currentTimeMillis();
-        return String.valueOf(currentTime - queryStartTime);
+        if (queryStartTime <= 0) {
+            return String.valueOf(-1);
+        } else {
+            return String.valueOf(currentTime - queryStartTime);
+        }
     }
 
     public String getQueryId() {

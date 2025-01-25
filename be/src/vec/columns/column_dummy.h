@@ -47,20 +47,24 @@ public:
     int compare_at(size_t, size_t, const IColumn&, int) const override { return 0; }
 
     [[noreturn]] Field operator[](size_t) const override {
-        LOG(FATAL) << "Cannot get value from " << get_name();
+        throw doris::Exception(ErrorCode::INTERNAL_ERROR, "Cannot get value from {}", get_name());
+        __builtin_unreachable();
     }
 
     void get(size_t, Field&) const override {
-        LOG(FATAL) << "Cannot get value from " << get_name();
+        throw doris::Exception(ErrorCode::INTERNAL_ERROR, "Cannot get value from {}", get_name());
     }
 
     void insert(const Field&) override {
-        LOG(FATAL) << "Cannot insert element into " << get_name();
+        throw doris::Exception(ErrorCode::INTERNAL_ERROR, "Cannot insert element into {}",
+                               get_name());
     }
 
     StringRef get_data_at(size_t) const override { return {}; }
 
     void insert_data(const char*, size_t) override { ++s; }
+
+    void clear() override { s = 0; }
 
     StringRef serialize_value_into_arena(size_t /*n*/, Arena& arena,
                                          char const*& begin) const override {
@@ -78,8 +82,8 @@ public:
         s += length;
     }
 
-    void insert_indices_from(const IColumn& src, const int* indices_begin,
-                             const int* indices_end) override {
+    void insert_indices_from(const IColumn& src, const uint32_t* indices_begin,
+                             const uint32_t* indices_end) override {
         s += (indices_end - indices_begin);
     }
 
@@ -95,7 +99,9 @@ public:
 
     ColumnPtr permute(const Permutation& perm, size_t limit) const override {
         if (s != perm.size()) {
-            LOG(FATAL) << "Size of permutation doesn't match size of column.";
+            throw doris::Exception(ErrorCode::INTERNAL_ERROR,
+                                   "Size of permutation doesn't match size of column.");
+            __builtin_unreachable();
         }
 
         return clone_dummy(limit ? std::min(s, limit) : s);
@@ -113,27 +119,14 @@ public:
         return clone_dummy(offsets.back());
     }
 
-    MutableColumns scatter(ColumnIndex num_columns, const Selector& selector) const override {
-        if (s != selector.size()) {
-            LOG(FATAL) << "Size of selector doesn't match size of column.";
-        }
-
-        std::vector<size_t> counts(num_columns);
-        for (auto idx : selector) ++counts[idx];
-
-        MutableColumns res(num_columns);
-        for (size_t i = 0; i < num_columns; ++i) res[i] = clone_resized(counts[i]);
-
-        return res;
-    }
-
     void append_data_by_selector(MutableColumnPtr& res,
                                  const IColumn::Selector& selector) const override {
         size_t num_rows = size();
 
         if (num_rows < selector.size()) {
-            LOG(FATAL) << fmt::format("Size of selector: {}, is larger than size of column:{}",
-                                      selector.size(), num_rows);
+            throw doris::Exception(ErrorCode::INTERNAL_ERROR,
+                                   "Size of selector: {}, is larger than size of column:{}",
+                                   selector.size(), num_rows);
         }
 
         res->reserve(num_rows);
@@ -141,33 +134,27 @@ public:
         for (size_t i = 0; i < selector.size(); ++i) res->insert_from(*this, selector[i]);
     }
 
-    void get_extremes(Field&, Field&) const override {}
+    void append_data_by_selector(MutableColumnPtr& res, const IColumn::Selector& selector,
+                                 size_t begin, size_t end) const override {
+        size_t num_rows = size();
+
+        if (num_rows < selector.size()) {
+            throw doris::Exception(ErrorCode::INTERNAL_ERROR,
+                                   "Size of selector: {}, is larger than size of column:{}",
+                                   selector.size(), num_rows);
+        }
+
+        res->reserve(num_rows);
+
+        for (size_t i = begin; i < end; ++i) res->insert_from(*this, selector[i]);
+    }
 
     void addSize(size_t delta) { s += delta; }
 
-    bool is_dummy() const override { return true; }
-
-    [[noreturn]] TypeIndex get_data_type() const override {
-        LOG(FATAL) << "IColumnDummy get_data_type not implemeted";
-    }
-
     void replace_column_data(const IColumn& rhs, size_t row, size_t self_row = 0) override {
-        LOG(FATAL) << "should not call the method in column dummy";
-    }
-
-    void replace_column_data_default(size_t self_row = 0) override {
-        LOG(FATAL) << "should not call the method in column dummy";
-    }
-
-    void get_indices_of_non_default_rows(Offsets64&, size_t, size_t) const override {
-        LOG(FATAL) << "should not call the method in column dummy";
-    }
-
-    ColumnPtr index(const IColumn& indexes, size_t limit) const override {
-        if (indexes.size() < limit) {
-            LOG(FATAL) << "Size of indexes is less than required.";
-        }
-        return clone_dummy(limit ? limit : s);
+        throw doris::Exception(ErrorCode::INTERNAL_ERROR,
+                               "should not call the method in column dummy");
+        __builtin_unreachable();
     }
 
 protected:

@@ -28,37 +28,38 @@
 #include <thread>
 #include <utility>
 
-// IWYU pragma: no_include <opentelemetry/common/threadlocal.h>
 #include "common/compiler_util.h" // IWYU pragma: keep
 #include "common/logging.h"
 #include "common/status.h"
 #include "io/fs/broker_file_system.h"
 #include "util/doris_metrics.h"
 
-namespace doris {
-namespace io {
-class IOContext;
+namespace doris::io {
+struct IOContext;
 
-BrokerFileReader::BrokerFileReader(const TNetworkAddress& broker_addr, const Path& path,
-                                   size_t file_size, TBrokerFD fd,
-                                   std::shared_ptr<BrokerFileSystem> fs)
-        : _path(path),
+BrokerFileReader::BrokerFileReader(const TNetworkAddress& broker_addr, Path path, size_t file_size,
+                                   TBrokerFD fd,
+                                   std::shared_ptr<BrokerServiceConnection> connection)
+        : _path(std::move(path)),
           _file_size(file_size),
           _broker_addr(broker_addr),
           _fd(fd),
-          _fs(std::move(fs)) {
-    _fs->get_client(&_client);
+          _connection(std::move(connection)) {
     DorisMetrics::instance()->broker_file_open_reading->increment(1);
     DorisMetrics::instance()->broker_file_reader_total->increment(1);
 }
 
 BrokerFileReader::~BrokerFileReader() {
-    BrokerFileReader::close();
+    static_cast<void>(BrokerFileReader::close());
 }
 
 Status BrokerFileReader::close() {
     bool expected = false;
     if (_closed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        if (!_connection->is_alive()) {
+            return Status::InternalError("connect to broker failed");
+        }
+
         TBrokerCloseReaderRequest request;
         request.__set_version(TBrokerVersion::VERSION_ONE);
         request.__set_fd(_fd);
@@ -66,21 +67,21 @@ Status BrokerFileReader::close() {
         TBrokerOperationStatus response;
         try {
             try {
-                (*_client)->closeReader(response, request);
-            } catch (apache::thrift::transport::TTransportException& e) {
+                (*_connection)->closeReader(response, request);
+            } catch (apache::thrift::transport::TTransportException&) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
-                RETURN_IF_ERROR((*_client).reopen());
-                (*_client)->closeReader(response, request);
+                RETURN_IF_ERROR((*_connection).reopen());
+                (*_connection)->closeReader(response, request);
             }
         } catch (apache::thrift::TException& e) {
             std::stringstream ss;
-            ss << "Close broker reader failed, broker:" << _broker_addr << " failed:" << e.what();
+            ss << "close broker file failed, broker:" << _broker_addr << " failed:" << e.what();
             return Status::RpcError(ss.str());
         }
 
         if (response.statusCode != TBrokerOperationStatusCode::OK) {
             std::stringstream ss;
-            ss << "close broker reader failed, broker:" << _broker_addr
+            ss << "close broker file failed, broker:" << _broker_addr
                << " failed:" << response.message;
             return Status::InternalError(ss.str());
         }
@@ -92,12 +93,19 @@ Status BrokerFileReader::close() {
 
 Status BrokerFileReader::read_at_impl(size_t offset, Slice result, size_t* bytes_read,
                                       const IOContext* /*io_ctx*/) {
-    DCHECK(!closed());
+    if (closed()) [[unlikely]] {
+        return Status::InternalError("read closed file: ", _path.native());
+    }
+
     size_t bytes_req = result.size;
     char* to = result.data;
     *bytes_read = 0;
     if (UNLIKELY(bytes_req == 0)) {
         return Status::OK();
+    }
+
+    if (!_connection->is_alive()) {
+        return Status::InternalError("connect to broker failed");
     }
 
     TBrokerPReadRequest request;
@@ -111,24 +119,24 @@ Status BrokerFileReader::read_at_impl(size_t offset, Slice result, size_t* bytes
         VLOG_RPC << "send pread request to broker:" << _broker_addr << " position:" << offset
                  << ", read bytes length:" << bytes_req;
         try {
-            (*_client)->pread(response, request);
+            (*_connection)->pread(response, request);
         } catch (apache::thrift::transport::TTransportException& e) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
-            RETURN_IF_ERROR((*_client).reopen());
+            RETURN_IF_ERROR((*_connection).reopen());
             LOG(INFO) << "retry reading from broker: " << _broker_addr << ". reason: " << e.what();
-            (*_client)->pread(response, request);
+            (*_connection)->pread(response, request);
         }
     } catch (apache::thrift::TException& e) {
         std::stringstream ss;
-        ss << "Open broker reader failed, broker:" << _broker_addr << " failed:" << e.what();
+        ss << "read broker file failed, broker:" << _broker_addr << " failed:" << e.what();
         return Status::RpcError(ss.str());
     }
 
     if (response.opStatus.statusCode == TBrokerOperationStatusCode::END_OF_FILE) {
         // read the end of broker's file
-        *bytes_read = 0;
         return Status::OK();
-    } else if (response.opStatus.statusCode != TBrokerOperationStatusCode::OK) {
+    }
+    if (response.opStatus.statusCode != TBrokerOperationStatusCode::OK) {
         std::stringstream ss;
         ss << "Open broker reader failed, broker:" << _broker_addr
            << " failed:" << response.opStatus.message;
@@ -140,5 +148,4 @@ Status BrokerFileReader::read_at_impl(size_t offset, Slice result, size_t* bytes
     return Status::OK();
 }
 
-} // namespace io
-} // namespace doris
+} // namespace doris::io

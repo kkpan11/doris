@@ -21,12 +21,15 @@ import org.apache.doris.nereids.trees.expressions.Expression;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 
 public class StatisticsBuilder {
 
     private double rowCount;
+    private int widthInJoinCluster = 1;
+    private final Map<Expression, ColumnStatistic> expressionToColumnStats;
 
-    private Map<Expression, ColumnStatistic> expressionToColumnStats;
+    private double deltaRowCount = 0.0;
 
     public StatisticsBuilder() {
         expressionToColumnStats = new HashMap<>();
@@ -34,12 +37,24 @@ public class StatisticsBuilder {
 
     public StatisticsBuilder(Statistics statistics) {
         this.rowCount = statistics.getRowCount();
+        this.widthInJoinCluster = statistics.getWidthInJoinCluster();
+        this.deltaRowCount = statistics.getDeltaRowCount();
         expressionToColumnStats = new HashMap<>();
         expressionToColumnStats.putAll(statistics.columnStatistics());
     }
 
     public StatisticsBuilder setRowCount(double rowCount) {
         this.rowCount = rowCount;
+        return this;
+    }
+
+    public StatisticsBuilder setWidthInJoinCluster(int widthInJoinCluster) {
+        this.widthInJoinCluster = widthInJoinCluster;
+        return this;
+    }
+
+    public StatisticsBuilder setDeltaRowCount(double deltaRowCount) {
+        this.deltaRowCount = deltaRowCount;
         return this;
     }
 
@@ -54,7 +69,11 @@ public class StatisticsBuilder {
         return this;
     }
 
+    public Set<Map.Entry<Expression, ColumnStatistic>> getExpressionColumnStatsEntries() {
+        return expressionToColumnStats.entrySet();
+    }
+
     public Statistics build() {
-        return new Statistics(rowCount, expressionToColumnStats);
+        return new Statistics(rowCount, widthInJoinCluster, expressionToColumnStats, deltaRowCount);
     }
 }

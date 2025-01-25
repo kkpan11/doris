@@ -20,24 +20,41 @@
 #include <stdint.h>
 
 #include "operator.h"
-#include "vec/exec/vselect_node.h"
 
-namespace doris {
-class ExecNode;
+namespace doris::pipeline {
+#include "common/compile_check_begin.h"
 
-namespace pipeline {
-
-class SelectOperatorBuilder final : public OperatorBuilder<vectorized::VSelectNode> {
+class SelectOperatorX;
+class SelectLocalState final : public PipelineXLocalState<FakeSharedState> {
 public:
-    SelectOperatorBuilder(int32_t id, ExecNode* select_node);
+    ENABLE_FACTORY_CREATOR(SelectLocalState);
 
-    OperatorPtr build_operator() override;
+    SelectLocalState(RuntimeState* state, OperatorXBase* parent)
+            : PipelineXLocalState<FakeSharedState>(state, parent) {}
+    ~SelectLocalState() = default;
+
+private:
+    friend class SelectOperatorX;
 };
 
-class SelectOperator final : public StreamingOperator<SelectOperatorBuilder> {
+class SelectOperatorX final : public StreamingOperatorX<SelectLocalState> {
 public:
-    SelectOperator(OperatorBuilderBase* operator_builder, ExecNode* select_node);
+    SelectOperatorX(ObjectPool* pool, const TPlanNode& tnode, int operator_id,
+                    const DescriptorTbl& descs)
+            : StreamingOperatorX<SelectLocalState>(pool, tnode, operator_id, descs) {}
+
+    Status pull(RuntimeState* state, vectorized::Block* block, bool* eos) override {
+        auto& local_state = get_local_state(state);
+        SCOPED_TIMER(local_state.exec_time_counter());
+        RETURN_IF_CANCELLED(state);
+        RETURN_IF_ERROR(vectorized::VExprContext::filter_block(local_state._conjuncts, block,
+                                                               block->columns()));
+        local_state.reached_limit(block, eos);
+        return Status::OK();
+    }
+
+    [[nodiscard]] bool is_source() const override { return false; }
 };
 
-} // namespace pipeline
-} // namespace doris
+#include "common/compile_check_end.h"
+} // namespace doris::pipeline

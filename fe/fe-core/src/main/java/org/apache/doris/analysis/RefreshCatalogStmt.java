@@ -33,12 +33,17 @@ import java.util.Map;
  * RefreshCatalogStmt
  * Manually refresh the catalog metadata.
  */
-public class RefreshCatalogStmt extends DdlStmt {
+public class RefreshCatalogStmt extends DdlStmt implements NotFallbackInParser {
     private static final String INVALID_CACHE = "invalid_cache";
 
     private final String catalogName;
     private Map<String, String> properties;
-    private boolean invalidCache = false;
+
+    /**
+     * Set default value to true, otherwise
+     * {@link org.apache.doris.catalog.RefreshManager.RefreshTask} will lost the default value
+     */
+    private boolean invalidCache = true;
 
     public RefreshCatalogStmt(String catalogName, Map<String, String> properties) {
         this.catalogName = catalogName;
@@ -62,13 +67,14 @@ public class RefreshCatalogStmt extends DdlStmt {
         }
 
         if (!Env.getCurrentEnv().getAccessManager().checkCtlPriv(
-                ConnectContext.get(), catalogName, PrivPredicate.ALTER)) {
-            ErrorReport.reportAnalysisException(ErrorCode.ERR_CATALOG_ACCESS_DENIED,
-                    analyzer.getQualifiedUser(), catalogName);
+                ConnectContext.get(), catalogName, PrivPredicate.SHOW)) {
+            ErrorReport.reportAnalysisException(ErrorCode.ERR_CATALOG_ACCESS_DENIED_ERROR,
+                    PrivPredicate.SHOW.getPrivs().toString(), catalogName);
         }
-        String invalidConfig = properties == null ? null : properties.get(INVALID_CACHE);
-        // Default is to invalid cache.
-        invalidCache = invalidConfig == null ? true : invalidConfig.equalsIgnoreCase("true");
+
+        // Set to false only if user set the property "invalid_cache"="false"
+        invalidCache = !(properties.get(INVALID_CACHE) != null && properties.get(INVALID_CACHE)
+                .equalsIgnoreCase("false"));
     }
 
     @Override
@@ -76,5 +82,10 @@ public class RefreshCatalogStmt extends DdlStmt {
         StringBuilder stringBuilder = new StringBuilder();
         stringBuilder.append("REFRESH CATALOG ").append("`").append(catalogName).append("`");
         return stringBuilder.toString();
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.REFRESH;
     }
 }

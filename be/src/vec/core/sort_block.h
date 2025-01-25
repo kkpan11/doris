@@ -29,7 +29,6 @@
 #include <utility>
 #include <vector>
 
-// IWYU pragma: no_include <opentelemetry/common/threadlocal.h>
 #include "common/compiler_util.h" // IWYU pragma: keep
 #include "util/simd/bits.h"
 #include "vec/columns/column.h"
@@ -55,24 +54,6 @@ namespace doris::vectorized {
 /// Sort one block by `description`. If limit != 0, then the partial sort of the first `limit` rows is produced.
 void sort_block(Block& src_block, Block& dest_block, const SortDescription& description,
                 UInt64 limit = 0);
-
-/** Used only in StorageMergeTree to sort the data with INSERT.
-  * Sorting is stable. This is important for keeping the order of rows in the CollapsingMergeTree engine
-  *  - because based on the order of rows it is determined whether to delete or leave groups of rows when collapsing.
-  * Collations are not supported. Partial sorting is not supported.
-  */
-void stable_sort_block(Block& block, const SortDescription& description);
-
-/** Same as stable_sort_block, but do not sort the block, but only calculate the permutation of the values,
-  *  so that you can rearrange the column values yourself.
-  */
-void stable_get_permutation(const Block& block, const SortDescription& description,
-                            IColumn::Permutation& out_permutation);
-
-/** Quickly check whether the block is already sorted. If the block is not sorted - returns false as fast as possible.
-  * Collations are not supported.
-  */
-bool is_already_sorted(const Block& block, const SortDescription& description);
 
 using ColumnWithSortDescription = std::pair<const IColumn*, SortColumnDescription>;
 
@@ -242,6 +223,15 @@ public:
         }
     }
 
+    void sort_column(const ColumnString64& column, EqualFlags& flags, IColumn::Permutation& perms,
+                     EqualRange& range, bool last_column) const {
+        if (!_should_inline_value(perms)) {
+            _sort_by_default(column, flags, perms, range, last_column);
+        } else {
+            _sort_by_inlined_permutation<StringRef>(column, flags, perms, range, last_column);
+        }
+    }
+
     void sort_column(const ColumnNullable& column, EqualFlags& flags, IColumn::Permutation& perms,
                      EqualRange& range, bool last_column) const {
         if (!column.has_null()) {
@@ -343,7 +333,8 @@ private:
             if constexpr (std::is_same_v<ColumnType, ColumnVector<T>> ||
                           std::is_same_v<ColumnType, ColumnDecimal<T>>) {
                 permutation_for_column[i].inline_value = column.get_data()[row_id];
-            } else if constexpr (std::is_same_v<ColumnType, ColumnString>) {
+            } else if constexpr (std::is_same_v<ColumnType, ColumnString> ||
+                                 std::is_same_v<ColumnType, ColumnString64>) {
                 permutation_for_column[i].inline_value = column.get_data_at(row_id);
             } else {
                 static_assert(always_false_v<ColumnType>);
@@ -357,7 +348,8 @@ private:
                           EqualRange& range, bool last_column) const {
         int new_limit = _limit;
         auto comparator = [&](const size_t a, const size_t b) {
-            if constexpr (!std::is_same_v<ColumnType, ColumnString>) {
+            if constexpr (!std::is_same_v<ColumnType, ColumnString> &&
+                          !std::is_same_v<ColumnType, ColumnString64>) {
                 auto value_a = column.get_data()[a];
                 auto value_b = column.get_data()[b];
                 return value_a > value_b ? 1 : (value_a < value_b ? -1 : 0);

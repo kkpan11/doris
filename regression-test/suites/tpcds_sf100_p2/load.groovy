@@ -32,7 +32,8 @@ suite('load') {
         |"AWS_ACCESS_KEY" = "${getS3AK()}",
         |"AWS_SECRET_KEY" = "${getS3SK()}",
         |"AWS_ENDPOINT" = "${getS3Endpoint()}",
-        |"AWS_REGION" = "${getS3Region()}")
+        |"AWS_REGION" = "${getS3Region()}",
+        |"provider" = "${getS3Provider()}")
         |PROPERTIES(
         |"exec_mem_limit" = "8589934592",
         |"load_parallelism" = "3")""".stripMargin()
@@ -73,5 +74,11 @@ suite('load') {
             rowCount = sql "select count(*) from ${table}"
         }
         assertEquals(rows, rowCount[0][0])
+    }
+
+    sleep(70000) // wait for row count report of the tables just loaded
+    tables.each { table, rows ->
+        sql """SET query_timeout = 1800"""
+        sql """ ANALYZE TABLE $table WITH SYNC """
     }
 }

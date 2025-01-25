@@ -17,50 +17,100 @@
 
 package org.apache.doris.nereids.types;
 
-import org.apache.doris.catalog.ScalarType;
+import org.apache.doris.analysis.Expr;
 import org.apache.doris.catalog.Type;
-import org.apache.doris.nereids.types.coercion.AbstractDataType;
-import org.apache.doris.nereids.types.coercion.PrimitiveType;
+import org.apache.doris.nereids.trees.expressions.Expression;
+import org.apache.doris.nereids.trees.expressions.SlotReference;
 
+import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 /**
  * AggStateType type in Nereids.
  */
-public class AggStateType extends PrimitiveType {
-
-    public static final AggStateType SYSTEM_DEFAULT = new AggStateType(null, null);
+public class AggStateType extends DataType {
 
     public static final int WIDTH = 16;
 
+    private static final Map<String, String> aliasToName = ImmutableMap.<String, String>builder()
+            .put("substr", "substring")
+            .put("ifnull", "nvl")
+            .put("rand", "random")
+            .put("add_months", "months_add")
+            .put("curdate", "current_date")
+            .put("ucase", "upper")
+            .put("lcase", "lower")
+            .put("hll_raw_agg", "hll_union")
+            .put("approx_count_distinct", "ndv")
+            .put("any", "any_value")
+            .put("char_length", "character_length")
+            .put("stddev_pop", "stddev")
+            .put("var_pop", "variance")
+            .put("variance_pop", "variance")
+            .put("var_samp", "variance_samp")
+            .put("hist", "histogram")
+            .build();
+
     private final List<DataType> subTypes;
     private final List<Boolean> subTypeNullables;
+    private final String functionName;
 
-    public AggStateType(List<DataType> subTypes, List<Boolean> subTypeNullables) {
-        this.subTypes = subTypes;
-        this.subTypeNullables = subTypeNullables;
+    /**
+     * Constructor for AggStateType
+     * @param functionName     nested function's name
+     * @param subTypes         nested function's argument list
+     * @param subTypeNullables nested nested function's argument's nullable list
+     */
+    public AggStateType(String functionName, List<DataType> subTypes, List<Boolean> subTypeNullables) {
+        this.subTypes = ImmutableList.copyOf(Objects.requireNonNull(subTypes, "subTypes should not be null"));
+        this.subTypeNullables = ImmutableList
+                .copyOf(Objects.requireNonNull(subTypeNullables, "subTypeNullables should not be null"));
+        Preconditions.checkState(subTypes.size() == subTypeNullables.size(),
+                "AggStateType' subTypes.size()!=subTypeNullables.size()");
+        this.functionName = aliasToName.getOrDefault(functionName, functionName);
+    }
+
+    public List<Expression> getMockedExpressions() {
+        List<Expression> result = new ArrayList<Expression>();
+        for (int i = 0; i < subTypes.size(); i++) {
+            result.add(new SlotReference("mocked", subTypes.get(i), subTypeNullables.get(i)));
+        }
+        return result;
+    }
+
+    public List<DataType> getSubTypes() {
+        return subTypes;
+    }
+
+    public List<Boolean> getSubTypeNullables() {
+        return subTypeNullables;
+    }
+
+    public String getFunctionName() {
+        return functionName;
     }
 
     @Override
     public Type toCatalogDataType() {
-        List<Type> types = subTypes.stream().map(t -> t.toCatalogDataType()).collect(Collectors.toList());
-        return new ScalarType(types, subTypeNullables);
+        List<Type> types = subTypes.stream().map(DataType::toCatalogDataType).collect(Collectors.toList());
+        return Expr.createAggStateType(functionName, types, subTypeNullables);
     }
 
     @Override
-    public boolean acceptsType(AbstractDataType other) {
+    public boolean acceptsType(DataType other) {
         return other instanceof AggStateType;
     }
 
     @Override
     public String simpleString() {
         return "agg_state";
-    }
-
-    @Override
-    public DataType defaultConcreteType() {
-        return SYSTEM_DEFAULT;
     }
 
     @Override

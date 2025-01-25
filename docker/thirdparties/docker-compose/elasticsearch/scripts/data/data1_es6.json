@@ -3,6 +3,9 @@
   "test2": "text#1",
   "test3": 3.14,
   "test4": "2022-08-08",
+  "test5": 12345,
+  "test6": "2022-08-08T12:10:10.151Z",
+  "test7": 123456789,
   "c_bool": [true, false, true, true],
   "c_byte": [1, -2, -3, 4],
   "c_short": [128, 129, -129, -130],
@@ -21,5 +24,9 @@
   "c_person": [
     {"name": "Andy", "age": 18},
     {"name": "Tim", "age": 28}
+  ],
+  "c_user": [
+    {"first": "John", "last":  "Smith"},
+    {"first": "Alice", "last":  "White"}
   ]
 }

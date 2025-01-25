@@ -18,10 +18,6 @@
 import org.codehaus.groovy.runtime.IOGroovyMethods
 
 suite ("test_dup_mv_bitmap_hash") {
-
-    // because nereids cannot support rollup correctly forbid it temporary
-    sql """set enable_nereids_planner=false"""
-
     sql """ DROP TABLE IF EXISTS d_table; """
 
     sql """
@@ -44,23 +40,16 @@ suite ("test_dup_mv_bitmap_hash") {
 
     createMV( "create materialized view k1g2bm as select k1,bitmap_union(to_bitmap(k2)) from d_table group by k1;")
 
-    explain {
-        sql("select bitmap_union_count(to_bitmap(k2)) from d_table group by k1 order by k1;")
-        contains "(k1g2bm)"
-    }
-    qt_select_mv "select bitmap_union_count(to_bitmap(k2)) from d_table group by k1 order by k1;"
+    sql """analyze table d_table with sync;"""
+    sql """alter table d_table modify column k1 set stats ('row_count'='4');"""
+    sql """set enable_stats=false;"""
 
-    result = "null"
-    sql "create materialized view k1g3bm as select k1,bitmap_union(bitmap_hash(k3)) from d_table group by k1;"
-    while (!result.contains("FINISHED")){
-        result = sql "SHOW ALTER TABLE MATERIALIZED VIEW WHERE TableName='d_table' ORDER BY CreateTime DESC LIMIT 1;"
-        result = result.toString()
-        logger.info("result: ${result}")
-        if(result.contains("CANCELLED")){
-            return 
-        }
-        Thread.sleep(1000)
-    }
+    mv_rewrite_success("select bitmap_union_count(to_bitmap(k2)) from d_table group by k1 order by k1;", "k1g2bm")
+    qt_select_mv "select bitmap_union_count(to_bitmap(k2)) from d_table group by k1 order by k1;"
+    sql """set enable_stats=true;"""
+    mv_rewrite_success("select bitmap_union_count(to_bitmap(k2)) from d_table group by k1 order by k1;", "k1g2bm")
+
+    createMV "create materialized view k1g3bm as select k1,bitmap_union(bitmap_hash(k3)) from d_table group by k1;"
 
     sql "insert into d_table select 2,2,'bb';"
     sql "insert into d_table select 3,3,'c';"
@@ -69,9 +58,15 @@ suite ("test_dup_mv_bitmap_hash") {
 
     qt_select_star "select * from d_table order by k1,k2,k3;"
 
-    explain {
-        sql("select k1,bitmap_union_count(bitmap_hash(k3)) from d_table group by k1;")
-        contains "(k1g3bm)"
-    }
+    sql """set enable_stats=true;"""
+    sql """alter table d_table modify column k1 set stats ('row_count'='4');"""
+    sql """analyze table d_table with sync;"""
+    sql """alter table d_table modify column k1 set stats ('row_count'='4');"""
+    sql """set enable_stats=false;"""
+
+    mv_rewrite_success("select k1,bitmap_union_count(bitmap_hash(k3)) from d_table group by k1;", "k1g3bm")
     qt_select_mv_sub "select k1,bitmap_union_count(bitmap_hash(k3)) from d_table group by k1 order by k1;"
+    sql """set enable_stats=true;"""
+    sql """alter table d_table modify column k1 set stats ('row_count'='4');"""
+    mv_rewrite_success("select k1,bitmap_union_count(bitmap_hash(k3)) from d_table group by k1;", "k1g3bm")
 }

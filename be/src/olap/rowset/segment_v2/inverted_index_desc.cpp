@@ -23,34 +23,57 @@
 #include "olap/olap_common.h"
 
 namespace doris::segment_v2 {
-const std::string segment_suffix = ".dat";
-const std::string index_suffix = ".idx";
-const std::string index_name_separator = "_";
 
-std::string InvertedIndexDescriptor::get_temporary_index_path(const std::string& segment_path,
-                                                              uint32_t uuid) {
-    return StripSuffixString(segment_path, segment_suffix) + index_name_separator +
-           std::to_string(uuid);
+const std::unordered_map<std::string, int32_t> InvertedIndexDescriptor::index_file_info_map = {
+        {"null_bitmap", 1}, {"segments.gen", 2}, {"segments_", 3}, {"fnm", 4}, {"tii", 5}};
+
+const std::unordered_map<std::string, int32_t> InvertedIndexDescriptor::normal_file_info_map = {
+        {"tis", 1}, {"frq", 2}, {"prx", 3}};
+
+// {tmp_dir}/{rowset_id}_{seg_id}_{index_id}@{suffix}
+std::string InvertedIndexDescriptor::get_temporary_index_path(std::string_view tmp_dir_path,
+                                                              std::string_view rowset_id,
+                                                              int64_t seg_id, int64_t index_id,
+                                                              std::string_view index_path_suffix) {
+    std::string suffix =
+            index_path_suffix.empty() ? "" : std::string {"@"} + index_path_suffix.data();
+    return fmt::format("{}/{}_{}_{}{}", tmp_dir_path, rowset_id, seg_id, index_id, suffix);
 }
 
-std::string InvertedIndexDescriptor::get_index_file_name(const std::string& segment_path,
-                                                         uint32_t uuid) {
-    return StripSuffixString(segment_path, segment_suffix) + index_name_separator +
-           std::to_string(uuid) + index_suffix;
+// InvertedIndexStorageFormat V1
+// {prefix}_{index_id}@{suffix}.idx
+std::string InvertedIndexDescriptor::get_index_file_path_v1(std::string_view index_path_prefix,
+                                                            int64_t index_id,
+                                                            std::string_view index_path_suffix) {
+    std::string suffix =
+            index_path_suffix.empty() ? "" : std::string {"@"} + index_path_suffix.data();
+    return fmt::format("{}_{}{}{}", index_path_prefix, index_id, suffix, index_suffix);
 }
 
-std::string InvertedIndexDescriptor::inverted_index_file_path(const string& rowset_dir,
-                                                              const RowsetId& rowset_id,
-                                                              int segment_id, int64_t index_id) {
-    // {rowset_dir}/{schema_hash}/{rowset_id}_{seg_num}_{index_id}.idx
-    return fmt::format("{}/{}_{}_{}.idx", rowset_dir, rowset_id.to_string(), segment_id, index_id);
+// InvertedIndexStorageFormat V2
+// {prefix}.idx
+std::string InvertedIndexDescriptor::get_index_file_path_v2(std::string_view index_path_prefix) {
+    return fmt::format("{}{}", index_path_prefix, index_suffix);
 }
 
-std::string InvertedIndexDescriptor::local_inverted_index_path_segcompacted(
-        const string& tablet_path, const RowsetId& rowset_id, int64_t begin, int64_t end,
-        int64_t index_id) {
-    // {root_path}/data/{shard_id}/{tablet_id}/{schema_hash}/{rowset_id}_{begin_seg}-{end_seg}_{index_id}.idx
-    return fmt::format("{}/{}_{}-{}_{}.idx", tablet_path, rowset_id.to_string(), begin, end,
-                       index_id);
+// local path prefix:
+//   {storage_dir}/data/{shard_id}/{tablet_id}/{schema_hash}/{rowset_id}_{seg_id}
+// remote path v0 prefix:
+//   data/{tablet_id}/{rowset_id}_{seg_id}
+std::string_view InvertedIndexDescriptor::get_index_file_path_prefix(
+        std::string_view segment_path) {
+    CHECK(segment_path.ends_with(segment_suffix));
+    segment_path.remove_suffix(segment_suffix.size());
+    return segment_path;
 }
+
+// {prefix}_{index_id}@{suffix} for inverted index cache
+std::string InvertedIndexDescriptor::get_index_file_cache_key(std::string_view index_path_prefix,
+                                                              int64_t index_id,
+                                                              std::string_view index_path_suffix) {
+    std::string suffix =
+            index_path_suffix.empty() ? "" : std::string {"@"} + index_path_suffix.data();
+    return fmt::format("{}_{}{}", index_path_prefix, index_id, suffix);
+}
+
 } // namespace doris::segment_v2

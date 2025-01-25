@@ -21,14 +21,13 @@
 
 #include "vec/columns/column_array.h"
 #include "vec/columns/column_string.h"
-#include "vec/common/hash_table/hash_set.h"
 #include "vec/data_types/data_type_array.h"
 #include "vec/functions/array/function_array_utils.h"
 #include "vec/functions/function_helpers.h"
 
 namespace doris::vectorized {
 
-enum class SetOperation { UNION, EXCEPT, INTERSECT };
+enum class SetOperation { UNION, EXCEPT };
 
 template <typename Set, typename Element>
 struct UnionAction;
@@ -36,32 +35,19 @@ struct UnionAction;
 template <typename Set, typename Element>
 struct ExceptAction;
 
-template <typename Set, typename Element>
-struct IntersectAction;
-
 template <typename Set, typename Element, SetOperation operation>
 struct ActionImpl;
-
-template <typename Set, typename Element>
-struct ActionImpl<Set, Element, SetOperation::UNION> {
-    using Action = UnionAction<Set, Element>;
-};
 
 template <typename Set, typename Element>
 struct ActionImpl<Set, Element, SetOperation::EXCEPT> {
     using Action = ExceptAction<Set, Element>;
 };
 
-template <typename Set, typename Element>
-struct ActionImpl<Set, Element, SetOperation::INTERSECT> {
-    using Action = IntersectAction<Set, Element>;
-};
-
 template <SetOperation operation, typename ColumnType>
 struct OpenSetImpl {
     using Element = typename ColumnType::value_type;
     using ElementNativeType = typename NativeType<Element>::Type;
-    using Set = HashSetWithStackMemory<ElementNativeType, DefaultHash<ElementNativeType>, 4>;
+    using Set = phmap::flat_hash_set<ElementNativeType>;
     using Action = typename ActionImpl<Set, Element, operation>::Action;
     Action action;
     Set set;
@@ -98,7 +84,7 @@ struct OpenSetImpl {
 
 template <SetOperation operation>
 struct OpenSetImpl<operation, ColumnString> {
-    using Set = HashSetWithStackMemory<StringRef, DefaultHash<StringRef>, 4>;
+    using Set = phmap::flat_hash_set<StringRef>;
     using Action = typename ActionImpl<Set, StringRef, operation>::Action;
     Action action;
     Set set;
@@ -156,9 +142,9 @@ public:
                           bool right_const) {
         ColumnArrayMutableData dst;
         if (left_data.nested_nullmap_data || right_data.nested_nullmap_data) {
-            dst = create_mutable_data(left_data.nested_col, true);
+            dst = create_mutable_data(left_data.nested_col.get(), true);
         } else {
-            dst = create_mutable_data(left_data.nested_col, false);
+            dst = create_mutable_data(left_data.nested_col.get(), false);
         }
         ColumnPtr res_column;
         if (left_const) {
@@ -194,7 +180,11 @@ private:
         constexpr auto execute_left_column_first = Impl::Action::execute_left_column_first;
         size_t current = 0;
         Impl impl;
-        for (size_t row = 0; row < left_data.offsets_ptr->size(); ++row) {
+        size_t row_size = left_data.offsets_ptr->size();
+        if constexpr (LCONST) {
+            row_size = right_data.offsets_ptr->size();
+        }
+        for (size_t row = 0; row < row_size; ++row) {
             size_t count = 0;
             size_t left_off = (*left_data.offsets_ptr)[index_check_const(row, LCONST) - 1];
             size_t left_len = (*left_data.offsets_ptr)[index_check_const(row, LCONST)] - left_off;
@@ -214,8 +204,8 @@ private:
         }
         return true;
     }
-    template <bool LCONST, bool RCONST, typename T, typename... Ts,
-              std::enable_if_t<(sizeof...(Ts) > 0), int> = 0>
+    template <bool LCONST, bool RCONST, typename T, typename... Ts>
+        requires(sizeof...(Ts) > 0)
     static bool _execute_internal(ColumnArrayMutableData& dst,
                                   const ColumnArrayExecutionData& left_data,
                                   const ColumnArrayExecutionData& right_data) {

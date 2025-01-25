@@ -18,6 +18,7 @@
 // https://github.com/ClickHouse/ClickHouse/blob/master/src/Functions/array/arrayCumSum.cpp
 // and modified by Doris
 
+#include "common/status.h"
 #include "vec/columns/column.h"
 #include "vec/columns/column_array.h"
 #include "vec/core/types.h"
@@ -34,13 +35,18 @@ namespace doris::vectorized {
 
 // array_cum_sum([1, 2, 3, 4, 5]) -> [1, 3, 6, 10, 15]
 // array_cum_sum([1, NULL, 3, NULL, 5]) -> [1, NULL, 4, NULL, 9]
+template <bool enable_decimal256>
 class FunctionArrayCumSum : public IFunction {
 public:
     using NullMapType = PaddedPODArray<UInt8>;
 
-    static constexpr auto name = "array_cum_sum";
+    static constexpr auto name = enable_decimal256 ? "array_cum_sum_decimal256" : "array_cum_sum";
 
-    static FunctionPtr create() { return std::make_shared<FunctionArrayCumSum>(); }
+    static FunctionPtr create() {
+        return std::make_shared<FunctionArrayCumSum<enable_decimal256>>();
+    }
+
+    using DecimalResultType = std::conditional_t<enable_decimal256, Decimal256, Decimal128V3>;
 
     String get_name() const override { return name; }
 
@@ -70,27 +76,28 @@ public:
             return_type = std::make_shared<DataTypeInt128>();
         } else if (which.is_float32() || which.is_float64()) {
             return_type = std::make_shared<DataTypeFloat64>();
-        } else if (which.is_decimal128() && !which.is_decimal128i()) {
+        } else if (which.is_decimal128v2() && !which.is_decimal128v3()) {
             // decimalv2
-            return_type = std::make_shared<DataTypeDecimal<Decimal128>>(
-                    DataTypeDecimal<Decimal128>::max_precision(), scale);
+            return_type = std::make_shared<DataTypeDecimal<Decimal128V2>>(
+                    DataTypeDecimal<Decimal128V2>::max_precision(), scale);
         } else if (which.is_decimal()) {
-            return_type = std::make_shared<DataTypeDecimal<Decimal128I>>(
-                    DataTypeDecimal<Decimal128I>::max_precision(), scale);
+            return_type = std::make_shared<DataTypeDecimal<DecimalResultType>>(
+                    DataTypeDecimal<DecimalResultType>::max_precision(), scale);
         }
         if (return_type) {
             return std::make_shared<DataTypeArray>(make_nullable(return_type));
         } else {
-            LOG(FATAL) << "Function of " << name
-                       << " return type get wrong: and input argument is: "
-                       << arguments[0]->get_name();
+            throw doris::Exception(
+                    ErrorCode::INVALID_ARGUMENT,
+                    "Function of {}, return type get wrong: and input argument is: {}", name,
+                    arguments[0]->get_name());
         }
 
         return nullptr;
     }
 
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        const size_t result, size_t input_rows_count) override {
+                        const uint32_t result, size_t input_rows_count) const override {
         auto src_arg = block.get_by_position(arguments[0]);
         ColumnPtr src_column = src_arg.column->convert_to_full_column_if_const();
 
@@ -111,7 +118,7 @@ public:
         // get null map
         const ColumnNullable* src_nested_nullable_col =
                 check_and_get_column<ColumnNullable>(*src_nested_column);
-        src_nested_column = src_nested_nullable_col->get_nested_column_ptr();
+        src_nested_column = src_nested_nullable_col->get_nested_column_ptr().get();
         const NullMapType& src_null_map = src_nested_nullable_col->get_null_map_column().get_data();
 
         ColumnPtr res_nested_ptr;
@@ -133,7 +140,7 @@ public:
 private:
     bool _execute_by_type(DataTypePtr src_nested_type, const IColumn& src_column,
                           const ColumnArray::Offsets64& src_offsets,
-                          const NullMapType& src_null_map, ColumnPtr& res_nested_ptr) {
+                          const NullMapType& src_null_map, ColumnPtr& res_nested_ptr) const {
         bool res = false;
         WhichDataType which(remove_nullable(src_nested_type));
         if (which.is_uint8()) {
@@ -161,17 +168,20 @@ private:
             res = _execute_number<Float64, Float64>(src_column, src_offsets, src_null_map,
                                                     res_nested_ptr);
         } else if (which.is_decimal32()) {
-            res = _execute_number<Decimal32, Decimal128I>(src_column, src_offsets, src_null_map,
-                                                          res_nested_ptr);
+            res = _execute_number<Decimal32, DecimalResultType>(src_column, src_offsets,
+                                                                src_null_map, res_nested_ptr);
         } else if (which.is_decimal64()) {
-            res = _execute_number<Decimal64, Decimal128I>(src_column, src_offsets, src_null_map,
-                                                          res_nested_ptr);
-        } else if (which.is_decimal128i()) {
-            res = _execute_number<Decimal128I, Decimal128I>(src_column, src_offsets, src_null_map,
-                                                            res_nested_ptr);
-        } else if (which.is_decimal128()) {
-            res = _execute_number<Decimal128, Decimal128>(src_column, src_offsets, src_null_map,
-                                                          res_nested_ptr);
+            res = _execute_number<Decimal64, DecimalResultType>(src_column, src_offsets,
+                                                                src_null_map, res_nested_ptr);
+        } else if (which.is_decimal128v3()) {
+            res = _execute_number<Decimal128V3, DecimalResultType>(src_column, src_offsets,
+                                                                   src_null_map, res_nested_ptr);
+        } else if (which.is_decimal256()) {
+            res = _execute_number<Decimal256, DecimalResultType>(src_column, src_offsets,
+                                                                 src_null_map, res_nested_ptr);
+        } else if (which.is_decimal128v2()) {
+            res = _execute_number<Decimal128V2, Decimal128V2>(src_column, src_offsets, src_null_map,
+                                                              res_nested_ptr);
         }
 
         return res;
@@ -179,7 +189,7 @@ private:
 
     template <typename Element, typename Result>
     bool _execute_number(const IColumn& src_column, const ColumnArray::Offsets64& src_offsets,
-                         const NullMapType& src_null_map, ColumnPtr& res_nested_ptr) {
+                         const NullMapType& src_null_map, ColumnPtr& res_nested_ptr) const {
         using ColVecType = ColumnVectorOrDecimal<Element>;
         using ColVecResult = ColumnVectorOrDecimal<Result>;
 
@@ -217,7 +227,8 @@ private:
     template <typename Element, typename Result>
     void _compute_cum_sum(const PaddedPODArray<Element>& src_datas,
                           const ColumnArray::Offsets64& src_offsets,
-                          const NullMapType& src_null_map, PaddedPODArray<Result>& res_datas) {
+                          const NullMapType& src_null_map,
+                          PaddedPODArray<Result>& res_datas) const {
         size_t prev_offset = 0;
         for (auto cur_offset : src_offsets) {
             // [1, null, 2, 3] -> [1, null, 3, 6]
@@ -241,7 +252,8 @@ private:
 };
 
 void register_function_array_cum_sum(SimpleFunctionFactory& factory) {
-    factory.register_function<FunctionArrayCumSum>();
+    factory.register_function<FunctionArrayCumSum<false>>(FunctionArrayCumSum<false>::name);
+    factory.register_function<FunctionArrayCumSum<true>>(FunctionArrayCumSum<true>::name);
 }
 
 } // namespace doris::vectorized

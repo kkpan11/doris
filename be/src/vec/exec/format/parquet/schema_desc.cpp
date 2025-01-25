@@ -26,6 +26,7 @@
 #include "common/logging.h"
 #include "runtime/define_primitive_type.h"
 #include "util/slice.h"
+#include "util/string_util.h"
 
 namespace doris::vectorized {
 
@@ -62,6 +63,32 @@ static int num_children_node(const tparquet::SchemaElement& schema) {
     return schema.__isset.num_children ? schema.num_children : 0;
 }
 
+/**
+ * `repeated_parent_def_level` is the definition level of the first ancestor node whose repetition_type equals REPEATED.
+ * Empty array/map values are not stored in doris columns, so have to use `repeated_parent_def_level` to skip the
+ * empty or null values in ancestor node.
+ *
+ * For instance, considering an array of strings with 3 rows like the following:
+ * null, [], [a, b, c]
+ * We can store four elements in data column: null, a, b, c
+ * and the offsets column is: 1, 1, 4
+ * and the null map is: 1, 0, 0
+ * For the i-th row in array column: range from `offsets[i - 1]` until `offsets[i]` represents the elements in this row,
+ * so we can't store empty array/map values in doris data column.
+ * As a comparison, spark does not require `repeated_parent_def_level`,
+ * because the spark column stores empty array/map values , and use anther length column to indicate empty values.
+ * Please reference: https://github.com/apache/spark/blob/master/sql/core/src/main/java/org/apache/spark/sql/execution/datasources/parquet/ParquetColumnVector.java
+ *
+ * Furthermore, we can also avoid store null array/map values in doris data column.
+ * The same three rows as above, We can only store three elements in data column: a, b, c
+ * and the offsets column is: 0, 0, 3
+ * and the null map is: 1, 0, 0
+ *
+ * Inherit the repetition and definition level from parent node, if the parent node is repeated,
+ * we should set repeated_parent_def_level = definition_level, otherwise as repeated_parent_def_level.
+ * @param parent parent node
+ * @param repeated_parent_def_level the first ancestor node whose repetition_type equals REPEATED
+ */
 static void set_child_node_level(FieldSchema* parent, int16_t repeated_parent_def_level) {
     for (auto& child : parent->children) {
         child.repetition_level = parent->repetition_level;
@@ -110,6 +137,9 @@ Status FieldDescriptor::parse_from_thrift(const std::vector<tparquet::SchemaElem
             return Status::InvalidArgument("Duplicated field name: {}", _fields[i].name);
         }
         _name_to_field.emplace(_fields[i].name, &_fields[i]);
+        if (_fields[i].field_id != -1) {
+            _field_id_name_mapping.emplace(_fields[i].field_id, _fields[i].name);
+        }
     }
 
     if (_next_schema_pos != t_schemas.size()) {
@@ -118,6 +148,14 @@ Status FieldDescriptor::parse_from_thrift(const std::vector<tparquet::SchemaElem
     }
 
     return Status::OK();
+}
+
+const doris::Slice FieldDescriptor::get_column_name_from_field_id(int32_t id) const {
+    auto const it = _field_id_name_mapping.find(id);
+    if (it == _field_id_name_mapping.end()) {
+        return {};
+    }
+    return {it->second.data()};
 }
 
 Status FieldDescriptor::parse_node_field(const std::vector<tparquet::SchemaElement>& t_schemas,
@@ -140,13 +178,12 @@ Status FieldDescriptor::parse_node_field(const std::vector<tparquet::SchemaEleme
         auto child = &node_field->children[0];
         parse_physical_field(t_schema, false, child);
 
-        std::string lower_case_name;
-        transform(t_schema.name.begin(), t_schema.name.end(), lower_case_name.begin(), ::tolower);
-        node_field->name = lower_case_name;
+        node_field->name = to_lower(t_schema.name);
         node_field->type.type = TYPE_ARRAY;
         node_field->type.add_sub_type(child->type);
         node_field->is_nullable = false;
         _next_schema_pos = curr_pos + 1;
+        node_field->field_id = t_schema.__isset.field_id ? t_schema.field_id : -1;
     } else {
         bool is_optional = is_optional_node(t_schema);
         if (is_optional) {
@@ -160,24 +197,26 @@ Status FieldDescriptor::parse_node_field(const std::vector<tparquet::SchemaEleme
 
 void FieldDescriptor::parse_physical_field(const tparquet::SchemaElement& physical_schema,
                                            bool is_nullable, FieldSchema* physical_field) {
-    std::string lower_case_name = physical_schema.name;
-    transform(lower_case_name.begin(), lower_case_name.end(), lower_case_name.begin(), ::tolower);
-    physical_field->name = lower_case_name;
+    physical_field->name = to_lower(physical_schema.name);
     physical_field->parquet_schema = physical_schema;
     physical_field->is_nullable = is_nullable;
     physical_field->physical_type = physical_schema.type;
     _physical_fields.push_back(physical_field);
     physical_field->physical_column_index = _physical_fields.size() - 1;
-    physical_field->type = get_doris_type(physical_schema);
+    auto type = get_doris_type(physical_schema);
+    physical_field->type = type.first;
+    physical_field->is_type_compatibility = type.second;
+    physical_field->field_id = physical_schema.__isset.field_id ? physical_schema.field_id : -1;
 }
 
-TypeDescriptor FieldDescriptor::get_doris_type(const tparquet::SchemaElement& physical_schema) {
-    TypeDescriptor type;
-    type.type = INVALID_TYPE;
+std::pair<TypeDescriptor, bool> FieldDescriptor::get_doris_type(
+        const tparquet::SchemaElement& physical_schema) {
+    std::pair<TypeDescriptor, bool> ans = {INVALID_TYPE, false};
+    TypeDescriptor& type = ans.first;
     if (physical_schema.__isset.logicalType) {
-        type = convert_to_doris_type(physical_schema.logicalType);
+        ans = convert_to_doris_type(physical_schema.logicalType);
     } else if (physical_schema.__isset.converted_type) {
-        type = convert_to_doris_type(physical_schema);
+        ans = convert_to_doris_type(physical_schema);
     }
     // use physical type instead
     if (type.type == INVALID_TYPE) {
@@ -210,11 +249,80 @@ TypeDescriptor FieldDescriptor::get_doris_type(const tparquet::SchemaElement& ph
             break;
         }
     }
-    return type;
+    return ans;
 }
 
-TypeDescriptor FieldDescriptor::convert_to_doris_type(tparquet::LogicalType logicalType) {
-    TypeDescriptor type;
+// Copy from org.apache.iceberg.avro.AvroSchemaUtil#validAvroName
+static bool is_valid_avro_name(const std::string& name) {
+    int length = name.length();
+    char first = name[0];
+    if (!isalpha(first) && first != '_') {
+        return false;
+    }
+
+    for (int i = 1; i < length; i++) {
+        char character = name[i];
+        if (!isalpha(character) && !isdigit(character) && character != '_') {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Copy from org.apache.iceberg.avro.AvroSchemaUtil#sanitize
+static void sanitize_avro_name(std::ostringstream& buf, char character) {
+    if (isdigit(character)) {
+        buf << '_' << character;
+    } else {
+        std::stringstream ss;
+        ss << std::hex << (int)character;
+        std::string hex_str = ss.str();
+        buf << "_x" << doris::to_lower(hex_str);
+    }
+}
+
+// Copy from org.apache.iceberg.avro.AvroSchemaUtil#sanitize
+static std::string sanitize_avro_name(const std::string& name) {
+    std::ostringstream buf;
+    int length = name.length();
+    char first = name[0];
+    if (!isalpha(first) && first != '_') {
+        sanitize_avro_name(buf, first);
+    } else {
+        buf << first;
+    }
+
+    for (int i = 1; i < length; i++) {
+        char character = name[i];
+        if (!isalpha(character) && !isdigit(character) && character != '_') {
+            sanitize_avro_name(buf, character);
+        } else {
+            buf << character;
+        }
+    }
+    return buf.str();
+}
+
+void FieldDescriptor::iceberg_sanitize(const std::vector<std::string>& read_columns) {
+    for (const std::string& col : read_columns) {
+        if (!is_valid_avro_name(col)) {
+            std::string sanitize_name = sanitize_avro_name(col);
+            auto it = _name_to_field.find(sanitize_name);
+            if (it != _name_to_field.end()) {
+                FieldSchema* schema = const_cast<FieldSchema*>(it->second);
+                schema->name = col;
+                _name_to_field.emplace(col, schema);
+                _name_to_field.erase(sanitize_name);
+            }
+        }
+    }
+}
+
+std::pair<TypeDescriptor, bool> FieldDescriptor::convert_to_doris_type(
+        tparquet::LogicalType logicalType) {
+    std::pair<TypeDescriptor, bool> ans = {INVALID_TYPE, false};
+    TypeDescriptor& type = ans.first;
+    bool& is_type_compatibility = ans.second;
     if (logicalType.__isset.STRING) {
         type = TypeDescriptor(TYPE_STRING);
     } else if (logicalType.__isset.DECIMAL) {
@@ -224,16 +332,25 @@ TypeDescriptor FieldDescriptor::convert_to_doris_type(tparquet::LogicalType logi
         type = TypeDescriptor(TYPE_DATEV2);
     } else if (logicalType.__isset.INTEGER) {
         if (logicalType.INTEGER.isSigned) {
-            if (logicalType.INTEGER.bitWidth <= 32) {
+            if (logicalType.INTEGER.bitWidth <= 8) {
+                type = TypeDescriptor(TYPE_TINYINT);
+            } else if (logicalType.INTEGER.bitWidth <= 16) {
+                type = TypeDescriptor(TYPE_SMALLINT);
+            } else if (logicalType.INTEGER.bitWidth <= 32) {
                 type = TypeDescriptor(TYPE_INT);
             } else {
                 type = TypeDescriptor(TYPE_BIGINT);
             }
         } else {
-            if (logicalType.INTEGER.bitWidth <= 16) {
+            is_type_compatibility = true;
+            if (logicalType.INTEGER.bitWidth <= 8) {
+                type = TypeDescriptor(TYPE_SMALLINT);
+            } else if (logicalType.INTEGER.bitWidth <= 16) {
                 type = TypeDescriptor(TYPE_INT);
-            } else {
+            } else if (logicalType.INTEGER.bitWidth <= 32) {
                 type = TypeDescriptor(TYPE_BIGINT);
+            } else {
+                type = TypeDescriptor(TYPE_LARGEINT);
             }
         }
     } else if (logicalType.__isset.TIME) {
@@ -255,12 +372,14 @@ TypeDescriptor FieldDescriptor::convert_to_doris_type(tparquet::LogicalType logi
     } else {
         type = TypeDescriptor(INVALID_TYPE);
     }
-    return type;
+    return ans;
 }
 
-TypeDescriptor FieldDescriptor::convert_to_doris_type(
+std::pair<TypeDescriptor, bool> FieldDescriptor::convert_to_doris_type(
         const tparquet::SchemaElement& physical_schema) {
-    TypeDescriptor type;
+    std::pair<TypeDescriptor, bool> ans = {INVALID_TYPE, false};
+    TypeDescriptor& type = ans.first;
+    bool& is_type_compatibility = ans.second;
     switch (physical_schema.converted_type) {
     case tparquet::ConvertedType::type::UTF8:
         type = TypeDescriptor(TYPE_STRING);
@@ -289,28 +408,33 @@ TypeDescriptor FieldDescriptor::convert_to_doris_type(
         type = TypeDescriptor(TYPE_TINYINT);
         break;
     case tparquet::ConvertedType::type::UINT_8:
+        is_type_compatibility = true;
         [[fallthrough]];
     case tparquet::ConvertedType::type::INT_16:
         type = TypeDescriptor(TYPE_SMALLINT);
         break;
     case tparquet::ConvertedType::type::UINT_16:
+        is_type_compatibility = true;
         [[fallthrough]];
     case tparquet::ConvertedType::type::INT_32:
         type = TypeDescriptor(TYPE_INT);
         break;
     case tparquet::ConvertedType::type::UINT_32:
-        [[fallthrough]];
-    case tparquet::ConvertedType::type::UINT_64:
+        is_type_compatibility = true;
         [[fallthrough]];
     case tparquet::ConvertedType::type::INT_64:
         type = TypeDescriptor(TYPE_BIGINT);
+        break;
+    case tparquet::ConvertedType::type::UINT_64:
+        is_type_compatibility = true;
+        type = TypeDescriptor(TYPE_LARGEINT);
         break;
     default:
         LOG(WARNING) << "Not supported parquet ConvertedType: " << physical_schema.converted_type;
         type = TypeDescriptor(INVALID_TYPE);
         break;
     }
-    return type;
+    return ans;
 }
 
 Status FieldDescriptor::parse_group_field(const std::vector<tparquet::SchemaElement>& t_schemas,
@@ -350,10 +474,11 @@ Status FieldDescriptor::parse_group_field(const std::vector<tparquet::SchemaElem
         // produce a non-null list<struct>
         RETURN_IF_ERROR(parse_struct_field(t_schemas, curr_pos, struct_field));
 
-        group_field->name = group_schema.name;
+        group_field->name = to_lower(group_schema.name);
         group_field->type.type = TYPE_ARRAY;
         group_field->type.add_sub_type(struct_field->type);
         group_field->is_nullable = false;
+        group_field->field_id = group_schema.__isset.field_id ? group_schema.field_id : -1;
     } else {
         RETURN_IF_ERROR(parse_struct_field(t_schemas, curr_pos, group_field));
     }
@@ -418,10 +543,11 @@ Status FieldDescriptor::parse_list_field(const std::vector<tparquet::SchemaEleme
         _next_schema_pos = curr_pos + 2;
     }
 
-    list_field->name = first_level.name;
+    list_field->name = to_lower(first_level.name);
     list_field->type.type = TYPE_ARRAY;
     list_field->type.add_sub_type(list_field->children[0].type);
     list_field->is_nullable = is_optional;
+    list_field->field_id = first_level.__isset.field_id ? first_level.field_id : -1;
 
     return Status::OK();
 }
@@ -454,7 +580,7 @@ Status FieldDescriptor::parse_map_field(const std::vector<tparquet::SchemaElemen
     }
     auto& map_key = t_schemas[curr_pos + 2];
     if (!is_required_node(map_key)) {
-        return Status::InvalidArgument("the third level(map key) in map group must be required");
+        LOG(WARNING) << "Filed " << map_schema.name << " is map type, but with nullable key column";
     }
 
     if (map_key_value.num_children == 1) {
@@ -475,16 +601,18 @@ Status FieldDescriptor::parse_map_field(const std::vector<tparquet::SchemaElemen
     map_field->definition_level++;
 
     map_field->children.resize(1);
-    set_child_node_level(map_field, map_field->repeated_parent_def_level);
+    // map is a repeated node, we should set the `repeated_parent_def_level` of its children as `definition_level`
+    set_child_node_level(map_field, map_field->definition_level);
     auto map_kv_field = &map_field->children[0];
     // produce MAP<STRUCT<KEY, VALUE>>
     RETURN_IF_ERROR(parse_struct_field(t_schemas, curr_pos + 1, map_kv_field));
 
-    map_field->name = map_schema.name;
+    map_field->name = to_lower(map_schema.name);
     map_field->type.type = TYPE_MAP;
     map_field->type.add_sub_type(map_kv_field->type.children[0]);
     map_field->type.add_sub_type(map_kv_field->type.children[1]);
     map_field->is_nullable = is_optional;
+    map_field->field_id = map_schema.__isset.field_id ? map_schema.field_id : -1;
 
     return Status::OK();
 }
@@ -504,12 +632,13 @@ Status FieldDescriptor::parse_struct_field(const std::vector<tparquet::SchemaEle
     for (int i = 0; i < num_children; ++i) {
         RETURN_IF_ERROR(parse_node_field(t_schemas, _next_schema_pos, &struct_field->children[i]));
     }
-    struct_field->name = struct_schema.name;
+    struct_field->name = to_lower(struct_schema.name);
     struct_field->is_nullable = is_optional;
     struct_field->type.type = TYPE_STRUCT;
+    struct_field->field_id = struct_schema.__isset.field_id ? struct_schema.field_id : -1;
     for (int i = 0; i < num_children; ++i) {
         struct_field->type.add_sub_type(struct_field->children[i].type,
-                                        struct_field->children[0].name);
+                                        struct_field->children[i].name);
     }
     return Status::OK();
 }

@@ -28,12 +28,17 @@ static int kNumShards = StoragePageCache::kDefaultNumShards;
 
 class StoragePageCacheTest : public testing::Test {
 public:
-    StoragePageCacheTest() {}
-    virtual ~StoragePageCacheTest() {}
+    StoragePageCacheTest() {
+        mem_tracker = MemTrackerLimiter::create_shared(MemTrackerLimiter::Type::GLOBAL,
+                                                       "StoragePageCacheTest");
+    }
+    ~StoragePageCacheTest() override = default;
+
+    std::shared_ptr<MemTrackerLimiter> mem_tracker;
 };
 
 // All cache space is allocated to data pages
-TEST(StoragePageCacheTest, data_page_only) {
+TEST_F(StoragePageCacheTest, data_page_only) {
     StoragePageCache cache(kNumShards * 2048, 0, 0, kNumShards);
 
     StoragePageCache::CacheKey key("abc", 0, 0);
@@ -44,7 +49,7 @@ TEST(StoragePageCacheTest, data_page_only) {
     {
         // insert normal page
         PageCacheHandle handle;
-        DataPage* data = new DataPage(1024);
+        auto* data = new DataPage(1024, true, page_type);
         cache.insert(key, data, &handle, page_type, false);
 
         EXPECT_EQ(handle.data().data, data->data());
@@ -57,7 +62,7 @@ TEST(StoragePageCacheTest, data_page_only) {
     {
         // insert in_memory page
         PageCacheHandle handle;
-        DataPage* data = new DataPage(1024);
+        auto* data = new DataPage(1024, true, page_type);
         cache.insert(memory_key, data, &handle, page_type, true);
 
         EXPECT_EQ(handle.data().data, data->data());
@@ -66,11 +71,12 @@ TEST(StoragePageCacheTest, data_page_only) {
         EXPECT_TRUE(found);
     }
 
-    // put too many page to eliminate first page
+    // Page Cache is LRU-K, K=2.
+    // Put too many page, after cache is full, no key is inserted twice and no evict occurs.
     for (int i = 0; i < 10 * kNumShards; ++i) {
         StoragePageCache::CacheKey key("bcd", 0, i);
         PageCacheHandle handle;
-        DataPage* data = new DataPage(1024);
+        auto* data = new DataPage(1024, true, page_type);
         cache.insert(key, data, &handle, page_type, false);
     }
 
@@ -90,6 +96,27 @@ TEST(StoragePageCacheTest, data_page_only) {
         EXPECT_FALSE(found);
     }
 
+    // After cache is full, no key is inserted twice and no evict occurs.
+    {
+        PageCacheHandle handle;
+        auto found = cache.lookup(key, &handle, page_type);
+        EXPECT_TRUE(found);
+    }
+
+    // put too many page twice to eliminate first page
+    for (int i = 0; i < 10 * kNumShards; ++i) {
+        StoragePageCache::CacheKey key("bcde", 0, i);
+        PageCacheHandle handle;
+        auto* data = new DataPage(1024, true, page_type);
+        cache.insert(key, data, &handle, page_type, false);
+        auto found = cache.lookup(key, &handle, page_type); // after handle destruct, free data.
+        EXPECT_FALSE(found);
+        data = new DataPage(1024, true, page_type);
+        cache.insert(key, data, &handle, page_type, false);
+        found = cache.lookup(key, &handle, page_type);
+        EXPECT_TRUE(found);
+    }
+
     // cache miss for eliminated key
     {
         PageCacheHandle handle;
@@ -99,7 +126,7 @@ TEST(StoragePageCacheTest, data_page_only) {
 }
 
 // All cache space is allocated to index pages
-TEST(StoragePageCacheTest, index_page_only) {
+TEST_F(StoragePageCacheTest, index_page_only) {
     StoragePageCache cache(kNumShards * 2048, 100, 0, kNumShards);
 
     StoragePageCache::CacheKey key("abc", 0, 0);
@@ -110,7 +137,7 @@ TEST(StoragePageCacheTest, index_page_only) {
     {
         // insert normal page
         PageCacheHandle handle;
-        DataPage* data = new DataPage(1024);
+        auto* data = new DataPage(1024, true, page_type);
         cache.insert(key, data, &handle, page_type, false);
 
         EXPECT_EQ(handle.data().data, data->data());
@@ -123,7 +150,7 @@ TEST(StoragePageCacheTest, index_page_only) {
     {
         // insert in_memory page
         PageCacheHandle handle;
-        DataPage* data = new DataPage(1024);
+        auto* data = new DataPage(1024, true, page_type);
         cache.insert(memory_key, data, &handle, page_type, true);
 
         EXPECT_EQ(handle.data().data, data->data());
@@ -136,7 +163,7 @@ TEST(StoragePageCacheTest, index_page_only) {
     for (int i = 0; i < 10 * kNumShards; ++i) {
         StoragePageCache::CacheKey key("bcd", 0, i);
         PageCacheHandle handle;
-        DataPage* data = new DataPage(1024);
+        auto* data = new DataPage(1024, true, page_type);
         cache.insert(key, data, &handle, page_type, false);
     }
 
@@ -165,7 +192,7 @@ TEST(StoragePageCacheTest, index_page_only) {
 }
 
 // Cache space is allocated by index_page_cache_ratio
-TEST(StoragePageCacheTest, mixed_pages) {
+TEST_F(StoragePageCacheTest, mixed_pages) {
     StoragePageCache cache(kNumShards * 2048, 10, 0, kNumShards);
 
     StoragePageCache::CacheKey data_key("data", 0, 0);
@@ -179,8 +206,8 @@ TEST(StoragePageCacheTest, mixed_pages) {
     {
         // insert both normal pages
         PageCacheHandle data_handle, index_handle;
-        DataPage* data = new DataPage(1024);
-        DataPage* index = new DataPage(1024);
+        auto* data = new DataPage(1024, true, page_type_data);
+        auto* index = new DataPage(1024, true, page_type_index);
         cache.insert(data_key, data, &data_handle, page_type_data, false);
         cache.insert(index_key, index, &index_handle, page_type_index, false);
 
@@ -198,8 +225,8 @@ TEST(StoragePageCacheTest, mixed_pages) {
     {
         // insert both in_memory pages
         PageCacheHandle data_handle, index_handle;
-        DataPage* data = new DataPage(1024);
-        DataPage* index = new DataPage(1024);
+        auto* data = new DataPage(1024, true, page_type_data);
+        auto* index = new DataPage(1024, true, page_type_index);
         cache.insert(data_key_mem, data, &data_handle, page_type_data, true);
         cache.insert(index_key_mem, index, &index_handle, page_type_index, true);
 
@@ -216,8 +243,8 @@ TEST(StoragePageCacheTest, mixed_pages) {
     for (int i = 0; i < 10 * kNumShards; ++i) {
         StoragePageCache::CacheKey key("bcd", 0, i);
         PageCacheHandle handle;
-        std::unique_ptr<DataPage> data = std::make_unique<DataPage>(1024);
-        std::unique_ptr<DataPage> index = std::make_unique<DataPage>(1024);
+        std::unique_ptr<DataPage> data = std::make_unique<DataPage>(1024, true, page_type_data);
+        std::unique_ptr<DataPage> index = std::make_unique<DataPage>(1024, true, page_type_index);
         cache.insert(key, data.release(), &handle, page_type_data, false);
         cache.insert(key, index.release(), &handle, page_type_index, false);
     }
@@ -237,8 +264,8 @@ TEST(StoragePageCacheTest, mixed_pages) {
         PageCacheHandle data_handle, index_handle;
         StoragePageCache::CacheKey miss_key_data("data_miss", 0, 1);
         StoragePageCache::CacheKey miss_key_index("index_miss", 0, 1);
-        std::unique_ptr<DataPage> data = std::make_unique<DataPage>(1024);
-        std::unique_ptr<DataPage> index = std::make_unique<DataPage>(1024);
+        std::unique_ptr<DataPage> data = std::make_unique<DataPage>(1024, true, page_type_data);
+        std::unique_ptr<DataPage> index = std::make_unique<DataPage>(1024, true, page_type_index);
         cache.insert(miss_key_data, data.release(), &data_handle, page_type_data, false);
         cache.insert(miss_key_index, index.release(), &index_handle, page_type_index, false);
 
@@ -248,12 +275,13 @@ TEST(StoragePageCacheTest, mixed_pages) {
         EXPECT_FALSE(found_index);
     }
 
-    // cache miss for eliminated key
     {
         PageCacheHandle data_handle, index_handle;
         auto found_data = cache.lookup(data_key, &data_handle, page_type_data);
         auto found_index = cache.lookup(index_key, &index_handle, page_type_index);
-        EXPECT_FALSE(found_data);
+        // after cache is full, no key is inserted twice and no evict occurs
+        EXPECT_TRUE(found_data);
+        // cache miss for eliminated key
         EXPECT_FALSE(found_index);
     }
 }

@@ -35,6 +35,7 @@
 #include "vec/io/io_helper.h"
 
 namespace doris {
+#include "common/compile_check_begin.h"
 namespace vectorized {
 class Arena;
 class BufferReadable;
@@ -50,11 +51,14 @@ namespace doris::vectorized {
 template <typename T>
 struct AggregateFunctionAvgWeightedData {
     void add(const T& data_val, double weight_val) {
+#ifdef __clang__
+#pragma clang fp reassociate(on)
+#endif
         if constexpr (IsDecimalV2<T>) {
             DecimalV2Value value = binary_cast<Int128, DecimalV2Value>(data_val);
             data_sum = data_sum + (double(value) * weight_val);
         } else {
-            data_sum = data_sum + (data_val * weight_val);
+            data_sum = data_sum + (double(data_val) * weight_val);
         }
         weight_sum = weight_sum + weight_val;
     }
@@ -70,6 +74,9 @@ struct AggregateFunctionAvgWeightedData {
     }
 
     void merge(const AggregateFunctionAvgWeightedData& rhs) {
+#ifdef __clang__
+#pragma clang fp reassociate(on)
+#endif
         data_sum = data_sum + rhs.data_sum;
         weight_sum = weight_sum + rhs.weight_sum;
     }
@@ -79,7 +86,7 @@ struct AggregateFunctionAvgWeightedData {
         weight_sum = 0.0;
     }
 
-    double get() const { return weight_sum ? data_sum / weight_sum : std::nan(""); }
+    double get() const { return data_sum / weight_sum; }
 
     double data_sum = 0.0;
     double weight_sum = 0.0;
@@ -100,10 +107,12 @@ public:
 
     DataTypePtr get_return_type() const override { return std::make_shared<DataTypeFloat64>(); }
 
-    void add(AggregateDataPtr __restrict place, const IColumn** columns, size_t row_num,
+    void add(AggregateDataPtr __restrict place, const IColumn** columns, ssize_t row_num,
              Arena*) const override {
-        const auto& column = assert_cast<const ColVecType&>(*columns[0]);
-        const auto& weight = assert_cast<const ColumnVector<Float64>&>(*columns[1]);
+        const auto& column =
+                assert_cast<const ColVecType&, TypeCheckOnRelease::DISABLE>(*columns[0]);
+        const auto& weight =
+                assert_cast<const ColumnFloat64&, TypeCheckOnRelease::DISABLE>(*columns[1]);
         this->data(place).add(column.get_data()[row_num], weight.get_element(row_num));
     }
 
@@ -124,9 +133,11 @@ public:
     }
 
     void insert_result_into(ConstAggregateDataPtr __restrict place, IColumn& to) const override {
-        auto& column = assert_cast<ColumnVector<Float64>&>(to);
+        auto& column = assert_cast<ColumnFloat64&>(to);
         column.get_data().push_back(this->data(place).get());
     }
 };
 
 } // namespace doris::vectorized
+
+#include "common/compile_check_end.h"

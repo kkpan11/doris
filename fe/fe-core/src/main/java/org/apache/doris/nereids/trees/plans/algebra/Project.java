@@ -23,14 +23,16 @@ import org.apache.doris.nereids.trees.expressions.ExprId;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
 import org.apache.doris.nereids.trees.expressions.Slot;
+import org.apache.doris.nereids.trees.expressions.functions.NoneMovableFunction;
+import org.apache.doris.nereids.util.ExpressionUtils;
+import org.apache.doris.nereids.util.PlanUtils;
 
-import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Collectors;
 
 /**
  * Common interface for logical/physical project.
@@ -50,16 +52,7 @@ public interface Project {
      * </pre>
      */
     default Map<Slot, Expression> getAliasToProducer() {
-        return getProjects()
-                .stream()
-                .filter(Alias.class::isInstance)
-                .collect(
-                        Collectors.toMap(
-                                NamedExpression::toSlot,
-                                // Avoid cast to alias, retrieving the first child expression.
-                                alias -> alias.child(0)
-                        )
-                );
+        return ExpressionUtils.generateReplaceMap(getProjects());
     }
 
     /**
@@ -71,49 +64,70 @@ public interface Project {
      * @return project list for merged project
      */
     default List<NamedExpression> mergeProjections(Project childProject) {
-        Map<Expression, Alias> replaceMap = childProject.getProjects().stream()
-                .filter(e -> e instanceof Alias)
-                .collect(Collectors.toMap(
-                        NamedExpression::toSlot,
-                        e -> (Alias) e));
-        return getProjects().stream()
-                .map(expr -> {
-                    if (expr instanceof Alias) {
-                        Alias alias = (Alias) expr;
-                        Expression insideExpr = alias.child();
-                        Expression newInsideExpr = insideExpr.rewriteUp(e -> {
-                            Alias getAlias = replaceMap.get(e);
-                            return getAlias == null ? e : getAlias.child();
-                        });
-                        return newInsideExpr == insideExpr ? expr : alias.withChildren(ImmutableList.of(newInsideExpr));
-                    } else {
-                        Alias getAlias = replaceMap.get(expr);
-                        return getAlias == null ? expr : getAlias;
-                    }
-                })
-                .collect(ImmutableList.toImmutableList());
+        List<NamedExpression> projects = new ArrayList<>();
+        projects.addAll(PlanUtils.mergeProjections(childProject.getProjects(), getProjects()));
+        for (NamedExpression expression : childProject.getProjects()) {
+            // keep NoneMovableFunction for later use
+            if (expression.containsType(NoneMovableFunction.class)) {
+                projects.add(expression);
+            }
+        }
+        return projects;
     }
 
     /**
      * find projects, if not found the slot, then throw AnalysisException
      */
-    static List<NamedExpression> findProject(
-            Collection<? extends Slot> slotReferences,
-            List<NamedExpression> projects) throws AnalysisException {
+    static List<? extends Expression> findProject(
+            Collection<? extends Expression> expressions,
+            List<? extends NamedExpression> projects) throws AnalysisException {
         Map<ExprId, NamedExpression> exprIdToProject = projects.stream()
-                .collect(ImmutableMap.toImmutableMap(p -> p.getExprId(), p -> p));
+                .collect(ImmutableMap.toImmutableMap(NamedExpression::getExprId, p -> p));
 
-        return slotReferences.stream()
-                .map(slot -> {
-                    ExprId exprId = slot.getExprId();
-                    NamedExpression project = exprIdToProject.get(exprId);
-                    if (project == null) {
-                        throw new AnalysisException("ExprId " + slot.getExprId() + " no exists in " + projects);
+        return ExpressionUtils.rewriteDownShortCircuit(expressions,
+                expr -> {
+                    if (expr instanceof Slot) {
+                        Slot slot = (Slot) expr;
+                        ExprId exprId = slot.getExprId();
+                        NamedExpression project = exprIdToProject.get(exprId);
+                        if (project == null) {
+                            throw new AnalysisException("ExprId " + slot.getExprId() + " no exists in " + projects);
+                        }
+                        return project;
                     }
-                    return project;
-                })
-                .collect(ImmutableList.toImmutableList());
+                    return expr;
+                });
+    }
+
+    /** isAllSlots */
+    default boolean isAllSlots() {
+        for (NamedExpression project : getProjects()) {
+            if (!project.isSlot()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * project(A as B) is eventually slot project, where A is a slot
+     */
+    default boolean isEventuallyAllSlots() {
+        for (NamedExpression project : getProjects()) {
+            if (!project.isSlot() && !(project instanceof Alias && project.child(0) instanceof Slot)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** containsNoneMovableFunction */
+    default boolean containsNoneMovableFunction() {
+        for (NamedExpression expression : getProjects()) {
+            if (expression.containsType(NoneMovableFunction.class)) {
+                return true;
+            }
+        }
+        return false;
     }
 }
-
-

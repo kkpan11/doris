@@ -50,11 +50,14 @@ public class TableAddOrDropInvertedIndicesInfo implements Writable {
     private boolean isDropInvertedIndex;
     @SerializedName(value = "jobId")
     private long jobId;
+    @SerializedName(value = "rawSql")
+    private String rawSql;
 
-    public TableAddOrDropInvertedIndicesInfo(long dbId, long tableId,
+    public TableAddOrDropInvertedIndicesInfo(String rawSql, long dbId, long tableId,
             Map<Long, LinkedList<Column>> indexSchemaMap, List<Index> indexes,
             List<Index> alterInvertedIndexes, boolean isDropInvertedIndex,
             long jobId) {
+        this.rawSql = rawSql;
         this.dbId = dbId;
         this.tableId = tableId;
         this.indexSchemaMap = indexSchemaMap;
@@ -92,6 +95,10 @@ public class TableAddOrDropInvertedIndicesInfo implements Writable {
         return jobId;
     }
 
+    public String toJson() {
+        return GsonUtils.GSON.toJson(this);
+    }
+
     @Override
     public void write(DataOutput out) throws IOException {
         Text.writeString(out, GsonUtils.GSON.toJson(this));
@@ -113,7 +120,7 @@ public class TableAddOrDropInvertedIndicesInfo implements Writable {
 
         TableAddOrDropInvertedIndicesInfo info = (TableAddOrDropInvertedIndicesInfo) obj;
 
-        return (dbId == info.dbId && tableId == tableId
+        return (dbId == info.dbId && tableId == info.tableId
                 && indexSchemaMap.equals(info.indexSchemaMap)
                 && indexes.equals(info.indexes)
                 && alterInvertedIndexes.equals(info.alterInvertedIndexes)

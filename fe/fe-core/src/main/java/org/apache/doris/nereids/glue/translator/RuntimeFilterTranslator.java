@@ -22,26 +22,27 @@ import org.apache.doris.analysis.Expr;
 import org.apache.doris.analysis.SlotId;
 import org.apache.doris.analysis.SlotRef;
 import org.apache.doris.analysis.TupleId;
-import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.processor.post.RuntimeFilterContext;
-import org.apache.doris.nereids.trees.expressions.ExprId;
+import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.expressions.SlotReference;
-import org.apache.doris.nereids.trees.plans.ObjectId;
-import org.apache.doris.nereids.trees.plans.physical.AbstractPhysicalJoin;
 import org.apache.doris.nereids.trees.plans.physical.RuntimeFilter;
+import org.apache.doris.planner.CTEScanNode;
+import org.apache.doris.planner.DataStreamSink;
 import org.apache.doris.planner.HashJoinNode;
 import org.apache.doris.planner.HashJoinNode.DistributionMode;
 import org.apache.doris.planner.JoinNodeBase;
 import org.apache.doris.planner.RuntimeFilter.RuntimeFilterTarget;
 import org.apache.doris.planner.ScanNode;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.statistics.StatisticalType;
 import org.apache.doris.thrift.TRuntimeFilterType;
 
+import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 
-import java.util.Collections;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -54,15 +55,10 @@ public class RuntimeFilterTranslator {
 
     public RuntimeFilterTranslator(RuntimeFilterContext context) {
         this.context = context;
-        context.generatePhysicalHashJoinToRuntimeFilter();
     }
 
-    public List<RuntimeFilter> getRuntimeFilterOfHashJoinNode(AbstractPhysicalJoin join) {
-        return context.getRuntimeFilterOnHashJoinNode(join);
-    }
-
-    public List<Slot> getTargetOnScanNode(ObjectId id) {
-        return context.getTargetOnOlapScanNodeMap().getOrDefault(id, Collections.emptyList());
+    public RuntimeFilterContext getContext() {
+        return context;
     }
 
     /**
@@ -76,21 +72,15 @@ public class RuntimeFilterTranslator {
     }
 
     private class RuntimeFilterExpressionTranslator extends ExpressionTranslator {
-        Map<ExprId, SlotRef> nereidsExprIdToSlotRef;
+        SlotRef targetSlotRef;
 
-        RuntimeFilterExpressionTranslator(Map<ExprId, SlotRef> nereidsExprIdToSlotRef) {
-            this.nereidsExprIdToSlotRef = nereidsExprIdToSlotRef;
+        RuntimeFilterExpressionTranslator(SlotRef targetSlotRef) {
+            this.targetSlotRef = targetSlotRef;
         }
 
         @Override
         public Expr visitSlotReference(SlotReference slotReference, PlanTranslatorContext context) {
-            slotReference = context.getRuntimeTranslator().get()
-                    .context.getCorrespondingOlapSlotReference(slotReference);
-            SlotRef slot = nereidsExprIdToSlotRef.get(slotReference.getExprId());
-            if (slot == null) {
-                throw new AnalysisException("cannot find SlotRef for " + slotReference);
-            }
-            return slot;
+            return targetSlotRef;
         }
     }
 
@@ -101,63 +91,89 @@ public class RuntimeFilterTranslator {
      * @param ctx plan translator context
      */
     public void createLegacyRuntimeFilter(RuntimeFilter filter, JoinNodeBase node, PlanTranslatorContext ctx) {
-        Expr target = context.getExprIdToOlapScanNodeSlotRef().get(filter.getTargetExpr().getExprId());
-        if (target == null) {
-            context.setTargetNullCount();
+        if (ConnectContext.get() != null
+                && ConnectContext.get().getSessionVariable()
+                .getIgnoredRuntimeFilterIds().contains(filter.getId().asInt())) {
             return;
         }
-        Expr targetExpr;
-        if (filter.getType() == TRuntimeFilterType.BITMAP) {
-            if (filter.getTargetExpression().equals(filter.getTargetExpr())) {
-                targetExpr = target;
-            } else {
-                RuntimeFilterExpressionTranslator translator = new RuntimeFilterExpressionTranslator(
-                        context.getExprIdToOlapScanNodeSlotRef());
-                targetExpr = filter.getTargetExpression().accept(translator, ctx);
-            }
-        } else {
-            targetExpr = target;
-        }
-
         Expr src = ExpressionTranslator.translate(filter.getSrcExpr(), ctx);
-        SlotRef targetSlot = target.getSrcSlotRef();
-        TupleId targetTupleId = targetSlot.getDesc().getParent().getId();
-        SlotId targetSlotId = targetSlot.getSlotId();
-        // adjust data type
-        if (!src.getType().equals(target.getType()) && filter.getType() != TRuntimeFilterType.BITMAP) {
-            targetExpr = new CastExpr(src.getType(), targetExpr);
+        List<Expr> targetExprList = new ArrayList<>();
+        List<Map<TupleId, List<SlotId>>> targetTupleIdMapList = new ArrayList<>();
+        List<ScanNode> scanNodeList = new ArrayList<>();
+        boolean hasInvalidTarget = false;
+        for (int i = 0; i < filter.getTargetExpressions().size(); i++) {
+            Slot curTargetSlot = filter.getTargetSlots().get(i);
+            Expression curTargetExpression = filter.getTargetExpressions().get(i);
+            SlotRef targetSlotRef = context.getExprIdToOlapScanNodeSlotRef().get(curTargetSlot.getExprId());
+            if (targetSlotRef == null) {
+                context.setTargetNullCount();
+                hasInvalidTarget = true;
+                break;
+            }
+            ScanNode scanNode = context.getScanNodeOfLegacyRuntimeFilterTarget().get(curTargetSlot);
+            Expr targetExpr;
+            if (curTargetSlot.equals(curTargetExpression)) {
+                targetExpr = targetSlotRef;
+            } else {
+                // map nereids target slot to original planner slot
+                Preconditions.checkArgument(curTargetExpression.getInputSlots().size() == 1,
+                        "target expression is invalid, input slot num > 1; filter :" + filter);
+                Slot slotInTargetExpression = curTargetExpression.getInputSlots().iterator().next();
+                Preconditions.checkArgument(slotInTargetExpression.equals(curTargetSlot)
+                        || curTargetSlot.equals(context.getAliasTransferMap().get(slotInTargetExpression).second));
+                RuntimeFilterExpressionTranslator translator = new RuntimeFilterExpressionTranslator(targetSlotRef);
+                targetExpr = curTargetExpression.accept(translator, ctx);
+            }
+
+            // adjust data type
+            if (!src.getType().equals(targetExpr.getType()) && filter.getType() != TRuntimeFilterType.BITMAP) {
+                targetExpr = new CastExpr(src.getType(), targetExpr);
+            }
+            SlotRef targetSlot = targetSlotRef.getSrcSlotRef();
+            TupleId targetTupleId = targetSlot.getDesc().getParent().getId();
+            SlotId targetSlotId = targetSlot.getSlotId();
+            scanNodeList.add(scanNode);
+            targetExprList.add(targetExpr);
+            targetTupleIdMapList.add(ImmutableMap.of(targetTupleId, ImmutableList.of(targetSlotId)));
         }
-        org.apache.doris.planner.RuntimeFilter origFilter
-                = org.apache.doris.planner.RuntimeFilter.fromNereidsRuntimeFilter(
-                filter.getId(), node, src, filter.getExprOrder(), targetExpr,
-                ImmutableMap.of(targetTupleId, ImmutableList.of(targetSlotId)),
-                filter.getType(), context.getLimits(), filter.getBuildSideNdv());
-        if (node instanceof HashJoinNode) {
-            origFilter.setIsBroadcast(((HashJoinNode) node).getDistributionMode() == DistributionMode.BROADCAST);
-        } else {
-            //bitmap rf requires isBroadCast=false, it always requires merge filter
-            origFilter.setIsBroadcast(false);
+        if (!hasInvalidTarget) {
+            org.apache.doris.planner.RuntimeFilter origFilter
+                    = org.apache.doris.planner.RuntimeFilter.fromNereidsRuntimeFilter(
+                    filter, node, src, targetExprList,
+                    targetTupleIdMapList, context.getLimits());
+            if (node instanceof HashJoinNode) {
+                origFilter.setIsBroadcast(((HashJoinNode) node).getDistributionMode() == DistributionMode.BROADCAST);
+                origFilter.setSingleEq(((HashJoinNode) node).getEqJoinConjuncts().size());
+            } else {
+                // nest loop join
+                origFilter.setIsBroadcast(true);
+            }
+            boolean isLocalTarget = scanNodeList.stream().allMatch(e ->
+                    !(e instanceof CTEScanNode) && e.getFragmentId().equals(node.getFragmentId()));
+            for (int i = 0; i < targetExprList.size(); i++) {
+                ScanNode scanNode = scanNodeList.get(i);
+                Expr targetExpr = targetExprList.get(i);
+                origFilter.addTarget(new RuntimeFilterTarget(
+                        scanNode, targetExpr, true, isLocalTarget));
+            }
+            origFilter.setBitmapFilterNotIn(filter.isBitmapFilterNotIn());
+            origFilter.setBloomFilterSizeCalculatedByNdv(filter.isBloomFilterSizeCalculatedByNdv());
+            org.apache.doris.planner.RuntimeFilter finalizedFilter = finalize(origFilter);
+            scanNodeList.stream().filter(e -> e.getStatisticalType() == StatisticalType.CTE_SCAN_NODE)
+                                 .forEach(f -> {
+                                     DataStreamSink sink = context.getPlanNodeIdToCTEDataSinkMap().get(f.getId());
+                                     if (sink != null) {
+                                         sink.addRuntimeFilter(finalizedFilter);
+                                     }
+                                 });
+            context.getLegacyFilters().add(finalizedFilter);
         }
-        ScanNode scanNode = context.getScanNodeOfLegacyRuntimeFilterTarget().get(filter.getTargetExpr());
-        origFilter.addTarget(new RuntimeFilterTarget(
-                scanNode,
-                targetExpr,
-                true,
-                scanNode.getFragmentId().equals(node.getFragmentId())));
-        origFilter.setBitmapFilterNotIn(filter.isBitmapFilterNotIn());
-        context.getLegacyFilters().add(finalize(origFilter));
     }
 
     private org.apache.doris.planner.RuntimeFilter finalize(org.apache.doris.planner.RuntimeFilter origFilter) {
         origFilter.markFinalized();
         origFilter.assignToPlanNodes();
         origFilter.extractTargetsPosition();
-        // Number of parallel instances are large for pipeline engine, so we prefer bloom filter.
-        if (origFilter.hasRemoteTargets() && origFilter.getType() == TRuntimeFilterType.IN_OR_BLOOM
-                && ConnectContext.get() != null
-                && ConnectContext.get().getSessionVariable().enablePipelineEngine()) {
-            origFilter.setType(TRuntimeFilterType.BLOOM);
-        }
         return origFilter;
     }
 }

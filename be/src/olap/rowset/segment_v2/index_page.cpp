@@ -52,7 +52,7 @@ void IndexPageBuilder::finish(OwnedSlice* body, PageFooterPB* footer) {
 
 Status IndexPageBuilder::get_first_key(Slice* key) const {
     if (_count == 0) {
-        return Status::NotFound("index page is empty");
+        return Status::Error<ErrorCode::ENTRY_NOT_FOUND>("index page is empty");
     }
     Slice input(_buffer);
     if (get_length_prefixed_slice(&input, key)) {
@@ -63,6 +63,10 @@ Status IndexPageBuilder::get_first_key(Slice* key) const {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+
+int64_t IndexPageReader::get_metadata_size() const {
+    return sizeof(IndexPageReader) + _vl_field_mem_size;
+}
 
 Status IndexPageReader::parse(const Slice& body, const IndexPageFooterPB& footer) {
     _footer = footer;
@@ -80,8 +84,13 @@ Status IndexPageReader::parse(const Slice& body, const IndexPageFooterPB& footer
         }
         _keys.push_back(key);
         _values.push_back(value);
+        _vl_field_mem_size += sizeof(char) * key.size;
     }
+    _vl_field_mem_size +=
+            _keys.capacity() * sizeof(Slice) + _values.capacity() * sizeof(PagePointer);
+    _vl_field_mem_size += _footer.ByteSizeLong();
 
+    update_metadata_size();
     _parsed = true;
     return Status::OK();
 }
@@ -105,7 +114,8 @@ Status IndexPageIterator::seek_at_or_before(const Slice& search_key) {
     // no exact match, the insertion point is `left`
     if (left == 0) {
         // search key is smaller than all keys
-        return Status::NotFound("given key is smaller than all keys in page");
+        return Status::Error<ErrorCode::ENTRY_NOT_FOUND>(
+                "given key is smaller than all keys in page");
     }
     // index entry records the first key of the indexed page,
     // therefore the first page with keys >= searched key is the one before the insertion point

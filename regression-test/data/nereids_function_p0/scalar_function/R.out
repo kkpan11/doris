@@ -28,6 +28,35 @@
 0.019198621771937627
 0.020943951023931952
 
+-- !sql_regexp_Varchar_Varchar --
+true
+false
+false
+false
+false
+false
+false
+false
+false
+false
+false
+false
+false
+
+-- !sql_regexp_Varchar_Varchar_not_null --
+false
+false
+false
+false
+false
+false
+false
+false
+false
+false
+false
+false
+
 -- !sql_regexp_extract_Varchar_Varchar_BigInt --
 \N
 
@@ -376,8 +405,38 @@ string3
 string3
 string3
 
--- !sql_right_Varchar_Integer --
+-- !sql_relace_empty01 --
+abcxabcyabczabc
 
+-- !sql_relace_empty02 --
+\N
+
+-- !sql_relace_empty03 --
+\N
+
+-- !sql_relace_empty04 --
+\N
+
+-- !sql_relace_empty05 --
+abcyz
+
+-- !sql_relace_empty06 --
+yz
+
+-- !sql_relace_empty07 --
+xyz
+
+-- !sql_relace_empty08 --
+abc
+
+-- !sql_relace_empty09 --
+b你bab好bbb世bcb界b
+
+-- !sql_relace_empty10 --
+你a好b世c界
+
+-- !sql_right_Varchar_Integer --
+\N
 1
 ar11
 rchar11
@@ -406,7 +465,7 @@ varchar13
 varchar13
 
 -- !sql_right_String_Integer --
-
+\N
 1
 ing1
 string1
@@ -440,7 +499,7 @@ string3
 0.0
 0.0
 0.0
-0.0
+1.0
 1.0
 1.0
 1.0
@@ -454,7 +513,7 @@ string3
 0.0
 0.0
 0.0
-0.0
+1.0
 1.0
 1.0
 1.0
@@ -1005,6 +1064,64 @@ string1
 string1
 string1
 string1
+string2
+string2
+string2
+string2
+string3
+string3
+string3
+string3
+
+-- !sql_rtrim_Varchar_Varchar --
+null
+varchar
+varchar
+varchar
+varchar
+varchar12
+varchar12
+varchar12
+varchar12
+varchar13
+varchar13
+varchar13
+varchar13
+
+-- !sql_rtrim_Varchar_Varchar_notnull --
+varchar
+varchar
+varchar
+varchar
+varchar12
+varchar12
+varchar12
+varchar12
+varchar13
+varchar13
+varchar13
+varchar13
+
+-- !sql_rtrim_String_String --
+null
+string
+string
+string
+string
+string2
+string2
+string2
+string2
+string3
+string3
+string3
+string3
+
+-- !sql_rtrim_String_String_notnull --
+string
+string
+string
+string
 string2
 string2
 string2

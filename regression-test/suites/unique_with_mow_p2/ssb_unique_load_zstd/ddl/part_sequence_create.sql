@@ -12,7 +12,8 @@ CREATE TABLE IF NOT EXISTS `part` (
 UNIQUE KEY (`p_partkey`)
 DISTRIBUTED BY HASH(`p_partkey`) BUCKETS 10
 PROPERTIES (
-"function_column.sequence_type" = 'int',
+"enable_mow_light_delete" = "true",
+"function_column.sequence_col" = 'p_partkey',
 "compression"="zstd",
 "replication_num" = "1",
 "enable_unique_key_merge_on_write" = "true"

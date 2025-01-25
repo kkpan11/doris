@@ -17,6 +17,7 @@
 
 package org.apache.doris.nereids.trees.expressions;
 
+import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.exceptions.UnboundException;
 import org.apache.doris.nereids.trees.expressions.literal.Literal;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
@@ -26,7 +27,10 @@ import org.apache.doris.nereids.types.DataType;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableList.Builder;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Objects;
 import java.util.stream.Collectors;
@@ -41,8 +45,14 @@ public class InPredicate extends Expression {
     private final Expression compareExpr;
     private final List<Expression> options;
 
-    public InPredicate(Expression compareExpr, List<Expression> options) {
-        super(new Builder<Expression>().add(compareExpr).addAll(options).build().toArray(new Expression[0]));
+    public InPredicate(Expression compareExpr, Collection<Expression> options) {
+        super(new Builder<Expression>().add(compareExpr).addAll(options).build());
+        this.compareExpr = Objects.requireNonNull(compareExpr, "Compare Expr cannot be null");
+        this.options = ImmutableList.copyOf(Objects.requireNonNull(options, "In list cannot be null"));
+    }
+
+    public InPredicate(Expression compareExpr, Collection<Expression> options, boolean inferred) {
+        super(new Builder<Expression>().add(compareExpr).addAll(options).build(), inferred);
         this.compareExpr = Objects.requireNonNull(compareExpr, "Compare Expr cannot be null");
         this.options = ImmutableList.copyOf(Objects.requireNonNull(options, "In list cannot be null"));
     }
@@ -68,6 +78,45 @@ public class InPredicate extends Expression {
     }
 
     @Override
+    public void checkLegalityBeforeTypeCoercion() {
+        if (children().get(0).getDataType().isStructType()) {
+            // we should check in value list is all struct type
+            for (int i = 1; i < children().size(); i++) {
+                if (!children().get(i).getDataType().isStructType() && !children().get(i).getDataType().isNullType()) {
+                    throw new AnalysisException("in predicate struct should compare with struct type list, but got : "
+                            + children().get(i).getDataType().toSql());
+                }
+            }
+            return;
+        }
+
+        if (children().get(0).getDataType().isArrayType()) {
+            // we should check in value list is all list type
+            for (int i = 1; i < children().size(); i++) {
+                if (!children().get(i).getDataType().isArrayType() && !children().get(i).getDataType().isNullType()) {
+                    throw new AnalysisException("in predicate list should compare with struct type list, but got : "
+                            + children().get(i).getDataType().toSql());
+                }
+            }
+            return;
+        }
+
+        children().forEach(c -> {
+            if (c.getDataType().isObjectType()) {
+                throw new AnalysisException("in predicate could not contains object type: " + this.toSql());
+            }
+            if (c.getDataType().isComplexType()) {
+                throw new AnalysisException("in predicate could not contains complex type: " + this.toSql());
+            }
+        });
+    }
+
+    @Override
+    public Expression withInferred(boolean inferred) {
+        return new InPredicate(children.get(0), ImmutableList.copyOf(children).subList(1, children.size()), true);
+    }
+
+    @Override
     public String toString() {
         return compareExpr + " IN " + options.stream()
             .map(Expression::toString)
@@ -75,9 +124,9 @@ public class InPredicate extends Expression {
     }
 
     @Override
-    public String toSql() {
+    public String computeToSql() {
         return compareExpr.toSql() + " IN " + options.stream()
-            .map(Expression::toSql)
+            .map(Expression::toSql).sorted()
             .collect(Collectors.joining(", ", "(", ")"));
     }
 
@@ -95,7 +144,7 @@ public class InPredicate extends Expression {
     }
 
     @Override
-    public int hashCode() {
+    protected int computeHashCode() {
         return Objects.hash(compareExpr, options);
     }
 
@@ -117,5 +166,14 @@ public class InPredicate extends Expression {
             }
         }
         return true;
+    }
+
+    //use for ut
+    public Expression sortOptions() {
+        if (isLiteralChildren()) {
+            List<Literal> values = options.stream().map(e -> (Literal) e).collect(Collectors.toList());
+            return new InPredicate(compareExpr, Lists.newArrayList(Sets.newTreeSet(values)));
+        }
+        return this;
     }
 }

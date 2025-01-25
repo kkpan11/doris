@@ -30,7 +30,8 @@ suite('load') {
         |"AWS_ACCESS_KEY" = "${getS3AK()}",
         |"AWS_SECRET_KEY" = "${getS3SK()}",
         |"AWS_ENDPOINT" = "${getS3Endpoint()}",
-        |"AWS_REGION" = "${getS3Region()}")
+        |"AWS_REGION" = "${getS3Region()}",
+        |"provider" = "${getS3Provider()}")
         |PROPERTIES(
         |"exec_mem_limit" = "8589934592",
         |"load_parallelism" = "3")""".stripMargin()
@@ -81,7 +82,7 @@ suite('load') {
         sql "sync"
         def r = sql "select @@insert_timeout"
         assertEquals(3600, r[0][0])
-        year_cons = [
+        def year_cons = [
             'lo_orderdate<19930101',
             'lo_orderdate>=19930101 and lo_orderdate<19940101',
             'lo_orderdate>=19940101 and lo_orderdate<19950101',
@@ -108,6 +109,7 @@ suite('load') {
                 INNER JOIN supplier s ON (s.s_suppkey = l.lo_suppkey) 
                 INNER JOIN part p ON (p.p_partkey = l.lo_partkey);"""
         }
+        sql "sync"
         rowCount = sql "select count(*) from ${table}"
         assertEquals(table_rows, rowCount[0][0])
     }

@@ -20,9 +20,13 @@ package org.apache.doris.fs.remote;
 import org.apache.doris.analysis.StorageBackend;
 import org.apache.doris.backup.Status;
 import org.apache.doris.common.UserException;
+import org.apache.doris.common.security.authentication.AuthenticationConfig;
+import org.apache.doris.common.security.authentication.HadoopAuthenticator;
 import org.apache.doris.datasource.property.PropertyConverter;
 import org.apache.doris.fs.obj.S3ObjStorage;
+import org.apache.doris.fs.remote.dfs.DFSFileSystem;
 
+import com.amazonaws.services.s3.model.AmazonS3Exception;
 import com.google.common.annotations.VisibleForTesting;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
@@ -32,34 +36,66 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.FileNotFoundException;
+import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 
 public class S3FileSystem extends ObjFileSystem {
 
     private static final Logger LOG = LogManager.getLogger(S3FileSystem.class);
+    private HadoopAuthenticator authenticator = null;
 
     public S3FileSystem(Map<String, String> properties) {
         super(StorageBackend.StorageType.S3.name(), StorageBackend.StorageType.S3, new S3ObjStorage(properties));
-        this.properties.putAll(properties);
+        initFsProperties();
     }
 
     @VisibleForTesting
     public S3FileSystem(S3ObjStorage storage) {
         super(StorageBackend.StorageType.S3.name(), StorageBackend.StorageType.S3, storage);
-        this.properties.putAll(storage.getProperties());
+        initFsProperties();
+    }
+
+    private void initFsProperties() {
+        this.properties.putAll(((S3ObjStorage) objStorage).getProperties());
     }
 
     @Override
     protected FileSystem nativeFileSystem(String remotePath) throws UserException {
+        //todo Extracting a common method to achieve logic reuse
+        if (closed.get()) {
+            throw new UserException("FileSystem is closed.");
+        }
         if (dfsFileSystem == null) {
-            Configuration conf = new Configuration();
-            System.setProperty("com.amazonaws.services.s3.enableV4", "true");
-            PropertyConverter.convertToHadoopFSProperties(properties).forEach(conf::set);
-            try {
-                dfsFileSystem = FileSystem.get(new Path(remotePath).toUri(), conf);
-            } catch (Exception e) {
-                throw new UserException("Failed to get S3 FileSystem for " + e.getMessage(), e);
+            synchronized (this) {
+                if (closed.get()) {
+                    throw new UserException("FileSystem is closed.");
+                }
+                if (dfsFileSystem == null) {
+                    Configuration conf = DFSFileSystem.getHdfsConf(ifNotSetFallbackToSimpleAuth());
+                    System.setProperty("com.amazonaws.services.s3.enableV4", "true");
+                    // the entry value in properties may be null, and
+                    PropertyConverter.convertToHadoopFSProperties(properties).entrySet().stream()
+                            .filter(entry -> entry.getKey() != null && entry.getValue() != null)
+                            .forEach(entry -> conf.set(entry.getKey(), entry.getValue()));
+                    // S3 does not support Kerberos authentication,
+                    // so here we create a simple authentication
+                    AuthenticationConfig authConfig = AuthenticationConfig.getSimpleAuthenticationConfig(conf);
+                    HadoopAuthenticator authenticator = HadoopAuthenticator.getHadoopAuthenticator(authConfig);
+                    try {
+                        dfsFileSystem = authenticator.doAs(() -> {
+                            try {
+                                return FileSystem.get(new Path(remotePath).toUri(), conf);
+                            } catch (IOException e) {
+                                throw new RuntimeException(e);
+                            }
+                        });
+                        this.authenticator = authenticator;
+                        RemoteFSPhantomManager.registerPhantomReference(this);
+                    } catch (Exception e) {
+                        throw new UserException("Failed to get S3 FileSystem for " + e.getMessage(), e);
+                    }
+                }
             }
         }
         return dfsFileSystem;
@@ -67,7 +103,7 @@ public class S3FileSystem extends ObjFileSystem {
 
     // broker file pattern glob is too complex, so we use hadoop directly
     @Override
-    public Status list(String remotePath, List<RemoteFile> result, boolean fileNameOnly) {
+    public Status globList(String remotePath, List<RemoteFile> result, boolean fileNameOnly) {
         try {
             FileSystem s3AFileSystem = nativeFileSystem(remotePath);
             Path pathPattern = new Path(remotePath);
@@ -86,9 +122,25 @@ public class S3FileSystem extends ObjFileSystem {
             LOG.info("file not found: " + e.getMessage());
             return new Status(Status.ErrCode.NOT_FOUND, "file not found: " + e.getMessage());
         } catch (Exception e) {
+            if (e.getCause() instanceof AmazonS3Exception) {
+                // process minio error msg
+                AmazonS3Exception ea = (AmazonS3Exception) e.getCause();
+                Map<String, String> callbackHeaders = ea.getHttpHeaders();
+                if (callbackHeaders != null && !callbackHeaders.isEmpty()) {
+                    String minioErrMsg = callbackHeaders.get("X-Minio-Error-Desc");
+                    if (minioErrMsg != null) {
+                        return new Status(Status.ErrCode.COMMON_ERROR, "Minio request error: " + minioErrMsg);
+                    }
+                }
+            }
             LOG.error("errors while get file status ", e);
             return new Status(Status.ErrCode.COMMON_ERROR, "errors while get file status " + e.getMessage());
         }
         return Status.OK;
+    }
+
+    @VisibleForTesting
+    public HadoopAuthenticator getAuthenticator() {
+        return authenticator;
     }
 }

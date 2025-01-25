@@ -23,8 +23,8 @@
 #include <gen_cpp/HeartbeatService_types.h>
 #include <gen_cpp/PaloInternalService_types.h>
 #include <gen_cpp/PlanNodes_types.h>
-#include <gen_cpp/Types_types.h>
 
+#include <algorithm>
 #include <ostream>
 #include <string>
 #include <utility>
@@ -44,29 +44,29 @@
 #include "vec/core/block.h"
 #include "vec/core/column_with_type_and_name.h"
 #include "vec/core/types.h"
-#include "vec/exec/scan/vmeta_scan_node.h"
 
 namespace doris {
 class RuntimeProfile;
 namespace vectorized {
 class VExprContext;
-class VScanNode;
 } // namespace vectorized
 } // namespace doris
 
 namespace doris::vectorized {
 
-VMetaScanner::VMetaScanner(RuntimeState* state, VMetaScanNode* parent, int64_t tuple_id,
-                           const TScanRangeParams& scan_range, int64_t limit,
-                           RuntimeProfile* profile)
-        : VScanner(state, static_cast<VScanNode*>(parent), limit, profile),
+VMetaScanner::VMetaScanner(RuntimeState* state, pipeline::ScanLocalStateBase* local_state,
+                           int64_t tuple_id, const TScanRangeParams& scan_range, int64_t limit,
+                           RuntimeProfile* profile, TUserIdentity user_identity)
+        : VScanner(state, local_state, limit, profile),
           _meta_eos(false),
           _tuple_id(tuple_id),
+          _user_identity(user_identity),
           _scan_range(scan_range.scan_range) {}
 
 Status VMetaScanner::open(RuntimeState* state) {
     VLOG_CRITICAL << "VMetaScanner::open";
     RETURN_IF_ERROR(VScanner::open(state));
+    RETURN_IF_ERROR(_fetch_metadata(_scan_range.meta_scan_range));
     return Status::OK();
 }
 
@@ -74,7 +74,6 @@ Status VMetaScanner::prepare(RuntimeState* state, const VExprContextSPtrs& conju
     VLOG_CRITICAL << "VMetaScanner::prepare";
     RETURN_IF_ERROR(VScanner::prepare(_state, conjuncts));
     _tuple_desc = state->desc_tbl().get_tuple_descriptor(_tuple_id);
-    RETURN_IF_ERROR(_fetch_metadata(_scan_range.meta_scan_range));
     return Status::OK();
 }
 
@@ -97,13 +96,13 @@ Status VMetaScanner::_get_block_impl(RuntimeState* state, Block* block, bool* eo
         columns.resize(column_size);
         for (auto i = 0; i < column_size; i++) {
             if (mem_reuse) {
-                columns[i] = std::move(*block->get_by_position(i).column).mutate();
+                columns[i] = block->get_by_position(i).column->assume_mutable();
             } else {
                 columns[i] = _tuple_desc->slots()[i]->get_empty_mutable_column();
             }
         }
         // fill block
-        _fill_block_with_remote_data(columns);
+        RETURN_IF_ERROR(_fill_block_with_remote_data(columns));
         if (_meta_eos == true) {
             if (block->rows() == 0) {
                 *eof = true;
@@ -138,61 +137,89 @@ Status VMetaScanner::_fill_block_with_remote_data(const std::vector<MutableColum
 
         for (int _row_idx = 0; _row_idx < _batch_data.size(); _row_idx++) {
             vectorized::IColumn* col_ptr = columns[col_idx].get();
-            if (slot_desc->is_nullable() == true) {
-                auto* nullable_column = reinterpret_cast<vectorized::ColumnNullable*>(col_ptr);
-                col_ptr = &nullable_column->get_nested_column();
-            }
-            switch (slot_desc->type().type) {
-            case TYPE_BOOLEAN: {
-                bool data = _batch_data[_row_idx].column_value[col_idx].boolVal;
-                reinterpret_cast<vectorized::ColumnVector<vectorized::UInt8>*>(col_ptr)
-                        ->insert_value((uint8_t)data);
-                break;
-            }
-            case TYPE_INT: {
-                int64_t data = _batch_data[_row_idx].column_value[col_idx].intVal;
-                reinterpret_cast<vectorized::ColumnVector<vectorized::Int32>*>(col_ptr)
-                        ->insert_value(data);
-                break;
-            }
-            case TYPE_BIGINT: {
-                int64_t data = _batch_data[_row_idx].column_value[col_idx].longVal;
-                reinterpret_cast<vectorized::ColumnVector<vectorized::Int64>*>(col_ptr)
-                        ->insert_value(data);
-                break;
-            }
-            case TYPE_FLOAT: {
-                double data = _batch_data[_row_idx].column_value[col_idx].doubleVal;
-                reinterpret_cast<vectorized::ColumnVector<vectorized::Float32>*>(col_ptr)
-                        ->insert_value(data);
-                break;
-            }
-            case TYPE_DOUBLE: {
-                double data = _batch_data[_row_idx].column_value[col_idx].doubleVal;
-                reinterpret_cast<vectorized::ColumnVector<vectorized::Float64>*>(col_ptr)
-                        ->insert_value(data);
-                break;
-            }
-            case TYPE_DATETIMEV2: {
-                uint64_t data = _batch_data[_row_idx].column_value[col_idx].longVal;
-                reinterpret_cast<vectorized::ColumnVector<vectorized::UInt64>*>(col_ptr)
-                        ->insert_value(data);
-                break;
-            }
-            case TYPE_STRING:
-            case TYPE_CHAR:
-            case TYPE_VARCHAR: {
-                std::string data = _batch_data[_row_idx].column_value[col_idx].stringVal;
-                reinterpret_cast<vectorized::ColumnString*>(col_ptr)->insert_data(data.c_str(),
-                                                                                  data.length());
-                break;
-            }
-            default: {
-                std::string error_msg =
-                        fmt::format("Invalid column type {} on column: {}.",
-                                    slot_desc->type().debug_string(), slot_desc->col_name());
-                return Status::InternalError(std::string(error_msg));
-            }
+            TCell& cell = _batch_data[_row_idx].column_value[col_idx];
+            if (cell.__isset.isNull && cell.isNull) {
+                DCHECK(slot_desc->is_nullable())
+                        << "cell is null but column is not nullable: " << slot_desc->col_name();
+                auto& null_col = reinterpret_cast<ColumnNullable&>(*col_ptr);
+                null_col.get_nested_column().insert_default();
+                null_col.get_null_map_data().push_back(1);
+            } else {
+                if (slot_desc->is_nullable()) {
+                    auto& null_col = reinterpret_cast<ColumnNullable&>(*col_ptr);
+                    null_col.get_null_map_data().push_back(0);
+                    col_ptr = null_col.get_nested_column_ptr().get();
+                }
+                switch (slot_desc->type().type) {
+                case TYPE_BOOLEAN: {
+                    bool data = cell.boolVal;
+                    reinterpret_cast<vectorized::ColumnVector<vectorized::UInt8>*>(col_ptr)
+                            ->insert_value((uint8_t)data);
+                    break;
+                }
+                case TYPE_TINYINT: {
+                    int8_t data = (int8_t)cell.intVal;
+                    reinterpret_cast<vectorized::ColumnVector<vectorized::Int8>*>(col_ptr)
+                            ->insert_value(data);
+                    break;
+                }
+                case TYPE_SMALLINT: {
+                    int16_t data = (int16_t)cell.intVal;
+                    reinterpret_cast<vectorized::ColumnVector<vectorized::Int16>*>(col_ptr)
+                            ->insert_value(data);
+                    break;
+                }
+                case TYPE_INT: {
+                    int32_t data = cell.intVal;
+                    reinterpret_cast<vectorized::ColumnVector<vectorized::Int32>*>(col_ptr)
+                            ->insert_value(data);
+                    break;
+                }
+                case TYPE_BIGINT: {
+                    int64_t data = cell.longVal;
+                    reinterpret_cast<vectorized::ColumnVector<vectorized::Int64>*>(col_ptr)
+                            ->insert_value(data);
+                    break;
+                }
+                case TYPE_FLOAT: {
+                    double data = cell.doubleVal;
+                    reinterpret_cast<vectorized::ColumnVector<vectorized::Float32>*>(col_ptr)
+                            ->insert_value(data);
+                    break;
+                }
+                case TYPE_DOUBLE: {
+                    double data = cell.doubleVal;
+                    reinterpret_cast<vectorized::ColumnVector<vectorized::Float64>*>(col_ptr)
+                            ->insert_value(data);
+                    break;
+                }
+                case TYPE_DATEV2: {
+                    uint32_t data = (uint32_t)cell.longVal;
+                    reinterpret_cast<vectorized::ColumnVector<vectorized::UInt32>*>(col_ptr)
+                            ->insert_value(data);
+                    break;
+                }
+                case TYPE_DATETIMEV2: {
+                    uint64_t data = cell.longVal;
+                    reinterpret_cast<vectorized::ColumnVector<vectorized::UInt64>*>(col_ptr)
+                            ->insert_value(data);
+                    break;
+                }
+                case TYPE_STRING:
+                case TYPE_CHAR:
+                case TYPE_VARCHAR: {
+                    std::string data = cell.stringVal;
+                    reinterpret_cast<vectorized::ColumnString*>(col_ptr)->insert_data(
+                            data.c_str(), data.length());
+                    break;
+                }
+                default: {
+                    std::string error_msg =
+                            fmt::format("Invalid column type {} on column: {}.",
+                                        slot_desc->type().debug_string(), slot_desc->col_name());
+                    return Status::InternalError(std::string(error_msg));
+                }
+                }
             }
         }
     }
@@ -207,11 +234,38 @@ Status VMetaScanner::_fetch_metadata(const TMetaScanRange& meta_scan_range) {
     case TMetadataType::ICEBERG:
         RETURN_IF_ERROR(_build_iceberg_metadata_request(meta_scan_range, &request));
         break;
+    case TMetadataType::HUDI:
+        RETURN_IF_ERROR(_build_hudi_metadata_request(meta_scan_range, &request));
+        break;
     case TMetadataType::BACKENDS:
         RETURN_IF_ERROR(_build_backends_metadata_request(meta_scan_range, &request));
         break;
-    case TMetadataType::WORKLOAD_GROUPS:
-        RETURN_IF_ERROR(_build_workload_groups_metadata_request(meta_scan_range, &request));
+    case TMetadataType::FRONTENDS:
+        RETURN_IF_ERROR(_build_frontends_metadata_request(meta_scan_range, &request));
+        break;
+    case TMetadataType::FRONTENDS_DISKS:
+        RETURN_IF_ERROR(_build_frontends_disks_metadata_request(meta_scan_range, &request));
+        break;
+    case TMetadataType::WORKLOAD_SCHED_POLICY:
+        RETURN_IF_ERROR(_build_workload_sched_policy_metadata_request(meta_scan_range, &request));
+        break;
+    case TMetadataType::CATALOGS:
+        RETURN_IF_ERROR(_build_catalogs_metadata_request(meta_scan_range, &request));
+        break;
+    case TMetadataType::MATERIALIZED_VIEWS:
+        RETURN_IF_ERROR(_build_materialized_views_metadata_request(meta_scan_range, &request));
+        break;
+    case TMetadataType::PARTITIONS:
+        RETURN_IF_ERROR(_build_partitions_metadata_request(meta_scan_range, &request));
+        break;
+    case TMetadataType::JOBS:
+        RETURN_IF_ERROR(_build_jobs_metadata_request(meta_scan_range, &request));
+        break;
+    case TMetadataType::TASKS:
+        RETURN_IF_ERROR(_build_tasks_metadata_request(meta_scan_range, &request));
+        break;
+    case TMetadataType::PARTITION_VALUES:
+        RETURN_IF_ERROR(_build_partition_values_metadata_request(meta_scan_range, &request));
         break;
     default:
         _meta_eos = true;
@@ -227,7 +281,7 @@ Status VMetaScanner::_fetch_metadata(const TMetaScanRange& meta_scan_range) {
 
     // _state->execution_timeout() is seconds, change to milliseconds
     int time_out = _state->execution_timeout() * 1000;
-    TNetworkAddress master_addr = ExecEnv::GetInstance()->master_info()->network_address;
+    TNetworkAddress master_addr = ExecEnv::GetInstance()->cluster_info()->master_fe_addr;
     TFetchSchemaTableDataResult result;
     RETURN_IF_ERROR(ThriftRpcHelper::rpc<FrontendServiceClient>(
             master_addr.hostname, master_addr.port,
@@ -236,7 +290,7 @@ Status VMetaScanner::_fetch_metadata(const TMetaScanRange& meta_scan_range) {
             },
             time_out));
 
-    Status status(result.status);
+    Status status(Status::create(result.status));
     if (!status.ok()) {
         LOG(WARNING) << "fetch schema table data from master failed, errmsg=" << status;
         return status;
@@ -265,6 +319,26 @@ Status VMetaScanner::_build_iceberg_metadata_request(const TMetaScanRange& meta_
     return Status::OK();
 }
 
+Status VMetaScanner::_build_hudi_metadata_request(const TMetaScanRange& meta_scan_range,
+                                                  TFetchSchemaTableDataRequest* request) {
+    VLOG_CRITICAL << "VMetaScanner::_build_hudi_metadata_request";
+    if (!meta_scan_range.__isset.hudi_params) {
+        return Status::InternalError("Can not find THudiMetadataParams from meta_scan_range.");
+    }
+
+    // create request
+    request->__set_cluster_name("");
+    request->__set_schema_table_name(TSchemaTableName::METADATA_TABLE);
+
+    // create TMetadataTableRequestParams
+    TMetadataTableRequestParams metadata_table_params;
+    metadata_table_params.__set_metadata_type(TMetadataType::HUDI);
+    metadata_table_params.__set_hudi_metadata_params(meta_scan_range.hudi_params);
+
+    request->__set_metada_table_params(metadata_table_params);
+    return Status::OK();
+}
+
 Status VMetaScanner::_build_backends_metadata_request(const TMetaScanRange& meta_scan_range,
                                                       TFetchSchemaTableDataRequest* request) {
     VLOG_CRITICAL << "VMetaScanner::_build_backends_metadata_request";
@@ -284,9 +358,47 @@ Status VMetaScanner::_build_backends_metadata_request(const TMetaScanRange& meta
     return Status::OK();
 }
 
-Status VMetaScanner::_build_workload_groups_metadata_request(
+Status VMetaScanner::_build_frontends_metadata_request(const TMetaScanRange& meta_scan_range,
+                                                       TFetchSchemaTableDataRequest* request) {
+    VLOG_CRITICAL << "VMetaScanner::_build_frontends_metadata_request";
+    if (!meta_scan_range.__isset.frontends_params) {
+        return Status::InternalError("Can not find TFrontendsMetadataParams from meta_scan_range.");
+    }
+    // create request
+    request->__set_cluster_name("");
+    request->__set_schema_table_name(TSchemaTableName::METADATA_TABLE);
+
+    // create TMetadataTableRequestParams
+    TMetadataTableRequestParams metadata_table_params;
+    metadata_table_params.__set_metadata_type(TMetadataType::FRONTENDS);
+    metadata_table_params.__set_frontends_metadata_params(meta_scan_range.frontends_params);
+
+    request->__set_metada_table_params(metadata_table_params);
+    return Status::OK();
+}
+
+Status VMetaScanner::_build_frontends_disks_metadata_request(
         const TMetaScanRange& meta_scan_range, TFetchSchemaTableDataRequest* request) {
-    VLOG_CRITICAL << "VMetaScanner::_build_workload_groups_metadata_request";
+    VLOG_CRITICAL << "VMetaScanner::_build_frontends_metadata_request";
+    if (!meta_scan_range.__isset.frontends_params) {
+        return Status::InternalError("Can not find TFrontendsMetadataParams from meta_scan_range.");
+    }
+    // create request
+    request->__set_cluster_name("");
+    request->__set_schema_table_name(TSchemaTableName::METADATA_TABLE);
+
+    // create TMetadataTableRequestParams
+    TMetadataTableRequestParams metadata_table_params;
+    metadata_table_params.__set_metadata_type(TMetadataType::FRONTENDS_DISKS);
+    metadata_table_params.__set_frontends_metadata_params(meta_scan_range.frontends_params);
+
+    request->__set_metada_table_params(metadata_table_params);
+    return Status::OK();
+}
+
+Status VMetaScanner::_build_workload_sched_policy_metadata_request(
+        const TMetaScanRange& meta_scan_range, TFetchSchemaTableDataRequest* request) {
+    VLOG_CRITICAL << "VMetaScanner::_build_workload_sched_policy_metadata_request";
 
     // create request
     request->__set_cluster_name("");
@@ -294,7 +406,124 @@ Status VMetaScanner::_build_workload_groups_metadata_request(
 
     // create TMetadataTableRequestParams
     TMetadataTableRequestParams metadata_table_params;
-    metadata_table_params.__set_metadata_type(TMetadataType::WORKLOAD_GROUPS);
+    metadata_table_params.__set_metadata_type(TMetadataType::WORKLOAD_SCHED_POLICY);
+    metadata_table_params.__set_current_user_ident(_user_identity);
+
+    request->__set_metada_table_params(metadata_table_params);
+    return Status::OK();
+}
+
+Status VMetaScanner::_build_catalogs_metadata_request(const TMetaScanRange& meta_scan_range,
+                                                      TFetchSchemaTableDataRequest* request) {
+    VLOG_CRITICAL << "VMetaScanner::_build_catalogs_metadata_request";
+
+    // create request
+    request->__set_schema_table_name(TSchemaTableName::METADATA_TABLE);
+
+    // create TMetadataTableRequestParams
+    TMetadataTableRequestParams metadata_table_params;
+    metadata_table_params.__set_metadata_type(TMetadataType::CATALOGS);
+    metadata_table_params.__set_current_user_ident(_user_identity);
+
+    request->__set_metada_table_params(metadata_table_params);
+    return Status::OK();
+}
+
+Status VMetaScanner::_build_materialized_views_metadata_request(
+        const TMetaScanRange& meta_scan_range, TFetchSchemaTableDataRequest* request) {
+    VLOG_CRITICAL << "VMetaScanner::_build_materialized_views_metadata_request";
+    if (!meta_scan_range.__isset.materialized_views_params) {
+        return Status::InternalError(
+                "Can not find TMaterializedViewsMetadataParams from meta_scan_range.");
+    }
+
+    // create request
+    request->__set_schema_table_name(TSchemaTableName::METADATA_TABLE);
+
+    // create TMetadataTableRequestParams
+    TMetadataTableRequestParams metadata_table_params;
+    metadata_table_params.__set_metadata_type(TMetadataType::MATERIALIZED_VIEWS);
+    metadata_table_params.__set_materialized_views_metadata_params(
+            meta_scan_range.materialized_views_params);
+
+    request->__set_metada_table_params(metadata_table_params);
+    return Status::OK();
+}
+
+Status VMetaScanner::_build_partitions_metadata_request(const TMetaScanRange& meta_scan_range,
+                                                        TFetchSchemaTableDataRequest* request) {
+    VLOG_CRITICAL << "VMetaScanner::_build_partitions_metadata_request";
+    if (!meta_scan_range.__isset.partitions_params) {
+        return Status::InternalError(
+                "Can not find TPartitionsMetadataParams from meta_scan_range.");
+    }
+
+    // create request
+    request->__set_schema_table_name(TSchemaTableName::METADATA_TABLE);
+
+    // create TMetadataTableRequestParams
+    TMetadataTableRequestParams metadata_table_params;
+    metadata_table_params.__set_metadata_type(TMetadataType::PARTITIONS);
+    metadata_table_params.__set_partitions_metadata_params(meta_scan_range.partitions_params);
+
+    request->__set_metada_table_params(metadata_table_params);
+    return Status::OK();
+}
+
+Status VMetaScanner::_build_jobs_metadata_request(const TMetaScanRange& meta_scan_range,
+                                                  TFetchSchemaTableDataRequest* request) {
+    VLOG_CRITICAL << "VMetaScanner::_build_jobs_metadata_request";
+    if (!meta_scan_range.__isset.jobs_params) {
+        return Status::InternalError("Can not find TJobsMetadataParams from meta_scan_range.");
+    }
+
+    // create request
+    request->__set_schema_table_name(TSchemaTableName::METADATA_TABLE);
+
+    // create TMetadataTableRequestParams
+    TMetadataTableRequestParams metadata_table_params;
+    metadata_table_params.__set_metadata_type(TMetadataType::JOBS);
+    metadata_table_params.__set_jobs_metadata_params(meta_scan_range.jobs_params);
+
+    request->__set_metada_table_params(metadata_table_params);
+    return Status::OK();
+}
+
+Status VMetaScanner::_build_tasks_metadata_request(const TMetaScanRange& meta_scan_range,
+                                                   TFetchSchemaTableDataRequest* request) {
+    VLOG_CRITICAL << "VMetaScanner::_build_tasks_metadata_request";
+    if (!meta_scan_range.__isset.tasks_params) {
+        return Status::InternalError("Can not find TTasksMetadataParams from meta_scan_range.");
+    }
+
+    // create request
+    request->__set_schema_table_name(TSchemaTableName::METADATA_TABLE);
+
+    // create TMetadataTableRequestParams
+    TMetadataTableRequestParams metadata_table_params;
+    metadata_table_params.__set_metadata_type(TMetadataType::TASKS);
+    metadata_table_params.__set_tasks_metadata_params(meta_scan_range.tasks_params);
+
+    request->__set_metada_table_params(metadata_table_params);
+    return Status::OK();
+}
+
+Status VMetaScanner::_build_partition_values_metadata_request(
+        const TMetaScanRange& meta_scan_range, TFetchSchemaTableDataRequest* request) {
+    VLOG_CRITICAL << "VMetaScanner::_build_partition_values_metadata_request";
+    if (!meta_scan_range.__isset.partition_values_params) {
+        return Status::InternalError(
+                "Can not find TPartitionValuesMetadataParams from meta_scan_range.");
+    }
+
+    // create request
+    request->__set_schema_table_name(TSchemaTableName::METADATA_TABLE);
+
+    // create TMetadataTableRequestParams
+    TMetadataTableRequestParams metadata_table_params;
+    metadata_table_params.__set_metadata_type(TMetadataType::PARTITION_VALUES);
+    metadata_table_params.__set_partition_values_metadata_params(
+            meta_scan_range.partition_values_params);
 
     request->__set_metada_table_params(metadata_table_params);
     return Status::OK();

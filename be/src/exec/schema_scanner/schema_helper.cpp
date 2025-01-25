@@ -23,8 +23,6 @@
 #include "util/thrift_rpc_helper.h"
 
 namespace doris {
-class TDescribeTableParams;
-class TDescribeTableResult;
 class TDescribeTablesParams;
 class TDescribeTablesResult;
 class TGetDbsParams;
@@ -35,6 +33,10 @@ class TListPrivilegesResult;
 class TListTableStatusResult;
 class TShowVariableRequest;
 class TShowVariableResult;
+class TShowProcessListRequest;
+class TShowProcessListResult;
+class TShowUserRequest;
+class TShowUserResult;
 
 Status SchemaHelper::get_db_names(const std::string& ip, const int32_t port,
                                   const TGetDbsParams& request, TGetDbsResult* result) {
@@ -60,13 +62,12 @@ Status SchemaHelper::list_table_status(const std::string& ip, const int32_t port
                 client->listTableStatus(*result, request);
             });
 }
-
-Status SchemaHelper::describe_table(const std::string& ip, const int32_t port,
-                                    const TDescribeTableParams& request,
-                                    TDescribeTableResult* result) {
+Status SchemaHelper::list_table_metadata_name_ids(const std::string& ip, const int32_t port,
+                                                  const doris::TGetTablesParams& request,
+                                                  TListTableMetadataNameIdsResult* result) {
     return ThriftRpcHelper::rpc<FrontendServiceClient>(
             ip, port, [&request, &result](FrontendServiceConnection& client) {
-                client->describeTable(*result, request);
+                client->listTableMetadataNameIds(*result, request);
             });
 }
 
@@ -122,6 +123,23 @@ std::string SchemaHelper::extract_db_name(const std::string& full_name) {
     }
     found++;
     return std::string(full_name.c_str() + found, full_name.size() - found);
+}
+
+Status SchemaHelper::show_process_list(const std::string& ip, const int32_t port,
+                                       const TShowProcessListRequest& request,
+                                       TShowProcessListResult* result) {
+    return ThriftRpcHelper::rpc<FrontendServiceClient>(
+            ip, port, [&request, &result](FrontendServiceConnection& client) {
+                client->showProcessList(*result, request);
+            });
+}
+
+Status SchemaHelper::show_user(const std::string& ip, const int32_t port,
+                               const TShowUserRequest& request, TShowUserResult* result) {
+    return ThriftRpcHelper::rpc<FrontendServiceClient>(
+            ip, port, [&request, &result](FrontendServiceConnection& client) {
+                client->showUser(*result, request);
+            });
 }
 
 } // namespace doris

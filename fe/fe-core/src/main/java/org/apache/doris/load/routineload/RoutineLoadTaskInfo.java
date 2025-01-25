@@ -27,6 +27,7 @@ import org.apache.doris.common.QuotaExceedException;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.util.DebugUtil;
 import org.apache.doris.common.util.TimeUtils;
+import org.apache.doris.service.ExecuteEnv;
 import org.apache.doris.service.FrontendOptions;
 import org.apache.doris.thrift.TRoutineLoadTask;
 import org.apache.doris.transaction.BeginTransactionException;
@@ -54,9 +55,9 @@ public abstract class RoutineLoadTaskInfo {
     private RoutineLoadManager routineLoadManager = Env.getCurrentEnv().getRoutineLoadManager();
 
     protected UUID id;
-    protected long txnId = -1L;
+    protected static final long INIT_TXN_ID = -1L;
+    protected long txnId = INIT_TXN_ID;
     protected long jobId;
-    protected String clusterName;
 
     private long createTimeMs;
     private long executeStartTimeMs = -1L;
@@ -70,20 +71,28 @@ public abstract class RoutineLoadTaskInfo {
 
     protected long timeoutMs = -1;
 
+    protected boolean isMultiTable = false;
+
+    protected boolean isEof = false;
+
     // this status will be set when corresponding transaction's status is changed.
     // so that user or other logic can know the status of the corresponding txn.
     protected TransactionStatus txnStatus = TransactionStatus.UNKNOWN;
 
-    public RoutineLoadTaskInfo(UUID id, long jobId, String clusterName, long timeoutMs) {
+    public RoutineLoadTaskInfo(UUID id, long jobId, long timeoutMs, boolean isMultiTable,
+                    long lastScheduledTime, boolean isEof) {
         this.id = id;
         this.jobId = jobId;
-        this.clusterName = clusterName;
         this.createTimeMs = System.currentTimeMillis();
         this.timeoutMs = timeoutMs;
+        this.isMultiTable = isMultiTable;
+        this.lastScheduledTime = lastScheduledTime;
+        this.isEof = isEof;
     }
 
-    public RoutineLoadTaskInfo(UUID id, long jobId, String clusterName, long timeoutMs, long previousBeId) {
-        this(id, jobId, clusterName, timeoutMs);
+    public RoutineLoadTaskInfo(UUID id, long jobId, long timeoutMs, long previousBeId,
+                               boolean isMultiTable, long lastScheduledTime, boolean isEof) {
+        this(id, jobId, timeoutMs, isMultiTable, lastScheduledTime, isEof);
         this.previousBeId = previousBeId;
     }
 
@@ -93,10 +102,6 @@ public abstract class RoutineLoadTaskInfo {
 
     public long getJobId() {
         return jobId;
-    }
-
-    public String getClusterName() {
-        return clusterName;
     }
 
     public void setExecuteStartTimeMs(long executeStartTimeMs) {
@@ -143,6 +148,10 @@ public abstract class RoutineLoadTaskInfo {
         return txnStatus;
     }
 
+    public boolean getIsEof() {
+        return isEof;
+    }
+
     public boolean isTimeout() {
         if (txnStatus == TransactionStatus.COMMITTED || txnStatus == TransactionStatus.VISIBLE) {
             // the corresponding txn is already finished, this task can not be treated as timeout.
@@ -157,6 +166,19 @@ public abstract class RoutineLoadTaskInfo {
         return false;
     }
 
+    public void handleTaskByTxnCommitAttachment(RLTaskTxnCommitAttachment rlTaskTxnCommitAttachment) {
+        judgeEof(rlTaskTxnCommitAttachment);
+    }
+
+    private void judgeEof(RLTaskTxnCommitAttachment rlTaskTxnCommitAttachment) {
+        RoutineLoadJob routineLoadJob = routineLoadManager.getJob(jobId);
+        if (rlTaskTxnCommitAttachment.getTotalRows() < routineLoadJob.getMaxBatchRows()
+                && rlTaskTxnCommitAttachment.getReceivedBytes() < routineLoadJob.getMaxBatchSizeBytes()
+                && rlTaskTxnCommitAttachment.getTaskExecutionTimeMs() < this.timeoutMs) {
+            this.isEof = true;
+        }
+    }
+
     abstract TRoutineLoadTask createRoutineLoadTask() throws UserException;
 
     // begin the txn of this task
@@ -168,7 +190,9 @@ public abstract class RoutineLoadTaskInfo {
         try {
             txnId = Env.getCurrentGlobalTransactionMgr().beginTransaction(routineLoadJob.getDbId(),
                     Lists.newArrayList(routineLoadJob.getTableId()), DebugUtil.printId(id), null,
-                    new TxnCoordinator(TxnSourceType.FE, FrontendOptions.getLocalHostAddress()),
+                    new TxnCoordinator(TxnSourceType.FE, 0,
+                            FrontendOptions.getLocalHostAddress(),
+                            ExecuteEnv.getInstance().getStartupTime()),
                     TransactionState.LoadJobSourceType.ROUTINE_LOAD_TASK, routineLoadJob.getId(),
                     timeoutMs / 1000);
         } catch (DuplicatedRequestException e) {
@@ -179,7 +203,9 @@ public abstract class RoutineLoadTaskInfo {
             // this should not happen for a routine load task, throw it out
             throw e;
         } catch (AnalysisException | BeginTransactionException e) {
-            LOG.debug("begin txn failed for routine load task: {}, {}", DebugUtil.printId(id), e.getMessage());
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("begin txn failed for routine load task: {}, {}", DebugUtil.printId(id), e.getMessage());
+            }
             return false;
         } catch (MetaNotFoundException | QuotaExceedException e) {
             LOG.warn("failed to begin txn for routine load task: {}, job id: {}",
@@ -194,7 +220,11 @@ public abstract class RoutineLoadTaskInfo {
         List<String> row = Lists.newArrayList();
         row.add(DebugUtil.printId(id));
         row.add(String.valueOf(txnId));
-        row.add(txnStatus.name());
+        if (INIT_TXN_ID != txnId) {
+            row.add(txnStatus.name());
+        } else {
+            row.add(null);
+        }
         row.add(String.valueOf(jobId));
         row.add(String.valueOf(TimeUtils.longToTimeString(createTimeMs)));
         row.add(String.valueOf(TimeUtils.longToTimeString(executeStartTimeMs)));
@@ -206,7 +236,7 @@ public abstract class RoutineLoadTaskInfo {
 
     abstract String getTaskDataSourceProperties();
 
-    abstract boolean hasMoreDataToConsume();
+    abstract boolean hasMoreDataToConsume() throws UserException;
 
     @Override
     public boolean equals(Object obj) {

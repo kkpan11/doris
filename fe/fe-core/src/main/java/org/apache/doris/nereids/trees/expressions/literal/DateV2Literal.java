@@ -17,20 +17,25 @@
 
 package org.apache.doris.nereids.trees.expressions.literal;
 
-import org.apache.doris.analysis.LiteralExpr;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
+import org.apache.doris.nereids.types.DateTimeV2Type;
 import org.apache.doris.nereids.types.DateV2Type;
-import org.apache.doris.nereids.util.DateUtils;
+
+import com.google.common.base.Suppliers;
 
 import java.time.LocalDateTime;
+import java.util.function.Supplier;
 
 /**
  * date v2 literal for nereids
  */
 public class DateV2Literal extends DateLiteral {
+    private final Supplier<org.apache.doris.analysis.DateLiteral> legacyLiteral = Suppliers.memoize(() ->
+            new org.apache.doris.analysis.DateLiteral(year, month, day, Type.DATEV2)
+    );
 
     public DateV2Literal(String s) throws AnalysisException {
         super(DateV2Type.INSTANCE, s);
@@ -41,8 +46,8 @@ public class DateV2Literal extends DateLiteral {
     }
 
     @Override
-    public LiteralExpr toLegacyLiteral() {
-        return new org.apache.doris.analysis.DateLiteral(year, month, day, Type.DATEV2);
+    public org.apache.doris.analysis.DateLiteral toLegacyLiteral() {
+        return legacyLiteral.get();
     }
 
     @Override
@@ -50,21 +55,79 @@ public class DateV2Literal extends DateLiteral {
         return visitor.visitDateV2Literal(this, context);
     }
 
-    public Expression plusDays(int days) {
-        return fromJavaDateType(DateUtils.getTime(DATE_FORMATTER, getStringValue()).plusDays(days));
+    public Expression plusDays(long days) {
+        return fromJavaDateType(toJavaDateType().plusDays(days));
     }
 
-    public Expression plusMonths(int months) {
-        return fromJavaDateType(DateUtils.getTime(DATE_FORMATTER, getStringValue()).plusMonths(months));
+    public Expression plusMonths(long months) {
+        return fromJavaDateType(toJavaDateType().plusMonths(months));
     }
 
-    public Expression plusYears(int years) {
-        return fromJavaDateType(DateUtils.getTime(DATE_FORMATTER, getStringValue()).plusYears(years));
+    public Expression plusWeeks(long weeks) {
+        return fromJavaDateType(toJavaDateType().plusWeeks(weeks));
+    }
+
+    public Expression plusYears(long years) {
+        return fromJavaDateType(toJavaDateType().plusYears(years));
     }
 
     public static Expression fromJavaDateType(LocalDateTime dateTime) {
-        return isDateOutOfRange(dateTime)
-                ? new NullLiteral(DateV2Type.INSTANCE)
-                : new DateV2Literal(dateTime.getYear(), dateTime.getMonthValue(), dateTime.getDayOfMonth());
+        if (isDateOutOfRange(dateTime)) {
+            throw new AnalysisException("datetime out of range: " + dateTime.toString());
+        }
+        return new DateV2Literal(dateTime.getYear(), dateTime.getMonthValue(), dateTime.getDayOfMonth());
+    }
+
+    /**
+     * 2020-01-01
+     * @return 2020-01-01 00:00:00
+     */
+    public DateTimeV2Literal toBeginOfTheDay() {
+        return toBeginOfTheDay(DateTimeV2Type.SYSTEM_DEFAULT);
+    }
+
+    /**
+     * 2020-01-01
+     * @return 2020-01-01 00:00:00
+     */
+    public DateTimeV2Literal toBeginOfTheDay(DateTimeV2Type dateType) {
+        return new DateTimeV2Literal(dateType, year, month, day, 0, 0, 0, 000000);
+    }
+
+    /**
+     * 2020-01-01
+     * @return 2020-01-01 23:59:59
+     */
+    public DateTimeV2Literal toEndOfTheDay() {
+        return toEndOfTheDay(DateTimeV2Type.SYSTEM_DEFAULT);
+    }
+
+    /**
+     * 2020-01-01
+     * @return 2020-01-01 23:59:59.9[scale]
+     */
+    public DateTimeV2Literal toEndOfTheDay(DateTimeV2Type dateType) {
+        long microSecond = 0;
+        // eg. scale == 4 -> 999900
+        for (int i = 0; i < 6; ++i) {
+            microSecond *= 10;
+            if (i < dateType.getScale()) {
+                microSecond += 9;
+            }
+        }
+        return new DateTimeV2Literal(dateType, year, month, day, 23, 59, 59, microSecond);
+    }
+
+    /**
+     * 2020-01-01
+     * @return 2020-01-02 0:0:0
+     */
+    public DateTimeV2Literal toBeginOfTomorrow() {
+        Expression tomorrow = plusDays(1);
+        if (tomorrow instanceof DateV2Literal) {
+            return ((DateV2Literal) tomorrow).toBeginOfTheDay();
+        } else {
+            return toEndOfTheDay();
+        }
     }
 }

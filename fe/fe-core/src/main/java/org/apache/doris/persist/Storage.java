@@ -30,6 +30,7 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.RandomAccessFile;
+import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -54,11 +55,16 @@ public class Storage {
     public static final String IMAGE_NEW = "image.ckpt";
     public static final String VERSION_FILE = "VERSION";
     public static final String ROLE_FILE = "ROLE";
+    public static final String DEPLOY_MODE_FILE = "DEPLOY_MODE";
+    public static final String DEPLOY_MODE = "deploy_mode";
+    public static final String CLOUD_MODE = "cloud";
+    public static final String LOCAL_MODE = "local";
 
     private int clusterID = 0;
     private String token;
     private FrontendNodeType role = FrontendNodeType.UNKNOWN;
     private String nodeName;
+    private String deployMode;
     private long editsSeq;
     private long latestImageSeq = 0;
     private long latestValidatedImageSeq = 0;
@@ -96,9 +102,9 @@ public class Storage {
         Properties prop = new Properties();
         File versionFile = getVersionFile();
         if (versionFile.isFile()) {
-            FileInputStream in = new FileInputStream(versionFile);
-            prop.load(in);
-            in.close();
+            try (FileInputStream in = new FileInputStream(versionFile)) {
+                prop.load(in);
+            }
             clusterID = Integer.parseInt(prop.getProperty(CLUSTER_ID));
             if (prop.getProperty(TOKEN) != null) {
                 token = prop.getProperty(TOKEN);
@@ -107,12 +113,20 @@ public class Storage {
 
         File roleFile = getRoleFile();
         if (roleFile.isFile()) {
-            FileInputStream in = new FileInputStream(roleFile);
-            prop.load(in);
-            in.close();
+            try (FileInputStream in = new FileInputStream(roleFile)) {
+                prop.load(in);
+            }
             role = FrontendNodeType.valueOf(prop.getProperty(FRONTEND_ROLE));
             // For compatibility, NODE_NAME may not exist in ROLE file, set nodeName to null
             nodeName = prop.getProperty(NODE_NAME, null);
+        }
+
+        File modeFile = getModeFile();
+        if (modeFile.isFile()) {
+            try (FileInputStream in = new FileInputStream(modeFile)) {
+                prop.load(in);
+            }
+            deployMode = prop.getProperty(DEPLOY_MODE);
         }
 
         // Find the latest two images
@@ -164,6 +178,14 @@ public class Storage {
         return role;
     }
 
+    public String getDeployMode() {
+        return deployMode;
+    }
+
+    public void setDeployMode(String deployMode) {
+        this.deployMode = deployMode;
+    }
+
     public String getNodeName() {
         return nodeName;
     }
@@ -185,8 +207,7 @@ public class Storage {
     }
 
     public static int newClusterID() {
-        Random random = new Random();
-        random.setSeed(System.currentTimeMillis());
+        Random random = new SecureRandom();
 
         int newID = 0;
         while (newID == 0) {
@@ -222,6 +243,12 @@ public class Storage {
         properties.setProperty(NODE_NAME, nameNode);
 
         writePropertiesToFile(properties, ROLE_FILE);
+    }
+
+    public void writeClusterMode() throws IOException {
+        Properties properties = new Properties();
+        properties.setProperty(DEPLOY_MODE, deployMode);
+        writePropertiesToFile(properties, DEPLOY_MODE_FILE);
     }
 
     private void writePropertiesToFile(Properties properties, String fileName) throws IOException {
@@ -285,6 +312,10 @@ public class Storage {
 
     public final File getRoleFile() {
         return new File(metaDir, ROLE_FILE);
+    }
+
+    public final File getModeFile() {
+        return new File(metaDir, DEPLOY_MODE_FILE);
     }
 
     public File getCurrentEditsFile() {

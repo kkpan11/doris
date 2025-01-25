@@ -38,6 +38,7 @@ class Thread;
 struct ScanContext {
 public:
     TUniqueId fragment_instance_id;
+    TUniqueId query_id;
     int64_t offset;
     // use this access_time to clean zombie context
     time_t last_access_time;
@@ -45,14 +46,14 @@ public:
     std::string context_id;
     short keep_alive_min;
     ScanContext(std::string id) : context_id(std::move(id)) {}
-    ScanContext(const TUniqueId& fragment_id, int64_t offset)
-            : fragment_instance_id(fragment_id), offset(offset) {}
 };
 
 class ExternalScanContextMgr {
 public:
     ExternalScanContextMgr(ExecEnv* exec_env);
-    ~ExternalScanContextMgr();
+    ~ExternalScanContextMgr() = default;
+
+    void stop();
 
     Status create_scan_context(std::shared_ptr<ScanContext>* p_context);
 
@@ -61,7 +62,7 @@ public:
     Status clear_scan_context(const std::string& context_id);
 
 private:
-    ExecEnv* _exec_env;
+    ExecEnv* _exec_env = nullptr;
     std::map<std::string, std::shared_ptr<ScanContext>> _active_contexts;
     void gc_expired_context();
 

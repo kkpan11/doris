@@ -18,8 +18,6 @@
 import org.codehaus.groovy.runtime.IOGroovyMethods
 
 suite ("create_mv_complex_type") {
-    sql "ADMIN SET FRONTEND CONFIG ('enable_struct_type' = 'true')"
-    sql "ADMIN SET FRONTEND CONFIG ('enable_map_type' = 'true')"
 
     sql """ DROP TABLE IF EXISTS base_table; """
     sql """
@@ -39,6 +37,8 @@ suite ("create_mv_complex_type") {
 
     sql """insert into base_table select 1, 100000, 1.0, '{"jsonk1": 123}', [100, 200], {"k1": 10}, {1, 2};"""
 
+    sql """alter table base_table modify column c_int set stats ('row_count'='1');"""
+
     def success = false
 
     // 1. special column - mv dup key
@@ -47,7 +47,7 @@ suite ("create_mv_complex_type") {
         sql """create materialized view mv as select c_jsonb, c_int from base_table;"""
         success = true
     } catch (Exception e) {
-        assertTrue(e.getMessage().contains("not support to create materialized view"), e.getMessage())
+        assertTrue(e.getMessage().contains("The first column could not be"), e.getMessage())
     }
     assertFalse(success)
 
@@ -65,7 +65,7 @@ suite ("create_mv_complex_type") {
         sql """create materialized view mv as select c_array, c_int from base_table;"""
         success = true
     } catch (Exception e) {
-        assertTrue(e.getMessage().contains("not support to create materialized view"), e.getMessage())
+        assertTrue(e.getMessage().contains("The first column could not be"), e.getMessage())
     }
     assertFalse(success)
 
@@ -83,7 +83,7 @@ suite ("create_mv_complex_type") {
         sql """create materialized view mv as select c_map, c_int from base_table;"""
         success = true
     } catch (Exception e) {
-        assertTrue(e.getMessage().contains("not support to create materialized view"), e.getMessage())
+        assertTrue(e.getMessage().contains("The first column could not be"), e.getMessage())
     }
     assertFalse(success)
 
@@ -101,7 +101,7 @@ suite ("create_mv_complex_type") {
         sql """create materialized view mv as select c_struct, c_int from base_table;"""
         success = true
     } catch (Exception e) {
-        assertTrue(e.getMessage().contains("not support to create materialized view"), e.getMessage())
+        assertTrue(e.getMessage().contains("The first column could not be"), e.getMessage())
     }
     assertFalse(success)
 
@@ -121,7 +121,7 @@ suite ("create_mv_complex_type") {
         sql """create materialized view mv as select c_bigint, c_int, c_jsonb, count(c_bigint) from base_table group by c_bigint, c_int, c_jsonb;"""
         success = true
     } catch (Exception e) {
-        assertTrue(e.getMessage().contains("don't support filter or group by"), e.getMessage())
+        assertTrue(e.getMessage().contains("don't support filter, group by"), e.getMessage())
     }
     assertFalse(success)
 
@@ -130,7 +130,7 @@ suite ("create_mv_complex_type") {
         sql """create materialized view mv as select c_bigint, c_int, c_array, count(c_bigint) from base_table group by c_bigint, c_int, c_array;"""
         success = true
     } catch (Exception e) {
-        assertTrue(e.getMessage().contains("don't support filter or group by"), e.getMessage())
+        assertTrue(e.getMessage().contains("don't support filter, group by"), e.getMessage())
     }
     assertFalse(success)
 
@@ -139,7 +139,7 @@ suite ("create_mv_complex_type") {
         sql """create materialized view mv as select c_bigint, c_int, c_map, count(c_bigint) from base_table group by c_bigint, c_int, c_map;"""
         success = true
     } catch (Exception e) {
-        assertTrue(e.getMessage().contains("don't support filter or group by"), e.getMessage())
+        assertTrue(e.getMessage().contains("don't support filter, group by"), e.getMessage())
     }
     assertFalse(success)
 
@@ -148,7 +148,7 @@ suite ("create_mv_complex_type") {
         sql """create materialized view mv as select c_bigint, c_int, c_struct, count(c_bigint) from base_table group by c_bigint, c_int, c_struct;"""
         success = true
     } catch (Exception e) {
-        assertTrue(e.getMessage().contains("don't support filter or group by"), e.getMessage())
+        assertTrue(e.getMessage().contains("don't support filter, group by"), e.getMessage())
     }
     assertFalse(success)
 
@@ -159,7 +159,7 @@ suite ("create_mv_complex_type") {
         sql """create materialized view mv as select c_bigint, c_int, c_jsonb from base_table order by c_bigint, c_int, c_jsonb;"""
         success = true
     } catch (Exception e) {
-        assertTrue(e.getMessage().contains("don't support filter or group by"), e.getMessage())
+        assertTrue(e.getMessage().contains("don't support filter, group by"), e.getMessage())
     }
     assertFalse(success)
 
@@ -168,7 +168,7 @@ suite ("create_mv_complex_type") {
         sql """create materialized view mv as select c_bigint, c_int, c_array from base_table order by c_bigint, c_int, c_array;"""
         success = true
     } catch (Exception e) {
-        assertTrue(e.getMessage().contains("don't support filter or group by"), e.getMessage())
+        assertTrue(e.getMessage().contains("don't support filter, group by"), e.getMessage())
     }
     assertFalse(success)
 
@@ -177,7 +177,7 @@ suite ("create_mv_complex_type") {
         sql """create materialized view mv as select c_bigint, c_int, c_map from base_table order by c_bigint, c_int, c_map;"""
         success = true
     } catch (Exception e) {
-        assertTrue(e.getMessage().contains("don't support filter or group by"), e.getMessage())
+        assertTrue(e.getMessage().contains("don't support filter, group by"), e.getMessage())
     }
     assertFalse(success)
 
@@ -186,7 +186,7 @@ suite ("create_mv_complex_type") {
         sql """create materialized view mv as select c_bigint, c_int, c_struct from base_table order by c_bigint, c_int, c_struct;"""
         success = true
     } catch (Exception e) {
-        assertTrue(e.getMessage().contains("don't support filter or group by"), e.getMessage())
+        assertTrue(e.getMessage().contains("don't support filter, group by"), e.getMessage())
     }
     assertFalse(success)
 }

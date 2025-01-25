@@ -19,7 +19,8 @@ package org.apache.doris.nereids.sqltest;
 
 import org.apache.doris.nereids.properties.DistributionSpecHash;
 import org.apache.doris.nereids.properties.DistributionSpecHash.ShuffleType;
-import org.apache.doris.nereids.rules.rewrite.logical.ReorderJoin;
+import org.apache.doris.nereids.properties.PhysicalProperties;
+import org.apache.doris.nereids.rules.rewrite.ReorderJoin;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalDistribute;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalPlan;
 import org.apache.doris.nereids.util.PlanChecker;
@@ -30,6 +31,7 @@ import org.junit.jupiter.api.Test;
 public class JoinTest extends SqlTestBase {
     @Test
     void testJoinUsing() {
+        connectContext.getSessionVariable().setDisableNereidsRules("PRUNE_EMPTY_PARTITION");
         String sql = "SELECT * FROM T1 JOIN T2 using (id)";
         PlanChecker.from(connectContext)
                 .analyze(sql)
@@ -41,29 +43,31 @@ public class JoinTest extends SqlTestBase {
 
     @Test
     void testColocatedJoin() {
+        connectContext.getSessionVariable().setDisableNereidsRules("PRUNE_EMPTY_PARTITION");
         String sql = "select * from T2 join T2 b on T2.id = b.id and T2.id = b.id;";
         PhysicalPlan plan = PlanChecker.from(connectContext)
                 .analyze(sql)
                 .rewrite()
-                .deriveStats()
                 .optimize()
                 .getBestPlanTree();
         // generate colocate join plan without physicalDistribute
         System.out.println(plan.treeString());
-        Assertions.assertFalse(plan.anyMatch(PhysicalDistribute.class::isInstance));
+        Assertions.assertFalse(plan.anyMatch(p -> p instanceof PhysicalDistribute
+                && ((PhysicalDistribute) p).getDistributionSpec() instanceof DistributionSpecHash));
         sql = "select * from T1 join T0 on T1.score = T0.score and T1.id = T0.id;";
         plan = PlanChecker.from(connectContext)
                 .analyze(sql)
                 .rewrite()
-                .deriveStats()
                 .optimize()
                 .getBestPlanTree();
         // generate colocate join plan without physicalDistribute
-        Assertions.assertFalse(plan.anyMatch(PhysicalDistribute.class::isInstance));
+        Assertions.assertFalse(plan.anyMatch(p -> p instanceof PhysicalDistribute
+                && ((PhysicalDistribute) p).getDistributionSpec() instanceof DistributionSpecHash));
     }
 
     @Test
     void testDedupConjuncts() {
+        connectContext.getSessionVariable().setDisableNereidsRules("PRUNE_EMPTY_PARTITION");
         String sql = "select * from T1 join T2 on T1.id = T2.id and T1.id = T2.id;";
         PlanChecker.from(connectContext)
                 .analyze(sql)
@@ -83,6 +87,7 @@ public class JoinTest extends SqlTestBase {
 
     @Test
     void testBucketJoinWithAgg() {
+        connectContext.getSessionVariable().setDisableNereidsRules("PRUNE_EMPTY_PARTITION");
         String sql = "select * from "
                 + "(select distinct id as cnt from T2) T1 inner join"
                 + "(select distinct id as cnt from T2) T2 "
@@ -91,9 +96,11 @@ public class JoinTest extends SqlTestBase {
                 .analyze(sql)
                 .rewrite()
                 .optimize()
-                .getBestPlanTree();
+                .getBestPlanTree(PhysicalProperties.ANY);
         Assertions.assertEquals(
-                ((DistributionSpecHash) plan.getPhysicalProperties().getDistributionSpec()).getShuffleType(),
-                ShuffleType.NATURAL);
+                ShuffleType.NATURAL,
+                ((DistributionSpecHash) ((PhysicalPlan) (plan.child(0).child(0)))
+                        .getPhysicalProperties().getDistributionSpec()).getShuffleType()
+        );
     }
 }

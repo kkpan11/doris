@@ -100,7 +100,6 @@ public class RoundRobinCreateTabletTest {
     @Test
     public void testCreateTablets() {
         MaterializedIndex index = new MaterializedIndex();
-        String clusterName = "default_cluster";
         HashDistributionInfo distributionInfo = new HashDistributionInfo(48, null);
         ReplicaAllocation replicaAlloc = new ReplicaAllocation((short) 3);
         TabletMeta tabletMeta = new TabletMeta(1L, 2L, 3L, 4L, 5, TStorageMedium.HDD);
@@ -111,9 +110,9 @@ public class RoundRobinCreateTabletTest {
         Config.disable_storage_medium_check = true;
 
         try {
-            Env.getCurrentEnv().getInternalCatalog().createTablets(clusterName, index, ReplicaState.NORMAL,
+            Env.getCurrentEnv().getInternalCatalog().createTablets(index, ReplicaState.NORMAL,
                     distributionInfo, 0, replicaAlloc, tabletMeta,
-                    tabletIdSet, idGeneratorBuffer);
+                    tabletIdSet, idGeneratorBuffer, false);
         } catch (Exception e) {
             System.out.println("failed to create tablets " + e.getMessage());
         }
@@ -122,7 +121,7 @@ public class RoundRobinCreateTabletTest {
         int beNum = 4;
         for (Tablet tablet : index.getTablets()) {
             for (Replica replica : tablet.getReplicas()) {
-                Assert.assertEquals((i++ % beNum) + 1, replica.getBackendId());
+                Assert.assertEquals((i++ % beNum) + 1, replica.getBackendIdWithoutException());
             }
         }
     }

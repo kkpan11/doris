@@ -24,7 +24,8 @@ import org.apache.doris.nereids.glue.translator.PlanTranslatorContext;
 import org.apache.doris.nereids.parser.NereidsParser;
 import org.apache.doris.nereids.properties.PhysicalProperties;
 import org.apache.doris.nereids.rules.analysis.LogicalSubQueryAliasToLogicalProject;
-import org.apache.doris.nereids.rules.rewrite.logical.MergeProjects;
+import org.apache.doris.nereids.rules.rewrite.InlineLogicalView;
+import org.apache.doris.nereids.rules.rewrite.MergeProjects;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalPlan;
 import org.apache.doris.nereids.util.MemoPatternMatchSupported;
 import org.apache.doris.nereids.util.MemoTestUtils;
@@ -41,7 +42,7 @@ public class ViewTest extends TestWithFeService implements MemoPatternMatchSuppo
     @Override
     protected void runBeforeAll() throws Exception {
         createDatabase("test");
-        connectContext.setDatabase("default_cluster:test");
+        connectContext.setDatabase("test");
         createTables(
                 "CREATE TABLE IF NOT EXISTS T1 (\n"
                         + "    ID1 bigint,\n"
@@ -100,7 +101,7 @@ public class ViewTest extends TestWithFeService implements MemoPatternMatchSuppo
             System.out.println("\n\n***** " + sql + " *****\n\n");
             StatementContext statementContext = MemoTestUtils.createStatementContext(connectContext, sql);
             NereidsPlanner planner = new NereidsPlanner(statementContext);
-            PhysicalPlan plan = planner.plan(
+            PhysicalPlan plan = planner.planWithLock(
                     new NereidsParser().parseSingle(sql),
                     PhysicalProperties.ANY
             );
@@ -115,7 +116,7 @@ public class ViewTest extends TestWithFeService implements MemoPatternMatchSuppo
                 .analyze("SELECT * FROM V1")
                 .applyTopDown(new LogicalSubQueryAliasToLogicalProject())
                 .applyTopDown(new MergeProjects())
-                .matchesFromRoot(
+                .matches(
                       logicalProject(
                               logicalOlapScan()
                       )
@@ -141,17 +142,18 @@ public class ViewTest extends TestWithFeService implements MemoPatternMatchSuppo
                         + "ON X.ID1 = Y.ID3"
                 )
                 .applyTopDown(new LogicalSubQueryAliasToLogicalProject())
+                .applyBottomUp(new InlineLogicalView())
                 .applyTopDown(new MergeProjects())
-                .matchesFromRoot(
+                .matches(
                         logicalProject(
                                 logicalJoin(
                                         logicalProject(
                                                 logicalJoin(
                                                         logicalProject(
-                                                                logicalOlapScan()
+                                                                    logicalOlapScan()
                                                         ),
                                                         logicalProject(
-                                                                logicalOlapScan()
+                                                                    logicalOlapScan()
                                                         )
                                                 )
                                         ),

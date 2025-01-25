@@ -25,6 +25,7 @@ import org.apache.doris.common.io.Writable;
 import org.apache.doris.ha.BDBHA;
 import org.apache.doris.ha.FrontendNodeType;
 import org.apache.doris.persist.gson.GsonUtils;
+import org.apache.doris.service.FeDiskInfo;
 import org.apache.doris.system.HeartbeatResponse.HbStatus;
 import org.apache.doris.system.SystemInfoService.HostInfo;
 
@@ -33,6 +34,7 @@ import com.google.gson.annotations.SerializedName;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
+import java.util.List;
 
 public class Frontend implements Writable {
     @SerializedName("role")
@@ -45,16 +47,24 @@ public class Frontend implements Writable {
     // used for getIpByHostname
     @SerializedName("editLogPort")
     private int editLogPort;
+    @SerializedName("cloudUniqueId")
+    private String cloudUniqueId;
+
     private String version;
 
     private int queryPort;
     private int rpcPort;
+    private int arrowFlightSqlPort;
 
     private long replayedJournalId;
+    private long lastStartupTime;
     private long lastUpdateTime;
     private String heartbeatErrMsg = "";
+    private List<FeDiskInfo> diskInfos;
 
     private boolean isAlive = false;
+
+    private long processUUID = 0;
 
     public Frontend() {
     }
@@ -94,6 +104,10 @@ public class Frontend implements Writable {
         return rpcPort;
     }
 
+    public int getArrowFlightSqlPort() {
+        return arrowFlightSqlPort;
+    }
+
     public boolean isAlive() {
         return isAlive;
     }
@@ -114,8 +128,28 @@ public class Frontend implements Writable {
         return heartbeatErrMsg;
     }
 
+    public long getLastStartupTime() {
+        return lastStartupTime;
+    }
+
+    public long getProcessUUID() {
+        return processUUID;
+    }
+
     public long getLastUpdateTime() {
         return lastUpdateTime;
+    }
+
+    public List<FeDiskInfo> getDiskInfos() {
+        return diskInfos;
+    }
+
+    public void setCloudUniqueId(String cloudUniqueId) {
+        this.cloudUniqueId = cloudUniqueId;
+    }
+
+    public String getCloudUniqueId() {
+        return cloudUniqueId;
     }
 
     /**
@@ -135,11 +169,20 @@ public class Frontend implements Writable {
             version = hbResponse.getVersion();
             queryPort = hbResponse.getQueryPort();
             rpcPort = hbResponse.getRpcPort();
+            arrowFlightSqlPort = hbResponse.getArrowFlightSqlPort();
             replayedJournalId = hbResponse.getReplayedJournalId();
             lastUpdateTime = hbResponse.getHbTime();
             heartbeatErrMsg = "";
+            lastStartupTime = hbResponse.getProcessUUID();
+            diskInfos = hbResponse.getDiskInfos();
             isChanged = true;
+            processUUID = hbResponse.getProcessUUID();
         } else {
+            // A non-master node disconnected.
+            // Set startUUID to zero, and be's heartbeat mgr will ignore this hb,
+            // so that its cancel worker will not cancel queries from this fe immediately
+            // until it receives a valid start UUID.
+            processUUID = 0;
             if (isAlive) {
                 isAlive = false;
                 isChanged = true;
@@ -193,5 +236,9 @@ public class Frontend implements Writable {
 
     public HostInfo toHostInfo() {
         return new HostInfo(host, editLogPort);
+    }
+
+    public boolean isOldStyleNodeName() {
+        return nodeName.equals(host + "_" + editLogPort);
     }
 }

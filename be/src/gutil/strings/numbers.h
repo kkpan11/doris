@@ -21,7 +21,6 @@ using std::string;
 
 using std::vector;
 
-#include "gutil/int128.h"
 #include "gutil/integral_types.h"
 // IWYU pragma: no_include <butil/macros.h>
 #include "gutil/macros.h" // IWYU pragma: keep
@@ -34,9 +33,6 @@ using std::vector;
 
 // Convert a fingerprint to 16 hex digits.
 string Uint64ToString(uint64 fp);
-
-// Formats a uint128 as a 32-digit hex string.
-string Uint128ToHexString(uint128 ui128);
 
 // Convert strings to numeric values, with strict error checking.
 // Leading and trailing spaces are allowed.
@@ -516,9 +512,9 @@ string AccurateItoaKMGT(int64 i);
 //    '\0'-terminated, which is more efficient.
 // ----------------------------------------------------------------------
 struct DoubleRangeOptions {
-    const char* separators;
+    const char* separators = nullptr;
     bool require_separator;
-    const char* acceptable_terminators;
+    const char* acceptable_terminators = nullptr;
     bool null_terminator_ok;
     bool allow_unbounded_markers;
     uint32 num_required_bounds;

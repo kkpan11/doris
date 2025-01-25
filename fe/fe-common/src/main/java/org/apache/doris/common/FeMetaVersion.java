@@ -64,9 +64,48 @@ public final class FeMetaVersion {
     public static final int VERSION_121 = 121;
     // For IndexChangeJob
     public static final int VERSION_122 = 122;
+    // For AnalysisInfo
+    public static final int VERSION_123 = 123;
+    // For auto-increment column
+    public static final int VERSION_124 = 124;
+    // For write/read auto create partition expr
+    public static final int VERSION_125 = 125;
+    // For write/read function nullable mode info
+    public static final int VERSION_126 = 126;
+    // For constraints
+    public static final int VERSION_127 = 127;
+    // For statistics. Update rows, new partition loaded, AnalysisJobInfo and AnalysisTaskInfo
+    public static final int VERSION_128 = 128;
+    // For table version
+    public static final int VERSION_129 = 129;
+
+    public static final int VERSION_130 = 130;
+
+    // for java-udtf add a bool field to write
+    public static final int VERSION_131 = 131;
+
+    // For transaction insert
+    public static final int VERSION_132 = 132;
+    // for expr serde
+    public static final int VERSION_133 = 133;
+    // For mate gson
+    public static final int VERSION_134 = 134;
+    // For mate gson
+    public static final int VERSION_135 = 135;
+    // For mate gson
+    public static final int VERSION_136 = 136;
+    // For mate gson
+    public static final int VERSION_137 = 137;
+
+    public static final int VERSION_138 = 138;
+
+    public static final int VERSION_139 = 139;
+
+    public static final int VERSION_140 = 140;
 
     // note: when increment meta version, should assign the latest version to VERSION_CURRENT
-    public static final int VERSION_CURRENT = VERSION_122;
+    public static final int VERSION_CURRENT = VERSION_140;
+
 
     // all logs meta version should >= the minimum version, so that we could remove many if clause, for example
     // if (FE_METAVERSION < VERSION_94) ...

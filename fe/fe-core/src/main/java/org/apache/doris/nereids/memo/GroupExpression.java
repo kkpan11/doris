@@ -35,6 +35,7 @@ import org.apache.doris.statistics.Statistics;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 
@@ -53,7 +54,7 @@ public class GroupExpression {
     private static final EventProducer COST_STATE_TRACER = new EventProducer(CostStateUpdateEvent.class,
             EventChannel.getDefaultChannel().addConsumers(new LogConsumer(CostStateUpdateEvent.class,
                     EventChannel.LOG)));
-    private double cost = 0.0;
+    private Cost cost;
     private Group ownerGroup;
     private final List<Group> children;
     private final Plan plan;
@@ -62,7 +63,7 @@ public class GroupExpression {
 
     private double estOutputRowCount = -1;
 
-    //Record the rule that generate this plan. It's used for debugging
+    // Record the rule that generate this plan. It's used for debugging
     private Rule fromRule;
 
     // Mapping from output properties to the corresponding best cost, statistics, and child properties.
@@ -77,13 +78,17 @@ public class GroupExpression {
     // After mergeGroup(), source Group was cleaned up, but it may be in the Job Stack. So use this to mark and skip it.
     private boolean isUnused = false;
 
-    private ObjectId id = StatementScopeIdGenerator.newObjectId();
+    private final ObjectId id = StatementScopeIdGenerator.newObjectId();
 
+    /**
+     * Just for UT.
+     */
     public GroupExpression(Plan plan) {
         this(plan, Lists.newArrayList());
     }
 
     /**
+     * Notice!!!: children will use param `children` directly, So don't modify it after this constructor outside.
      * Constructor for GroupExpression.
      *
      * @param plan {@link Plan} to reference
@@ -92,12 +97,14 @@ public class GroupExpression {
     public GroupExpression(Plan plan, List<Group> children) {
         this.plan = Objects.requireNonNull(plan, "plan can not be null")
                 .withGroupExpression(Optional.of(this));
-        this.children = Lists.newArrayList(Objects.requireNonNull(children, "children can not be null"));
-        this.children.forEach(childGroup -> childGroup.addParentExpression(this));
+        this.children = Objects.requireNonNull(children, "children can not be null");
         this.ruleMasks = new BitSet(RuleType.SENTINEL.ordinal());
         this.statDerived = false;
         this.lowestCostTable = Maps.newHashMap();
         this.requestPropertiesMap = Maps.newHashMap();
+        for (Group child : children) {
+            child.addParentExpression(this);
+        }
     }
 
     public PhysicalProperties getOutputProperties(PhysicalProperties requestProperties) {
@@ -166,6 +173,10 @@ public class GroupExpression {
 
     public void propagateApplied(GroupExpression toGroupExpression) {
         toGroupExpression.ruleMasks.or(ruleMasks);
+    }
+
+    public void clearApplied() {
+        ruleMasks.clear();
     }
 
     public boolean isStatDerived() {
@@ -244,9 +255,9 @@ public class GroupExpression {
         return lowestCostTable.get(property).first;
     }
 
-    public void putOutputPropertiesMap(PhysicalProperties outputPropertySet,
-            PhysicalProperties requiredPropertySet) {
-        this.requestPropertiesMap.put(requiredPropertySet, outputPropertySet);
+    public void putOutputPropertiesMap(PhysicalProperties outputProperties,
+            PhysicalProperties requiredProperties) {
+        this.requestPropertiesMap.put(requiredProperties, outputProperties);
     }
 
     /**
@@ -265,7 +276,27 @@ public class GroupExpression {
         this.getLowestCostTable()
                 .forEach((properties, pair) -> target.updateLowestCostTable(properties, pair.second, pair.first));
         // requestPropertiesMap
-        target.requestPropertiesMap.putAll(this.requestPropertiesMap);
+        // ATTN: when do merge, we should update target requestPropertiesMap
+        //   ONLY IF the cost of source's request property lower than target one.
+        //   Otherwise, the requestPropertiesMap will not sync with lowestCostTable.
+        //   Then, we will get wrong output property when get the final plan.
+        for (Map.Entry<PhysicalProperties, PhysicalProperties> entry : requestPropertiesMap.entrySet()) {
+            PhysicalProperties request = entry.getKey();
+            if (!target.requestPropertiesMap.containsKey(request)) {
+                target.requestPropertiesMap.put(entry.getKey(), entry.getValue());
+            } else {
+                PhysicalProperties sourceOutput = entry.getValue();
+                PhysicalProperties targetOutput = target.getRequestPropertiesMap().get(request);
+                if (this.getLowestCostTable().containsKey(sourceOutput)
+                        && target.getLowestCostTable().containsKey(targetOutput)) {
+                    Cost sourceCost = this.getLowestCostTable().get(sourceOutput).first;
+                    Cost targetCost = target.getLowestCostTable().get(targetOutput).first;
+                    if (sourceCost.getValue() < targetCost.getValue()) {
+                        target.requestPropertiesMap.put(entry.getKey(), entry.getValue());
+                    }
+                }
+            }
+        }
         // ruleMasks
         target.ruleMasks.or(this.ruleMasks);
 
@@ -275,11 +306,11 @@ public class GroupExpression {
         this.ownerGroup = null;
     }
 
-    public double getCost() {
+    public Cost getCost() {
         return cost;
     }
 
-    public void setCost(double cost) {
+    public void setCost(Cost cost) {
         this.cost = cost;
     }
 
@@ -292,8 +323,7 @@ public class GroupExpression {
             return false;
         }
         GroupExpression that = (GroupExpression) o;
-        return children.equals(that.children) && plan.equals(that.plan)
-                && plan.getLogicalProperties().equals(that.plan.getLogicalProperties());
+        return children.equals(that.children) && plan.equals(that.plan);
     }
 
     @Override
@@ -302,11 +332,15 @@ public class GroupExpression {
     }
 
     public Statistics childStatistics(int idx) {
-        return new Statistics(child(idx).getStatistics());
+        return child(idx).getStatistics();
     }
 
     public void setEstOutputRowCount(double estOutputRowCount) {
         this.estOutputRowCount = estOutputRowCount;
+    }
+
+    public Map<PhysicalProperties, PhysicalProperties> getRequestPropertiesMap() {
+        return ImmutableMap.copyOf(requestPropertiesMap);
     }
 
     @Override
@@ -319,12 +353,44 @@ public class GroupExpression {
         } else {
             builder.append("#").append(ownerGroup.getGroupId().asInt());
         }
-        builder.append(" cost=").append(format.format((long) cost));
+        if (cost != null) {
+            builder.append(" cost=").append(cost.getValue() + " " + cost);
+        } else {
+            builder.append(" cost=null");
+        }
         builder.append(" estRows=").append(format.format(estOutputRowCount));
-        builder.append(" (plan=").append(plan.toString()).append(") children=[");
-        builder.append(Joiner.on(", ").join(
-                children.stream().map(Group::getGroupId).collect(Collectors.toList())));
-        builder.append("]");
+        builder.append(" children=[").append(Joiner.on(", ").join(
+                        children.stream().map(Group::getGroupId).collect(Collectors.toList())))
+                .append(" ]");
+        builder.append(" (plan=").append(plan.toString()).append(")");
         return builder.toString();
+    }
+
+    public ObjectId getId() {
+        return id;
+    }
+
+    /**
+     * the first child plan of clazz
+     * @param clazz the operator type, like join/aggregate
+     * @return child operator of type clazz, if not found, return null
+     */
+    public Plan getFirstChildPlan(Class clazz) {
+        for (Group childGroup : children) {
+            for (GroupExpression logical : childGroup.getLogicalExpressions()) {
+                if (clazz.isInstance(logical.getPlan())) {
+                    return logical.getPlan();
+                }
+            }
+        }
+        // for dphyp
+        for (Group childGroup : children) {
+            for (GroupExpression physical : childGroup.getPhysicalExpressions()) {
+                if (clazz.isInstance(physical.getPlan())) {
+                    return physical.getPlan();
+                }
+            }
+        }
+        return null;
     }
 }

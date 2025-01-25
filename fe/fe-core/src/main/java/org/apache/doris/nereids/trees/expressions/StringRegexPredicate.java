@@ -41,15 +41,12 @@ public abstract class StringRegexPredicate extends ScalarFunction
             FunctionSignature.ret(BooleanType.INSTANCE).args(VarcharType.SYSTEM_DEFAULT, VarcharType.SYSTEM_DEFAULT)
     );
 
-    /**
-     * Constructor of StringRegexPredicate.
-     *
-     * @param left     left child of string regex
-     * @param right    right child of string regex
-     * @param name   operator symbol
-     */
-    public StringRegexPredicate(String name, Expression left, Expression right) {
-        super(name, left, right);
+    protected StringRegexPredicate(String name, List<Expression> children) {
+        this(name, children, false);
+    }
+
+    protected StringRegexPredicate(String name, List<Expression> children, boolean inferred) {
+        super(name, children, inferred);
     }
 
     @Override
@@ -58,7 +55,7 @@ public abstract class StringRegexPredicate extends ScalarFunction
     }
 
     @Override
-    public String toSql() {
+    public String computeToSql() {
         return '(' + left().toSql() + ' ' + getName() + ' ' + right().toSql() + ')';
     }
 

@@ -22,7 +22,6 @@
 #include <stdint.h>
 
 #include <list>
-#include <map>
 #include <memory>
 #include <string>
 #include <tuple>
@@ -33,8 +32,10 @@
 #include "common/status.h"
 #include "exec/olap_common.h"
 #include "io/file_factory.h"
+#include "io/fs/file_meta_cache.h"
 #include "io/fs/file_reader.h"
 #include "io/fs/file_reader_writer_fwd.h"
+#include "util/obj_lru_cache.h"
 #include "util/runtime_profile.h"
 #include "vec/exec/format/generic_reader.h"
 #include "vec/exec/format/parquet/parquet_common.h"
@@ -54,7 +55,7 @@ class TupleDescriptor;
 
 namespace io {
 class FileSystem;
-class IOContext;
+struct IOContext;
 } // namespace io
 namespace vectorized {
 class Block;
@@ -88,11 +89,14 @@ public:
         int64_t open_file_num = 0;
         int64_t row_group_filter_time = 0;
         int64_t page_index_filter_time = 0;
+        int64_t read_page_index_time = 0;
+        int64_t parse_page_index_time = 0;
+        int64_t predicate_filter_time = 0;
     };
 
     ParquetReader(RuntimeProfile* profile, const TFileScanRangeParams& params,
                   const TFileRangeDesc& range, size_t batch_size, cctz::time_zone* ctz,
-                  io::IOContext* io_ctx, RuntimeState* state, ShardedKVCache* kv_cache = nullptr,
+                  io::IOContext* io_ctx, RuntimeState* state, FileMetaCache* meta_cache = nullptr,
                   bool enable_lazy_mat = true);
 
     ParquetReader(const TFileScanRangeParams& params, const TFileRangeDesc& range,
@@ -113,11 +117,11 @@ public:
             const std::unordered_map<std::string, int>* colname_to_slot_id,
             const VExprContextSPtrs* not_single_slot_filter_conjuncts,
             const std::unordered_map<int, VExprContextSPtrs>* slot_id_to_filter_conjuncts,
-            bool filter_groups = true);
+            bool filter_groups = true, const bool hive_use_column_names = true);
 
     Status get_next_block(Block* block, size_t* read_rows, bool* eof) override;
 
-    void close();
+    Status close() override;
 
     RowRange get_whole_range() { return _whole_range; }
 
@@ -126,7 +130,6 @@ public:
 
     int64_t size() const { return _file_reader->size(); }
 
-    std::unordered_map<std::string, TypeDescriptor> get_name_to_type() override;
     Status get_columns(std::unordered_map<std::string, TypeDescriptor>* name_to_type,
                        std::unordered_set<std::string>* missing_cols) override;
 
@@ -137,53 +140,65 @@ public:
 
     const tparquet::FileMetaData* get_meta_data() const { return _t_metadata; }
 
+    // Only for iceberg reader to sanitize invalid column names
+    void iceberg_sanitize(const std::vector<std::string>& read_columns);
+
     Status set_fill_columns(
             const std::unordered_map<std::string, std::tuple<std::string, const SlotDescriptor*>>&
                     partition_columns,
             const std::unordered_map<std::string, VExprContextSPtr>& missing_columns) override;
 
-    std::vector<tparquet::KeyValue> get_metadata_key_values();
+    const FieldDescriptor get_file_metadata_schema();
     void set_table_to_file_col_map(std::unordered_map<std::string, std::string>& map) {
         _table_col_to_file_col = map;
     }
 
+protected:
+    void _collect_profile_before_close() override;
+
 private:
     struct ParquetProfile {
-        RuntimeProfile::Counter* filtered_row_groups;
-        RuntimeProfile::Counter* to_read_row_groups;
-        RuntimeProfile::Counter* filtered_group_rows;
-        RuntimeProfile::Counter* filtered_page_rows;
-        RuntimeProfile::Counter* lazy_read_filtered_rows;
-        RuntimeProfile::Counter* filtered_bytes;
-        RuntimeProfile::Counter* raw_rows_read;
-        RuntimeProfile::Counter* to_read_bytes;
-        RuntimeProfile::Counter* column_read_time;
-        RuntimeProfile::Counter* parse_meta_time;
-        RuntimeProfile::Counter* parse_footer_time;
-        RuntimeProfile::Counter* open_file_time;
-        RuntimeProfile::Counter* open_file_num;
-        RuntimeProfile::Counter* row_group_filter_time;
-        RuntimeProfile::Counter* page_index_filter_time;
+        RuntimeProfile::Counter* filtered_row_groups = nullptr;
+        RuntimeProfile::Counter* to_read_row_groups = nullptr;
+        RuntimeProfile::Counter* filtered_group_rows = nullptr;
+        RuntimeProfile::Counter* filtered_page_rows = nullptr;
+        RuntimeProfile::Counter* lazy_read_filtered_rows = nullptr;
+        RuntimeProfile::Counter* filtered_bytes = nullptr;
+        RuntimeProfile::Counter* raw_rows_read = nullptr;
+        RuntimeProfile::Counter* to_read_bytes = nullptr;
+        RuntimeProfile::Counter* column_read_time = nullptr;
+        RuntimeProfile::Counter* parse_meta_time = nullptr;
+        RuntimeProfile::Counter* parse_footer_time = nullptr;
+        RuntimeProfile::Counter* open_file_time = nullptr;
+        RuntimeProfile::Counter* open_file_num = nullptr;
+        RuntimeProfile::Counter* row_group_filter_time = nullptr;
+        RuntimeProfile::Counter* page_index_filter_time = nullptr;
+        RuntimeProfile::Counter* read_page_index_time = nullptr;
+        RuntimeProfile::Counter* parse_page_index_time = nullptr;
 
-        RuntimeProfile::Counter* file_read_time;
-        RuntimeProfile::Counter* file_read_calls;
-        RuntimeProfile::Counter* file_read_bytes;
-        RuntimeProfile::Counter* decompress_time;
-        RuntimeProfile::Counter* decompress_cnt;
-        RuntimeProfile::Counter* decode_header_time;
-        RuntimeProfile::Counter* decode_value_time;
-        RuntimeProfile::Counter* decode_dict_time;
-        RuntimeProfile::Counter* decode_level_time;
-        RuntimeProfile::Counter* decode_null_map_time;
+        RuntimeProfile::Counter* file_read_time = nullptr;
+        RuntimeProfile::Counter* file_read_calls = nullptr;
+        RuntimeProfile::Counter* file_meta_read_calls = nullptr;
+        RuntimeProfile::Counter* file_read_bytes = nullptr;
+        RuntimeProfile::Counter* decompress_time = nullptr;
+        RuntimeProfile::Counter* decompress_cnt = nullptr;
+        RuntimeProfile::Counter* decode_header_time = nullptr;
+        RuntimeProfile::Counter* decode_value_time = nullptr;
+        RuntimeProfile::Counter* decode_dict_time = nullptr;
+        RuntimeProfile::Counter* decode_level_time = nullptr;
+        RuntimeProfile::Counter* decode_null_map_time = nullptr;
+        RuntimeProfile::Counter* skip_page_header_num = nullptr;
+        RuntimeProfile::Counter* parse_page_header_num = nullptr;
+        RuntimeProfile::Counter* predicate_filter_time = nullptr;
     };
 
     Status _open_file();
     void _init_profile();
+    void _close_internal();
     Status _next_row_group_reader();
     RowGroupReader::PositionDeleteContext _get_position_delete_ctx(
             const tparquet::RowGroup& row_group,
             const RowGroupReader::RowGroupIndex& row_group_index);
-    Status _init_read_columns();
     Status _init_row_groups(const bool& is_filter_groups);
     void _init_system_properties();
     void _init_file_description();
@@ -205,33 +220,41 @@ private:
     std::string _meta_cache_key(const std::string& path) { return "meta_" + path; }
     std::vector<io::PrefetchRange> _generate_random_access_ranges(
             const RowGroupReader::RowGroupIndex& group, size_t* avg_io_size);
+    void _collect_profile();
 
-    RuntimeProfile* _profile;
+    static SortOrder _determine_sort_order(const tparquet::SchemaElement& parquet_schema);
+
+private:
+    RuntimeProfile* _profile = nullptr;
     const TFileScanRangeParams& _scan_params;
     const TFileRangeDesc& _scan_range;
-    FileSystemProperties _system_properties;
-    FileDescription _file_description;
-    std::shared_ptr<io::FileSystem> _file_system = nullptr;
-    io::FileReaderSPtr _file_reader = nullptr;
+    io::FileSystemProperties _system_properties;
+    io::FileDescription _file_description;
+
+    // the following fields are for parquet meta data cache.
+    // if _meta_cache is not null, the _file_metadata will be got from _meta_cache,
+    // and it is owned by _meta_cache_handle.
+    // if _meta_cache is null, _file_metadata will be managed by _file_metadata_ptr,
+    // which will be released when deconstructing.
+    // ATTN: these fields must be before _file_reader, to make sure they will be released
+    // after _file_reader. Otherwise, there may be heap-use-after-free bug.
+    ObjLRUCache::CacheHandle _meta_cache_handle;
+    std::unique_ptr<FileMetaData> _file_metadata_ptr;
     FileMetaData* _file_metadata = nullptr;
-    // set to true if _file_metadata is owned by this reader.
-    // otherwise, it is owned by someone else, such as _kv_cache
-    bool _is_file_metadata_owned = false;
-    const tparquet::FileMetaData* _t_metadata;
-    std::unique_ptr<RowGroupReader> _current_group_reader = nullptr;
+    const tparquet::FileMetaData* _t_metadata = nullptr;
+
+    io::FileReaderSPtr _file_reader = nullptr;
+    std::unique_ptr<RowGroupReader> _current_group_reader;
     // read to the end of current reader
     bool _row_group_eof = true;
-    int32_t _total_groups;                  // num of groups(stripes) of a parquet(orc) file
-    std::map<std::string, int> _map_column; // column-name <---> column-index
+    int32_t _total_groups; // num of groups(stripes) of a parquet(orc) file
     // table column name to file column name map. For iceberg schema evolution.
     std::unordered_map<std::string, std::string> _table_col_to_file_col;
-    std::unordered_map<std::string, ColumnValueRangeType>* _colname_to_value_range;
-    std::vector<ParquetReadColumn> _read_columns;
+    std::unordered_map<std::string, ColumnValueRangeType>* _colname_to_value_range = nullptr;
+    std::vector<std::string> _read_columns;
     RowRange _whole_range = RowRange(0, 0);
     const std::vector<int64_t>* _delete_rows = nullptr;
     int64_t _delete_rows_index = 0;
-    // should turn off filtering by page index and lazy read if having complex type
-    bool _has_complex_type = false;
 
     // Used for column lazy read.
     RowGroupReader::LazyReadContext _lazy_read_ctx;
@@ -241,27 +264,29 @@ private:
     size_t _batch_size;
     int64_t _range_start_offset;
     int64_t _range_size;
-    cctz::time_zone* _ctz;
+    cctz::time_zone* _ctz = nullptr;
 
     std::unordered_map<int, tparquet::OffsetIndex> _col_offsets;
-    const std::vector<std::string>* _column_names;
+    const std::vector<std::string>* _column_names = nullptr;
 
     std::vector<std::string> _missing_cols;
     Statistics _statistics;
     ParquetColumnReader::Statistics _column_statistics;
     ParquetProfile _parquet_profile;
     bool _closed = false;
-    io::IOContext* _io_ctx;
-    RuntimeState* _state;
+    io::IOContext* _io_ctx = nullptr;
+    RuntimeState* _state = nullptr;
     // Cache to save some common part such as file footer.
-    // Owned by scan node and shared by all parquet readers of this scan node.
     // Maybe null if not used
-    ShardedKVCache* _kv_cache = nullptr;
+    FileMetaCache* _meta_cache = nullptr;
     bool _enable_lazy_mat = true;
-    const TupleDescriptor* _tuple_descriptor;
-    const RowDescriptor* _row_descriptor;
-    const std::unordered_map<std::string, int>* _colname_to_slot_id;
-    const VExprContextSPtrs* _not_single_slot_filter_conjuncts;
-    const std::unordered_map<int, VExprContextSPtrs>* _slot_id_to_filter_conjuncts;
+    bool _enable_filter_by_min_max = true;
+    const TupleDescriptor* _tuple_descriptor = nullptr;
+    const RowDescriptor* _row_descriptor = nullptr;
+    const std::unordered_map<std::string, int>* _colname_to_slot_id = nullptr;
+    const VExprContextSPtrs* _not_single_slot_filter_conjuncts = nullptr;
+    const std::unordered_map<int, VExprContextSPtrs>* _slot_id_to_filter_conjuncts = nullptr;
+    bool _hive_use_column_names = false;
+    std::unordered_map<tparquet::Type::type, bool> _ignored_stats;
 };
 } // namespace doris::vectorized

@@ -41,7 +41,7 @@ public class SqlModeTest {
         } catch (Exception e) {
             Assert.fail(e.getMessage());
         }
-        Assert.assertEquals("SELECT * FROM `db1`.`tbl1` WHERE `name` = 'BILL GATES'", selectStmt.toSql());
+        Assert.assertEquals("SELECT * FROM `db1`.`tbl1` WHERE (`name` = 'BILL GATES')", selectStmt.toSql());
 
         parser = new SqlParser(new SqlScanner(new StringReader(stmt), SqlModeHelper.MODE_DEFAULT));
         try {
@@ -49,7 +49,7 @@ public class SqlModeTest {
         } catch (Exception e) {
             Assert.fail(e.getMessage());
         }
-        Assert.assertEquals("SELECT * FROM `db1`.`tbl1` WHERE `name` = 'BILL GATES'", selectStmt.toSql());
+        Assert.assertEquals("SELECT * FROM `db1`.`tbl1` WHERE (`name` = 'BILL GATES')", selectStmt.toSql());
     }
 
     @Test
@@ -80,7 +80,7 @@ public class SqlModeTest {
         if (!(expr instanceof CompoundPredicate)) {
             Assert.fail();
         }
-        Assert.assertEquals("'a' OR 'b' OR 'c'", expr.toSql());
+        Assert.assertEquals("(('a' OR 'b') OR 'c')", expr.toSql());
     }
 
     @Test
@@ -100,6 +100,7 @@ public class SqlModeTest {
         }
 
         analyzer = AccessTestUtil.fetchAdminAnalyzer(false);
+        analyzer.getContext().getSessionVariable().setEnableFoldConstantByBe(false);
         try {
             parsedStmt.analyze(analyzer);
             ExprRewriter rewriter = analyzer.getExprRewriter();

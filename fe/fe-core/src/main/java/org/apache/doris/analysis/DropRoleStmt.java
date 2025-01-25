@@ -18,7 +18,8 @@
 package org.apache.doris.analysis;
 
 import org.apache.doris.catalog.Env;
-import org.apache.doris.cluster.ClusterNamespace;
+import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.FeNameFormat;
@@ -26,7 +27,7 @@ import org.apache.doris.common.UserException;
 import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.qe.ConnectContext;
 
-public class DropRoleStmt extends DdlStmt {
+public class DropRoleStmt extends DdlStmt implements NotFallbackInParser {
 
     private boolean ifExists;
     private String role;
@@ -44,15 +45,19 @@ public class DropRoleStmt extends DdlStmt {
         return ifExists;
     }
 
-    public String getQualifiedRole() {
+    public String getRole() {
         return role;
     }
 
     @Override
     public void analyze(Analyzer analyzer) throws UserException {
         super.analyze(analyzer);
+
+        if (Config.access_controller_type.equalsIgnoreCase("ranger-doris")) {
+            throw new AnalysisException("Drop role is prohibited when Ranger is enabled.");
+        }
+
         FeNameFormat.checkRoleName(role, false /* can not be superuser */, "Can not drop role");
-        role = ClusterNamespace.getFullName(analyzer.getClusterName(), role);
 
         // check if current user has GRANT priv on GLOBAL level.
         if (!Env.getCurrentEnv().getAccessManager().checkGlobalPriv(ConnectContext.get(), PrivPredicate.GRANT)) {
@@ -63,5 +68,10 @@ public class DropRoleStmt extends DdlStmt {
     @Override
     public String toSql() {
         return "DROP ROLE " + role;
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.DROP;
     }
 }

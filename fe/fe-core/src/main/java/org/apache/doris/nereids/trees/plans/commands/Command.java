@@ -17,46 +17,36 @@
 
 package org.apache.doris.nereids.trees.plans.commands;
 
+import org.apache.doris.common.Config;
+import org.apache.doris.common.DdlException;
 import org.apache.doris.nereids.memo.GroupExpression;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.plans.AbstractPlan;
+import org.apache.doris.nereids.trees.plans.BlockFuncDepsPropagation;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.PlanType;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.StmtExecutor;
-import org.apache.doris.statistics.Statistics;
 
-import org.jetbrains.annotations.Nullable;
+import com.google.common.collect.ImmutableList;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * All DDL and DML commands' super class.
  */
-public abstract class Command extends AbstractPlan implements LogicalPlan {
+public abstract class Command extends AbstractPlan implements LogicalPlan, BlockFuncDepsPropagation {
 
-    public Command(PlanType type, Plan... children) {
-        super(type, children);
+    protected Command(PlanType type) {
+        super(type, Optional.empty(), Optional.empty(), null, ImmutableList.of());
     }
 
-    public Command(PlanType type, Optional<LogicalProperties> optLogicalProperties, Plan... children) {
-        super(type, optLogicalProperties, children);
-    }
-
-    public Command(PlanType type, Optional<GroupExpression> groupExpression,
-            Optional<LogicalProperties> optLogicalProperties,
-            @Nullable Statistics statistics,
-            Plan... children) {
-        super(type, groupExpression, optLogicalProperties, statistics, children);
-    }
-
-    public void run(ConnectContext ctx, StmtExecutor executor) throws Exception {
-        // all command should impl this interface.
-    }
+    public abstract void run(ConnectContext ctx, StmtExecutor executor) throws Exception;
 
     @Override
     public Optional<GroupExpression> getGroupExpression() {
@@ -99,6 +89,12 @@ public abstract class Command extends AbstractPlan implements LogicalPlan {
     }
 
     @Override
+    public Plan withGroupExprLogicalPropChildren(Optional<GroupExpression> groupExpression,
+            Optional<LogicalProperties> logicalProperties, List<Plan> children) {
+        throw new RuntimeException("Command do not implement withGroupExprLogicalPropChildren");
+    }
+
+    @Override
     public boolean canBind() {
         throw new RuntimeException("Command do not implement canResolve");
     }
@@ -106,6 +102,11 @@ public abstract class Command extends AbstractPlan implements LogicalPlan {
     @Override
     public List<Slot> getOutput() {
         throw new RuntimeException("Command do not implement getOutput");
+    }
+
+    @Override
+    public Set<Slot> getOutputSet() {
+        throw new RuntimeException("Command do not implement getOutputSet");
     }
 
     @Override
@@ -118,8 +119,15 @@ public abstract class Command extends AbstractPlan implements LogicalPlan {
         throw new RuntimeException("Command do not implement withGroupExpression");
     }
 
-    @Override
-    public Plan withLogicalProperties(Optional<LogicalProperties> logicalProperties) {
-        throw new RuntimeException("Command do not implement withLogicalProperties");
+    public void verifyCommandSupported(ConnectContext ctx) throws DdlException {
+        // check command has been supported in cloud mode
+        if (Config.isCloudMode()) {
+            checkSupportedInCloudMode(ctx);
+        }
     }
+
+    // check if the command is supported in cloud mode
+    // see checkStmtSupported() in fe/fe-core/src/main/java/org/apache/doris/qe/ShowExecutor.java
+    // override this method if the command is not supported in cloud mode
+    protected void checkSupportedInCloudMode(ConnectContext ctx) throws DdlException {}
 }

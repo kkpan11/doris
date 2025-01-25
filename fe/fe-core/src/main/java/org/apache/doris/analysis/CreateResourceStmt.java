@@ -20,11 +20,13 @@ package org.apache.doris.analysis;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.Resource.ResourceType;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.FeNameFormat;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.util.PrintableMap;
+import org.apache.doris.datasource.property.constants.AzureProperties;
 import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.qe.ConnectContext;
 
@@ -32,7 +34,7 @@ import java.util.Map;
 
 // CREATE [EXTERNAL] RESOURCE resource_name
 // PROPERTIES (key1 = value1, ...)
-public class CreateResourceStmt extends DdlStmt {
+public class CreateResourceStmt extends DdlStmt implements NotFallbackInParser {
     private static final String TYPE = "type";
 
     private final boolean isExternal;
@@ -66,6 +68,30 @@ public class CreateResourceStmt extends DdlStmt {
         return resourceType;
     }
 
+    public void analyzeResourceType() throws UserException {
+        String type = properties.get(TYPE);
+        if (type == null) {
+            throw new AnalysisException("Resource type can't be null");
+        }
+
+        if (AzureProperties.checkAzureProviderPropertyExist(properties)) {
+            resourceType = ResourceType.AZURE;
+            return;
+        }
+
+        resourceType = ResourceType.fromString(type);
+        if (resourceType == ResourceType.UNKNOWN) {
+            throw new AnalysisException("Unsupported resource type: " + type);
+        }
+        if (resourceType == ResourceType.SPARK && !isExternal) {
+            throw new AnalysisException("Spark is external resource");
+        }
+        if (resourceType == ResourceType.ODBC_CATALOG && !Config.enable_odbc_mysql_broker_table) {
+            throw new AnalysisException("ODBC table is deprecated, use JDBC instead. Or you can set "
+                    + "`enable_odbc_mysql_broker_table=true` in fe.conf to enable ODBC again.");
+        }
+    }
+
     @Override
     public void analyze(Analyzer analyzer) throws UserException {
         super.analyze(analyzer);
@@ -76,23 +102,14 @@ public class CreateResourceStmt extends DdlStmt {
         }
 
         // check name
-        FeNameFormat.checkResourceName(resourceName);
+        FeNameFormat.checkResourceName(resourceName, ResourceTypeEnum.GENERAL);
 
         // check type in properties
         if (properties == null || properties.isEmpty()) {
             throw new AnalysisException("Resource properties can't be null");
         }
-        String type = properties.get(TYPE);
-        if (type == null) {
-            throw new AnalysisException("Resource type can't be null");
-        }
-        resourceType = ResourceType.fromString(type);
-        if (resourceType == ResourceType.UNKNOWN) {
-            throw new AnalysisException("Unsupported resource type: " + type);
-        }
-        if (resourceType == ResourceType.SPARK && !isExternal) {
-            throw new AnalysisException("Spark is external resource");
-        }
+
+        analyzeResourceType();
     }
 
     @Override
@@ -103,7 +120,17 @@ public class CreateResourceStmt extends DdlStmt {
             sb.append("EXTERNAL ");
         }
         sb.append("RESOURCE '").append(resourceName).append("' ");
-        sb.append("PROPERTIES(").append(new PrintableMap<>(properties, " = ", true, false)).append(")");
+        sb.append("PROPERTIES(").append(new PrintableMap<>(properties, " = ", true, false, true)).append(")");
         return sb.toString();
+    }
+
+    @Override
+    public boolean needAuditEncryption() {
+        return true;
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.CREATE;
     }
 }

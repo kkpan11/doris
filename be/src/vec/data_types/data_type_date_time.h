@@ -45,6 +45,7 @@ class DataTypeDateV2;
 } // namespace doris
 
 namespace doris::vectorized {
+#include "common/compile_check_begin.h"
 
 /** DateTime stores time as unix timestamp.
 	* The value itself is independent of time zone.
@@ -73,18 +74,22 @@ public:
     const char* get_family_name() const override { return "DateTime"; }
     std::string do_get_name() const override { return "DateTime"; }
     TypeIndex get_type_id() const override { return TypeIndex::DateTime; }
-    PrimitiveType get_type_as_primitive_type() const override { return TYPE_DATETIME; }
-    TPrimitiveType::type get_type_as_tprimitive_type() const override {
-        return TPrimitiveType::DATETIME;
+    TypeDescriptor get_type_as_type_descriptor() const override {
+        return TypeDescriptor(TYPE_DATETIME);
     }
 
-    bool can_be_inside_nullable() const override { return true; }
+    doris::FieldType get_storage_field_type() const override {
+        return doris::FieldType::OLAP_FIELD_TYPE_DATETIME;
+    }
 
     bool equals(const IDataType& rhs) const override;
 
     std::string to_string(const IColumn& column, size_t row_num) const override;
+    std::string to_string(Int64 value) const;
 
-    DataTypeSerDeSPtr get_serde() const override { return std::make_shared<DataTypeDate64SerDe>(); }
+    DataTypeSerDeSPtr get_serde(int nesting_level = 1) const override {
+        return std::make_shared<DataTypeDateTimeSerDe>(nesting_level);
+    }
 
     Field get_field(const TExprNode& node) const override {
         VecDateTimeValue value;
@@ -98,6 +103,13 @@ public:
     }
 
     void to_string(const IColumn& column, size_t row_num, BufferWritable& ostr) const override;
+    void to_string_batch(const IColumn& column, ColumnString& column_to) const final {
+        DataTypeNumberBase<Int64>::template to_string_batch_impl<DataTypeDateTime>(column,
+                                                                                   column_to);
+    }
+
+    size_t number_length() const;
+    void push_number(ColumnString::Chars& chars, const Int64& num) const;
 
     Status from_string(ReadBuffer& rb, IColumn* column) const override;
 
@@ -132,4 +144,5 @@ constexpr bool IsTimeType = IsDateTimeType<DataType> || IsDateType<DataType>;
 template <typename DataType>
 constexpr bool IsTimeV2Type = IsDateTimeV2Type<DataType> || IsDateV2Type<DataType>;
 
+#include "common/compile_check_end.h"
 } // namespace doris::vectorized

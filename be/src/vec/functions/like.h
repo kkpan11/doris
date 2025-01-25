@@ -115,20 +115,38 @@ struct LikeSearchState {
 using LikeFn = std::function<doris::Status(LikeSearchState*, const ColumnString&, const StringRef&,
                                            ColumnUInt8::Container&)>;
 
-using LikePredicateFn = std::function<doris::Status(
-        LikeSearchState*, const PredicateColumnType<TYPE_STRING>&, const StringRef&,
-        ColumnUInt8::Container&, uint16_t* sel, size_t sz)>;
-
 using ScalarLikeFn = std::function<doris::Status(LikeSearchState*, const StringRef&,
                                                  const StringRef&, unsigned char*)>;
 
+using VectorLikeFn = std::function<doris::Status(const ColumnString&, const ColumnString&,
+                                                 ColumnUInt8::Container&)>;
+
 struct LikeState {
+    bool is_like_pattern;
     LikeSearchState search_state;
     LikeFn function;
-    // Two functions below are used only for predicate.
-    LikePredicateFn predicate_like_function;
     ScalarLikeFn scalar_function;
 };
+
+struct VectorPatternSearchState {
+    MutableColumnPtr _search_strings;
+    std::string _search_string;
+    VectorLikeFn _vector_function;
+    bool _pattern_matched;
+
+    VectorPatternSearchState(VectorLikeFn vector_function)
+            : _search_strings(ColumnString::create()),
+              _vector_function(vector_function),
+              _pattern_matched(true) {}
+
+    virtual ~VectorPatternSearchState() = default;
+
+    virtual void like_pattern_match(const std::string& pattern_str) = 0;
+
+    virtual void regexp_pattern_match(const std::string& pattern_str) = 0;
+};
+
+using VPatternSearchStateSPtr = std::shared_ptr<VectorPatternSearchState>;
 
 class FunctionLikeBase : public IFunction {
 public:
@@ -139,87 +157,86 @@ public:
     }
 
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t /*input_rows_count*/) override;
+                        uint32_t result, size_t /*input_rows_count*/) const override;
 
     Status close(FunctionContext* context, FunctionContext::FunctionStateScope scope) override;
+
+    friend struct VectorAllpassSearchState;
+    friend struct VectorEqualSearchState;
+    friend struct VectorSubStringSearchState;
+    friend struct VectorStartsWithSearchState;
+    friend struct VectorEndsWithSearchState;
 
 protected:
     Status vector_const(const ColumnString& values, const StringRef* pattern_val,
                         ColumnUInt8::Container& result, const LikeFn& function,
-                        LikeSearchState* search_state);
+                        LikeSearchState* search_state) const;
+
+    Status vector_non_const(const ColumnString& values, const ColumnString& patterns,
+                            ColumnUInt8::Container& result, LikeState* state,
+                            size_t input_rows_count) const;
 
     Status execute_substring(const ColumnString::Chars& values,
                              const ColumnString::Offsets& value_offsets,
-                             ColumnUInt8::Container& result, LikeSearchState* search_state);
+                             ColumnUInt8::Container& result, LikeSearchState* search_state) const;
+
+    template <bool LIKE_PATTERN>
+    static VPatternSearchStateSPtr pattern_type_recognition(const ColumnString& patterns);
+
+    static Status constant_allpass_fn(LikeSearchState* state, const ColumnString& val,
+                                      const StringRef& pattern, ColumnUInt8::Container& result);
+
+    static Status constant_allpass_fn_scalar(LikeSearchState* state, const StringRef& val,
+                                             const StringRef& pattern, unsigned char* result);
+
+    static Status vector_allpass_fn(const ColumnString& vals, const ColumnString& search_strings,
+                                    ColumnUInt8::Container& result);
 
     static Status constant_starts_with_fn(LikeSearchState* state, const ColumnString& val,
                                           const StringRef& pattern, ColumnUInt8::Container& result);
 
-    static Status constant_ends_with_fn(LikeSearchState* state, const ColumnString& val,
-                                        const StringRef& pattern, ColumnUInt8::Container& result);
-
-    static Status constant_equals_fn(LikeSearchState* state, const ColumnString& val,
-                                     const StringRef& pattern, ColumnUInt8::Container& result);
-
-    static Status constant_substring_fn(LikeSearchState* state, const ColumnString& val,
-                                        const StringRef& pattern, ColumnUInt8::Container& result);
-
-    static Status constant_regex_fn(LikeSearchState* state, const ColumnString& val,
-                                    const StringRef& pattern, ColumnUInt8::Container& result);
-
-    static Status regexp_fn(LikeSearchState* state, const ColumnString& val,
-                            const StringRef& pattern, ColumnUInt8::Container& result);
-
-    // These functions below are used only for predicate.
-    static Status constant_regex_fn_predicate(LikeSearchState* state,
-                                              const PredicateColumnType<TYPE_STRING>& val,
-                                              const StringRef& pattern,
-                                              ColumnUInt8::Container& result, const uint16_t* sel,
-                                              size_t sz);
-
-    static Status regexp_fn_predicate(LikeSearchState* state,
-                                      const PredicateColumnType<TYPE_STRING>& val,
-                                      const StringRef& pattern, ColumnUInt8::Container& result,
-                                      const uint16_t* sel, size_t sz);
-
-    static Status constant_starts_with_fn_predicate(LikeSearchState* state,
-                                                    const PredicateColumnType<TYPE_STRING>& val,
-                                                    const StringRef& pattern,
-                                                    ColumnUInt8::Container& result,
-                                                    const uint16_t* sel, size_t sz);
-
-    static Status constant_ends_with_fn_predicate(LikeSearchState* state,
-                                                  const PredicateColumnType<TYPE_STRING>& val,
-                                                  const StringRef& pattern,
-                                                  ColumnUInt8::Container& result,
-                                                  const uint16_t* sel, size_t sz);
-
-    static Status constant_equals_fn_predicate(LikeSearchState* state,
-                                               const PredicateColumnType<TYPE_STRING>& val,
-                                               const StringRef& pattern,
-                                               ColumnUInt8::Container& result, const uint16_t* sel,
-                                               size_t sz);
-
-    static Status constant_substring_fn_predicate(LikeSearchState* state,
-                                                  const PredicateColumnType<TYPE_STRING>& val,
-                                                  const StringRef& pattern,
-                                                  ColumnUInt8::Container& result,
-                                                  const uint16_t* sel, size_t sz);
-
     static Status constant_starts_with_fn_scalar(LikeSearchState* state, const StringRef& val,
                                                  const StringRef& pattern, unsigned char* result);
+
+    static Status vector_starts_with_fn(const ColumnString& vals,
+                                        const ColumnString& search_strings,
+                                        ColumnUInt8::Container& result);
+
+    static Status constant_ends_with_fn(LikeSearchState* state, const ColumnString& val,
+                                        const StringRef& pattern, ColumnUInt8::Container& result);
 
     static Status constant_ends_with_fn_scalar(LikeSearchState* state, const StringRef& val,
                                                const StringRef& pattern, unsigned char* result);
 
+    static Status vector_ends_with_fn(const ColumnString& vals, const ColumnString& search_strings,
+                                      ColumnUInt8::Container& result);
+
+    static Status constant_equals_fn(LikeSearchState* state, const ColumnString& val,
+                                     const StringRef& pattern, ColumnUInt8::Container& result);
+
     static Status constant_equals_fn_scalar(LikeSearchState* state, const StringRef& val,
                                             const StringRef& pattern, unsigned char* result);
+
+    static Status vector_equals_fn(const ColumnString& vals, const ColumnString& search_strings,
+                                   ColumnUInt8::Container& result);
+
+    static Status constant_substring_fn(LikeSearchState* state, const ColumnString& val,
+                                        const StringRef& pattern, ColumnUInt8::Container& result);
 
     static Status constant_substring_fn_scalar(LikeSearchState* state, const StringRef& val,
                                                const StringRef& pattern, unsigned char* result);
 
+    static Status vector_substring_fn(const ColumnString& vals, const ColumnString& search_strings,
+                                      ColumnUInt8::Container& result);
+
+    static Status constant_regex_fn(LikeSearchState* state, const ColumnString& val,
+                                    const StringRef& pattern, ColumnUInt8::Container& result);
+
     static Status constant_regex_fn_scalar(LikeSearchState* state, const StringRef& val,
                                            const StringRef& pattern, unsigned char* result);
+
+    static Status regexp_fn(LikeSearchState* state, const ColumnString& val,
+                            const StringRef& pattern, ColumnUInt8::Container& result);
 
     static Status regexp_fn_scalar(LikeSearchState* state, const StringRef& val,
                                    const StringRef& pattern, unsigned char* result);
@@ -239,16 +256,20 @@ public:
 
     Status open(FunctionContext* context, FunctionContext::FunctionStateScope scope) override;
 
+    static Status construct_like_const_state(FunctionContext* ctx, const StringRef& pattern,
+                                             std::shared_ptr<LikeState>& state,
+                                             bool try_hyperscan = true);
+
     friend struct LikeSearchState;
+    friend struct VectorAllpassSearchState;
+    friend struct VectorEqualSearchState;
+    friend struct VectorSubStringSearchState;
+    friend struct VectorStartsWithSearchState;
+    friend struct VectorEndsWithSearchState;
 
 private:
     static Status like_fn(LikeSearchState* state, const ColumnString& val, const StringRef& pattern,
                           ColumnUInt8::Container& result);
-
-    static Status like_fn_predicate(LikeSearchState* state,
-                                    const PredicateColumnType<TYPE_STRING>& val,
-                                    const StringRef& pattern, ColumnUInt8::Container& result,
-                                    uint16_t* sel, size_t sz);
 
     static Status like_fn_scalar(LikeSearchState* state, const StringRef& val,
                                  const StringRef& pattern, unsigned char* result);
@@ -259,12 +280,12 @@ private:
     static void remove_escape_character(std::string* search_string);
 };
 
-class FunctionRegexp : public FunctionLikeBase {
+class FunctionRegexpLike : public FunctionLikeBase {
 public:
     static constexpr auto name = "regexp";
     static constexpr auto alias = "rlike";
 
-    static FunctionPtr create() { return std::make_shared<FunctionRegexp>(); }
+    static FunctionPtr create() { return std::make_shared<FunctionRegexpLike>(); }
 
     String get_name() const override { return name; }
 

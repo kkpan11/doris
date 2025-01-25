@@ -34,7 +34,7 @@ suite("modify_replica_use_partition") {
     // data_sizes is one arrayList<Long>, t is tablet
     def fetchDataSize = { data_sizes, t ->
         def tabletId = t[0]
-        String meta_url = t[16]
+        String meta_url = t[17]
         def clos = {  respCode, body ->
             logger.info("test ttl expired resp Code {}", "${respCode}".toString())
             assertEquals("${respCode}".toString(), "200")
@@ -63,6 +63,7 @@ suite("modify_replica_use_partition") {
     }
 
     def tableName = "lineitem3"
+    sql """ DROP TABLE IF EXISTS ${tableName} """
     def stream_load_one_part = { partnum ->
         streamLoad {
             table tableName
@@ -195,7 +196,7 @@ suite("modify_replica_use_partition") {
             DUPLICATE KEY(L_ORDERKEY, L_PARTKEY, L_SUPPKEY, L_LINENUMBER)
             PARTITION BY RANGE(`L_SHIPDATE`)
             (
-                PARTITION `p202301` VALUES LESS THAN ("2017-02-01"),
+                PARTITION `p202301` VALUES LESS THAN ("1995-12-01"),
                 PARTITION `p202302` VALUES LESS THAN ("2017-03-01")
             )
             DISTRIBUTED BY HASH(L_ORDERKEY) BUCKETS 3
@@ -234,10 +235,12 @@ suite("modify_replica_use_partition") {
     def originSize = tablets.size()
 
     // alter change replication num
-    sql """
-    ALTER TABLE ${tableName}
-    MODIFY PARTITION (p202301, p202302) SET("replication_num"="3");
-    """
+    if (!isCloudMode()) {
+        sql """
+        ALTER TABLE ${tableName}
+        MODIFY PARTITION (p202301, p202302) SET("replication_num"="3");
+        """
+    }
 
     sql """
     select count(*) from ${tableName}
@@ -306,7 +309,7 @@ suite("modify_replica_use_partition") {
             DUPLICATE KEY(L_ORDERKEY, L_PARTKEY, L_SUPPKEY, L_LINENUMBER)
             PARTITION BY RANGE(`L_SHIPDATE`)
             (
-                PARTITION `p202301` VALUES LESS THAN ("2017-02-01"),
+                PARTITION `p202301` VALUES LESS THAN ("1995-12-01"),
                 PARTITION `p202302` VALUES LESS THAN ("2017-03-01")
             )
             DISTRIBUTED BY HASH(L_ORDERKEY) BUCKETS 3
@@ -358,10 +361,12 @@ suite("modify_replica_use_partition") {
     assertTrue(RemoteDataSize1 != 0)
 
     // alter change replication num
-    sql """
-    ALTER TABLE ${tableName}
-    MODIFY PARTITION (p202301, p202302) SET("replication_num"="1");
-    """
+    if (!isCloudMode()) {
+        sql """
+        ALTER TABLE ${tableName}
+        MODIFY PARTITION (p202301, p202302) SET("replication_num"="1");
+        """
+    }
 
     sql """
     select count(*) from ${tableName}
@@ -400,7 +405,7 @@ suite("modify_replica_use_partition") {
             DUPLICATE KEY(L_ORDERKEY, L_PARTKEY, L_SUPPKEY, L_LINENUMBER)
             PARTITION BY RANGE(`L_SHIPDATE`)
             (
-                PARTITION `p202301` VALUES LESS THAN ("2017-02-01") ("replication_num" = "3"),
+                PARTITION `p202301` VALUES LESS THAN ("1995-12-01") ("replication_num" = "3"),
                 PARTITION `p202302` VALUES LESS THAN ("2017-03-01") ("replication_num" = "1")
             )
             DISTRIBUTED BY HASH(L_ORDERKEY) BUCKETS 3
@@ -451,15 +456,17 @@ suite("modify_replica_use_partition") {
     assertTrue(RemoteDataSize1 != 0)
 
     // alter change replication num
-    sql """
-    ALTER TABLE ${tableName}
-    MODIFY PARTITION (p202301) SET("replication_num"="1");
-    """
+    if (!isCloudMode()) {
+        sql """
+        ALTER TABLE ${tableName}
+        MODIFY PARTITION (p202301) SET("replication_num"="1");
+        """
 
-    sql """
-    ALTER TABLE ${tableName}
-    MODIFY PARTITION (p202302) SET("replication_num"="3");
-    """
+        sql """
+        ALTER TABLE ${tableName}
+        MODIFY PARTITION (p202302) SET("replication_num"="3");
+        """
+    }
 
     sql """
     select count(*) from ${tableName}

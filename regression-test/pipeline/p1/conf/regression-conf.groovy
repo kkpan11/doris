@@ -21,8 +21,19 @@
 defaultDb = "regression_test"
 
 jdbcUrl = "jdbc:mysql://172.19.0.2:9132/?useLocalSessionState=true&allowLoadLocalInfile=true"
+targetJdbcUrl = "jdbc:mysql://172.19.0.2:9132/?useLocalSessionState=true&allowLoadLocalInfile=true"
 jdbcUser = "root"
 jdbcPassword = ""
+
+ccrDownstreamUrl = "jdbc:mysql://172.19.0.2:9132/?useLocalSessionState=true&allowLoadLocalInfile=true"
+ccrDownstreamUser = "root"
+ccrDownstreamPassword = ""
+ccrDownstreamFeThriftAddress = "127.0.0.1:9020"
+
+feSourceThriftAddress = "127.0.0.1:9020"
+feTargetThriftAddress = "127.0.0.1:9020"
+feSyncerUser = "root"
+feSyncerPassword = ""
 
 feHttpAddress = "172.19.0.2:8132"
 feHttpUser = "root"
@@ -41,12 +52,26 @@ testGroups = ""
 // empty suite will test all suite
 testSuites = ""
 // this suites will not be executed
-excludeSuites = "q67_ignore_temporarily"
+excludeSuites = "000_the_start_sentinel_do_not_touch," + // keep this line as the first line
+    "test_analyze_stats_p1," +
+    "test_broker_load," +
+    "test_profile," +
+    "test_refresh_mtmv," +
+    "test_spark_load," +
+    "zzz_the_end_sentinel_do_not_touch" // keep this line as the last line
+
+// this dir will not be executed
+excludeDirectories = "000_the_start_sentinel_do_not_touch," + // keep this line as the first line
+    "fault_injection_p0," +
+    "workload_manager_p1," +
+    "zzz_the_end_sentinel_do_not_touch" // keep this line as the last line
 
 cacheDataPath="/data/regression/"
 
-s3Endpoint = "cos.ap-hongkong.myqcloud.com"
-s3BucketName = "doris-build-hk-1308700295"
-s3Region = "ap-hongkong"
+s3Source="aliyun"
 
-max_failure_num=0
+max_failure_num=50
+
+externalEnvIp="127.0.0.1"
+
+enableBrokerLoad=true

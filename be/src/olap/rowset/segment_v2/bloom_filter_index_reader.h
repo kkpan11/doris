@@ -28,6 +28,7 @@
 #include "olap/rowset/segment_v2/common.h"
 #include "olap/rowset/segment_v2/indexed_column_reader.h"
 #include "olap/types.h"
+#include "util/once.h"
 
 namespace doris {
 
@@ -37,34 +38,45 @@ class BloomFilterIndexIterator;
 class BloomFilter;
 class BloomFilterIndexPB;
 
-class BloomFilterIndexReader {
+class BloomFilterIndexReader : public MetadataAdder<BloomFilterIndexReader> {
 public:
     explicit BloomFilterIndexReader(io::FileReaderSPtr file_reader,
-                                    const BloomFilterIndexPB* bloom_filter_index_meta)
+                                    const BloomFilterIndexPB& bloom_filter_index_meta)
             : _file_reader(std::move(file_reader)),
-              _type_info(get_scalar_type_info<FieldType::OLAP_FIELD_TYPE_VARCHAR>()),
-              _bloom_filter_index_meta(bloom_filter_index_meta) {}
+              _type_info(get_scalar_type_info<FieldType::OLAP_FIELD_TYPE_VARCHAR>()) {
+        _bloom_filter_index_meta.reset(new BloomFilterIndexPB(bloom_filter_index_meta));
+    }
 
-    Status load(bool use_page_cache, bool kept_in_memory);
+    Status load(bool use_page_cache, bool kept_in_memory,
+                OlapReaderStatistics* bf_index_load_stats);
+
+    BloomFilterAlgorithmPB algorithm() { return _bloom_filter_index_meta->algorithm(); }
 
     // create a new column iterator.
-    Status new_iterator(std::unique_ptr<BloomFilterIndexIterator>* iterator);
+    Status new_iterator(std::unique_ptr<BloomFilterIndexIterator>* iterator,
+                        OlapReaderStatistics* index_load_stats);
 
     const TypeInfo* type_info() const { return _type_info; }
+
+private:
+    Status _load(bool use_page_cache, bool kept_in_memory, OlapReaderStatistics* index_load_stats);
+
+    int64_t get_metadata_size() const override;
 
 private:
     friend class BloomFilterIndexIterator;
 
     io::FileReaderSPtr _file_reader;
-    const TypeInfo* _type_info;
-    const BloomFilterIndexPB* _bloom_filter_index_meta;
+    DorisCallOnce<Status> _load_once;
+    const TypeInfo* _type_info = nullptr;
+    std::unique_ptr<BloomFilterIndexPB> _bloom_filter_index_meta = nullptr;
     std::unique_ptr<IndexedColumnReader> _bloom_filter_reader;
 };
 
 class BloomFilterIndexIterator {
 public:
-    explicit BloomFilterIndexIterator(BloomFilterIndexReader* reader)
-            : _reader(reader), _bloom_filter_iter(reader->_bloom_filter_reader.get()) {}
+    explicit BloomFilterIndexIterator(BloomFilterIndexReader* reader, OlapReaderStatistics* stats)
+            : _reader(reader), _bloom_filter_iter(reader->_bloom_filter_reader.get(), stats) {}
 
     // Read bloom filter at the given ordinal into `bf`.
     Status read_bloom_filter(rowid_t ordinal, std::unique_ptr<BloomFilter>* bf);
@@ -72,7 +84,7 @@ public:
     size_t current_bloom_filter_index() const { return _bloom_filter_iter.get_current_ordinal(); }
 
 private:
-    BloomFilterIndexReader* _reader;
+    BloomFilterIndexReader* _reader = nullptr;
     IndexedColumnIterator _bloom_filter_iter;
 };
 

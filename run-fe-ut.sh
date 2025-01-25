@@ -90,11 +90,11 @@ echo "******************************"
 echo "    Runing DorisFe Unittest    "
 echo "******************************"
 
-echo "Build docs"
-cd "${DORIS_HOME}/docs"
-./build_help_zip.sh
-cp build/help-resource.zip "${DORIS_HOME}"/fe/fe-core/src/test/resources/real-help-resource.zip
-cd "${DORIS_HOME}"
+#echo "Build docs"
+#cd "${DORIS_HOME}/docs"
+#./build_help_zip.sh
+#cp build/help-resource.zip "${DORIS_HOME}"/fe/fe-core/src/test/resources/real-help-resource.zip
+#cd "${DORIS_HOME}"
 
 "${DORIS_HOME}"/generated-source.sh
 
@@ -107,18 +107,22 @@ if [[ -z "${FE_UT_PARALLEL}" ]]; then
 fi
 echo "Unit test parallel is: ${FE_UT_PARALLEL}"
 
-if [[ "${COVERAGE}" -eq 1 ]]; then
-    echo "Run coverage statistic"
-    ant cover-test
-else
-    if [[ "${RUN}" -eq 1 ]]; then
-        echo "Run the specified class: $1"
-        # eg:
-        # sh run-fe-ut.sh --run org.apache.doris.utframe.DemoTest
-        # sh run-fe-ut.sh --run org.apache.doris.utframe.DemoTest#testCreateDbAndTable+test2
-        "${MVN_CMD}" test -Dcheckstyle.skip=true -DfailIfNoTests=false -D test="$1"
+if [[ "${RUN}" -eq 1 ]]; then
+    echo "Run the specified class: $1"
+    # eg:
+    # sh run-fe-ut.sh --run org.apache.doris.utframe.DemoTest
+    # sh run-fe-ut.sh --run org.apache.doris.utframe.DemoTest#testCreateDbAndTable+test2
+
+    if [[ "${COVERAGE}" -eq 1 ]]; then
+        "${MVN_CMD}" test jacoco:report -DfailIfNoTests=false -Dtest="$1"
     else
-        echo "Run Frontend UT"
+        "${MVN_CMD}" test -Dcheckstyle.skip=true -DfailIfNoTests=false -Dtest="$1"
+    fi
+else
+    echo "Run Frontend UT"
+    if [[ "${COVERAGE}" -eq 1 ]]; then
+        "${MVN_CMD}" test jacoco:report -DfailIfNoTests=false
+    else
         "${MVN_CMD}" test -Dcheckstyle.skip=true -DfailIfNoTests=false
     fi
 fi

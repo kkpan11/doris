@@ -34,6 +34,7 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 
 import java.io.StringReader;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
@@ -100,8 +101,8 @@ public class ShowViewStmtTest {
         ConnectContext ctx = UtFrameUtils.createDefaultCtx();
         ShowViewStmt stmt = new ShowViewStmt("", new TableName(internalCtl, "testDb", "test1"));
         stmt.analyze(new Analyzer(ctx.getEnv(), ctx));
-        Assert.assertEquals("SHOW VIEW FROM `default_cluster:testDb`.`test1`", stmt.toString());
-        Assert.assertEquals("default_cluster:testDb", stmt.getDb());
+        Assert.assertEquals("SHOW VIEW FROM `testDb`.`test1`", stmt.toString());
+        Assert.assertEquals("testDb", stmt.getDb());
         Assert.assertEquals("test1", stmt.getTbl());
         Assert.assertEquals(2, stmt.getMetaData().getColumnCount());
         Assert.assertEquals("View", stmt.getMetaData().getColumn(0).getName());
@@ -229,10 +230,11 @@ public class ShowViewStmtTest {
         ShowResultSet resultSet = executor.execute();
         System.out.println(resultSet.getResultRows());
         Assert.assertEquals(2, resultSet.getResultRows().size());
+        List<String> views = Arrays.asList("view4", "view5");
         Assert.assertTrue(resultSet.next());
-        Assert.assertEquals("view4", resultSet.getString(0));
+        Assert.assertTrue(views.contains(resultSet.getString(0)));
         Assert.assertTrue(resultSet.next());
-        Assert.assertEquals("view5", resultSet.getString(0));
+        Assert.assertTrue(views.contains(resultSet.getString(0)));
 
         dorisAssert.dropView("view4")
                    .dropView("view5");

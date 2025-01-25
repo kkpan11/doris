@@ -25,27 +25,15 @@
 #include "common/status.h"
 #include "vec/data_types/data_type.h"
 
-namespace doris {
-namespace vectorized {
+namespace doris::vectorized {
 enum class TypeIndex;
-} // namespace vectorized
-} // namespace doris
+} // namespace doris::vectorized
 
 namespace doris::vectorized {
 
-/** Get data type that covers all possible values of passed data types.
-  * If there is no such data type, throws an exception.
-  *
-  * Examples: least common supertype for UInt8, Int8 - Int16.
-  * Examples: there is no least common supertype for Array(UInt8), Int8.
-  */
-
 using TypeIndexSet = phmap::flat_hash_set<TypeIndex>;
 
-Status get_least_supertype(const DataTypes& types, DataTypePtr* type,
-                           bool compatible_with_string = false);
-
-Status get_least_supertype(const TypeIndexSet& types, DataTypePtr* type,
-                           bool compatible_with_string = false);
+void get_least_supertype_jsonb(const DataTypes& types, DataTypePtr* type);
+void get_least_supertype_jsonb(const TypeIndexSet& types, DataTypePtr* type);
 
 } // namespace doris::vectorized

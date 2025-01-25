@@ -18,65 +18,106 @@
 version: "3"
 
 services:
-  doris--spark-iceberg:
+
+  spark-iceberg:
     image: tabulario/spark-iceberg
     container_name: doris--spark-iceberg
     hostname: doris--spark-iceberg
     build: spark/
     depends_on:
-      - doris--rest
-      - doris--minio
+      rest:
+        condition: service_started
+      mc:
+        condition: service_completed_successfully
     volumes:
-      - ./warehouse:/home/iceberg/warehouse
-      - ./notebooks:/home/iceberg/notebooks/notebooks
-      - ./entrypoint.sh:/opt/spark/entrypoint.sh
+      - ./data/output/spark-warehouse:/home/iceberg/warehouse
+      - ./data/output/spark-notebooks:/home/iceberg/notebooks/notebooks
+      - ./data:/mnt/data
+      - ./scripts:/mnt/scripts
       - ./spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+      - ./data/input/jars/paimon-spark-3.5-0.8.0.jar:/opt/spark/jars/paimon-spark-3.5-0.8.0.jar
+      - ./data/input/jars/paimon-s3-0.8.0.jar:/opt/spark/jars/paimon-s3-0.8.0.jar
     environment:
       - AWS_ACCESS_KEY_ID=admin
       - AWS_SECRET_ACCESS_KEY=password
       - AWS_REGION=us-east-1
-    ports:
-      - ${NOTEBOOK_SERVER_PORT}:8888
-      - ${SPARK_DRIVER_UI_PORT}:8080
-      - ${SPARK_HISTORY_UI_PORT}:10000
-    links:
-      - doris--rest:rest
-      - doris--minio:minio
+    entrypoint: /bin/sh /mnt/scripts/entrypoint.sh
     networks:
       - doris--iceberg
-    entrypoint:
-      - /opt/spark/entrypoint.sh
+    healthcheck:
+      test: ls /mnt/SUCCESS
+      interval: 5s
+      timeout: 120s
+      retries: 120
 
-  doris--rest:
-    image: tabulario/iceberg-rest:0.2.0
+  postgres:
+    image: postgis/postgis:14-3.3
+    container_name: doris--postgres
+    environment:
+      POSTGRES_PASSWORD: 123456
+      POSTGRES_USER: root
+      POSTGRES_DB: iceberg
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U root" ]
+      interval: 5s
+      timeout: 60s
+      retries: 120
+    volumes:
+      - ./data/input/pgdata:/var/lib/postgresql/data
+    networks:
+      - doris--iceberg
+
+  rest:
+    image: tabulario/iceberg-rest:1.6.0
+    container_name: doris--iceberg-rest
     ports:
       - ${REST_CATALOG_PORT}:8181
+    volumes:
+      - ./data:/mnt/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
     environment:
       - AWS_ACCESS_KEY_ID=admin
       - AWS_SECRET_ACCESS_KEY=password
       - AWS_REGION=us-east-1
       - CATALOG_WAREHOUSE=s3a://warehouse/wh/
       - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
-      - CATALOG_S3_ENDPOINT=http://doris--minio:9000
+      - CATALOG_S3_ENDPOINT=http://minio:9000
+      - CATALOG_URI=jdbc:postgresql://postgres:5432/iceberg
+      - CATALOG_JDBC_USER=root
+      - CATALOG_JDBC_PASSWORD=123456
     networks:
       - doris--iceberg
-  doris--minio:
-    image: minio/minio
+    entrypoint: /bin/bash /mnt/data/input/script/rest_init.sh
+
+  minio:
+    image: minio/minio:RELEASE.2025-01-20T14-49-07Z
     container_name: doris--minio
-    hostname: doris--minio
+    ports:
+      - ${MINIO_API_PORT}:9000
+    healthcheck:
+      test: [ "CMD", "mc", "ready", "local" ]
+      interval: 10s
+      timeout: 60s
+      retries: 120
     environment:
       - MINIO_ROOT_USER=admin
       - MINIO_ROOT_PASSWORD=password
-    ports:
-      - ${MINIO_UI_PORT}:9001
-      - ${MINIO_API_PORT}:9000
+      - MINIO_DOMAIN=minio
     networks:
-      - doris--iceberg
+      doris--iceberg:
+        aliases:
+          - warehouse.minio
     command: ["server", "/data", "--console-address", ":9001"]
-  doris--mc:
+
+  mc:
     depends_on:
-      - doris--minio
-    image: minio/mc
+      minio:
+        condition: service_healthy
+    image: minio/mc:RELEASE.2025-01-17T23-25-50Z
     container_name: doris--mc
     environment:
       - AWS_ACCESS_KEY_ID=admin
@@ -84,13 +125,21 @@ services:
       - AWS_REGION=us-east-1
     networks:
       - doris--iceberg
+    volumes:
+      - ./data:/mnt/data
     entrypoint: >
       /bin/sh -c "
-      until (/usr/bin/mc config host add minio http://doris--minio:9000 admin password) do echo '...waiting...' && sleep 1; done;
+      until (/usr/bin/mc config host add minio http://minio:9000 admin password) do echo '...waiting...' && sleep 1; done;
       /usr/bin/mc rm -r --force minio/warehouse;
       /usr/bin/mc mb minio/warehouse;
       /usr/bin/mc policy set public minio/warehouse;
-      exit 0;
+      echo 'copy data';
+      mc cp -r /mnt/data/input/minio/warehouse/* minio/warehouse/;
       "
+
 networks:
   doris--iceberg:
+    ipam:
+      driver: default
+      config:
+        - subnet: 168.38.0.0/24

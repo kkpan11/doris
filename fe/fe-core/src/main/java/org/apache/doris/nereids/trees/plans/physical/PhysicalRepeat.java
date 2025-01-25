@@ -18,6 +18,7 @@
 package org.apache.doris.nereids.trees.plans.physical;
 
 import org.apache.doris.nereids.memo.GroupExpression;
+import org.apache.doris.nereids.properties.DataTrait;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.properties.PhysicalProperties;
 import org.apache.doris.nereids.trees.expressions.Expression;
@@ -97,7 +98,7 @@ public class PhysicalRepeat<CHILD_TYPE extends Plan> extends PhysicalUnary<CHILD
 
     @Override
     public String toString() {
-        return Utils.toSqlString("PhysicalRepeat[" + id.asInt() + "]" + getGroupIdAsString(),
+        return Utils.toSqlString("PhysicalRepeat[" + id.asInt() + "]" + getGroupIdWithPrefix(),
                 "groupingSets", groupingSets,
                 "outputExpressions", outputExpressions,
                 "stats", statistics
@@ -147,7 +148,8 @@ public class PhysicalRepeat<CHILD_TYPE extends Plan> extends PhysicalUnary<CHILD
     @Override
     public PhysicalRepeat<Plan> withChildren(List<Plan> children) {
         Preconditions.checkArgument(children.size() == 1);
-        return new PhysicalRepeat<>(groupingSets, outputExpressions, getLogicalProperties(), children.get(0));
+        return new PhysicalRepeat<>(groupingSets, outputExpressions, groupExpression,
+                getLogicalProperties(), physicalProperties, statistics, children.get(0));
     }
 
     @Override
@@ -157,9 +159,11 @@ public class PhysicalRepeat<CHILD_TYPE extends Plan> extends PhysicalUnary<CHILD
     }
 
     @Override
-    public PhysicalRepeat<CHILD_TYPE> withLogicalProperties(Optional<LogicalProperties> logicalProperties) {
-        return new PhysicalRepeat<>(groupingSets, outputExpressions, Optional.empty(),
-                logicalProperties.get(), physicalProperties, statistics, child());
+    public Plan withGroupExprLogicalPropChildren(Optional<GroupExpression> groupExpression,
+            Optional<LogicalProperties> logicalProperties, List<Plan> children) {
+        Preconditions.checkArgument(children.size() == 1);
+        return new PhysicalRepeat<>(groupingSets, outputExpressions, groupExpression,
+                logicalProperties.get(), physicalProperties, statistics, children.get(0));
     }
 
     @Override
@@ -173,5 +177,38 @@ public class PhysicalRepeat<CHILD_TYPE extends Plan> extends PhysicalUnary<CHILD
     public PhysicalRepeat<CHILD_TYPE> withAggOutput(List<NamedExpression> newOutput) {
         return new PhysicalRepeat<>(groupingSets, newOutput, Optional.empty(),
                 getLogicalProperties(), physicalProperties, statistics, child());
+    }
+
+    @Override
+    public PhysicalRepeat<CHILD_TYPE> withGroupSetsAndOutput(List<List<Expression>> groupingSets,
+            List<NamedExpression> outputExpressionList) {
+        return new PhysicalRepeat<>(groupingSets, outputExpressionList, Optional.empty(),
+                getLogicalProperties(), physicalProperties, statistics, child());
+    }
+
+    @Override
+    public PhysicalRepeat<CHILD_TYPE> resetLogicalProperties() {
+        return new PhysicalRepeat<>(groupingSets, outputExpressions, groupExpression,
+                null, physicalProperties, statistics, child());
+    }
+
+    @Override
+    public void computeUnique(DataTrait.Builder builder) {
+        // don't generate unique slot
+    }
+
+    @Override
+    public void computeUniform(DataTrait.Builder builder) {
+        builder.addUniformSlot(child(0).getLogicalProperties().getTrait());
+    }
+
+    @Override
+    public void computeEqualSet(DataTrait.Builder builder) {
+        builder.addEqualSet(child().getLogicalProperties().getTrait());
+    }
+
+    @Override
+    public void computeFd(DataTrait.Builder builder) {
+        builder.addFuncDepsDG(child().getLogicalProperties().getTrait());
     }
 }

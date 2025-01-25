@@ -17,6 +17,8 @@
 
 package org.apache.doris.common;
 
+
+import org.apache.doris.common.security.authentication.PreExecutionAuthenticator;
 import org.apache.doris.metric.Metric;
 import org.apache.doris.metric.Metric.MetricUnit;
 import org.apache.doris.metric.MetricLabel;
@@ -26,12 +28,19 @@ import com.google.common.collect.Maps;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.jetbrains.annotations.NotNull;
 
+import java.util.Comparator;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.RejectedExecutionHandler;
+import java.util.concurrent.RunnableFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadFactory;
@@ -39,7 +48,6 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
-
 /**
  * ThreadPoolManager is a helper class for construct daemon thread pool with limit thread and memory resource.
  * thread names in thread pool are formatted as poolName-ID, where ID is a unique, sequentially assigned integer.
@@ -63,11 +71,12 @@ import java.util.function.Supplier;
 
 public class ThreadPoolManager {
 
+    private static final Logger LOG = LogManager.getLogger(ThreadPoolManager.class);
     private static Map<String, ThreadPoolExecutor> nameToThreadPoolMap = Maps.newConcurrentMap();
 
     private static String[] poolMetricTypes = {"pool_size", "active_thread_num", "task_in_queue"};
 
-    private static final long KEEP_ALIVE_TIME = 60L;
+    public static final long KEEP_ALIVE_TIME = 60L;
 
     public static void registerAllThreadPoolMetric() {
         for (Map.Entry<String, ThreadPoolExecutor> entry : nameToThreadPoolMap.entrySet()) {
@@ -113,11 +122,61 @@ public class ThreadPoolManager {
                 new LogDiscardPolicy(poolName), poolName, needRegisterMetric);
     }
 
+    public static ThreadPoolExecutor newDaemonCacheThreadPoolUseBlockedPolicy(int maxNumThread,
+                                                              String poolName, boolean needRegisterMetric) {
+        return newDaemonThreadPool(0, maxNumThread, KEEP_ALIVE_TIME,
+            TimeUnit.SECONDS, new SynchronousQueue(),
+            new BlockedPolicy(poolName, 10), poolName, needRegisterMetric);
+    }
+
+    public static ThreadPoolExecutor newDaemonCacheThreadPoolThrowException(int maxNumThread,
+                                                              String poolName, boolean needRegisterMetric) {
+        return newDaemonThreadPool(0, maxNumThread, KEEP_ALIVE_TIME,
+            TimeUnit.SECONDS, new SynchronousQueue(),
+            new LogDiscardPolicyThrowException(poolName), poolName, needRegisterMetric);
+    }
+
     public static ThreadPoolExecutor newDaemonFixedThreadPool(int numThread,
             int queueSize, String poolName, boolean needRegisterMetric) {
         return newDaemonThreadPool(numThread, numThread, KEEP_ALIVE_TIME, TimeUnit.SECONDS,
                 new LinkedBlockingQueue<>(queueSize), new BlockedPolicy(poolName, 60),
                 poolName, needRegisterMetric);
+    }
+
+    public static ThreadPoolExecutor newDaemonFixedThreadPoolWithPreAuth(
+            int numThread,
+            int queueSize,
+            String poolName,
+            boolean needRegisterMetric,
+            PreExecutionAuthenticator preAuth) {
+        return newDaemonThreadPoolWithPreAuth(numThread, numThread, KEEP_ALIVE_TIME, TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(queueSize), new BlockedPolicy(poolName, 60),
+            poolName, needRegisterMetric, preAuth);
+    }
+
+    public static ThreadPoolExecutor newDaemonFixedThreadPool(int numThread, int queueSize,
+                                                              String poolName, int timeoutSeconds,
+                                                              boolean needRegisterMetric) {
+        return newDaemonThreadPool(numThread, numThread, KEEP_ALIVE_TIME, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(queueSize), new BlockedPolicy(poolName, timeoutSeconds),
+                poolName, needRegisterMetric);
+    }
+
+    public static ThreadPoolExecutor newDaemonFixedThreadPool(int numThread, int queueSize,
+                                                              String poolName,
+                                                              boolean needRegisterMetric,
+                                                              RejectedExecutionHandler handler) {
+        return newDaemonThreadPool(numThread, numThread, KEEP_ALIVE_TIME, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(queueSize), handler,
+                poolName, needRegisterMetric);
+    }
+
+    public static <T> ThreadPoolExecutor newDaemonFixedPriorityThreadPool(int numThread, int initQueueSize,
+                                                                          Comparator<T> comparator, Class<T> tClass,
+                                                                          String poolName, boolean needRegisterMetric) {
+        return newDaemonPriorityThreadPool(numThread, numThread, KEEP_ALIVE_TIME, TimeUnit.SECONDS,
+                    new PriorityBlockingQueue<>(initQueueSize), new BlockedPolicy(poolName, 60),
+                    comparator, tClass, poolName, needRegisterMetric);
     }
 
     public static ThreadPoolExecutor newDaemonProfileThreadPool(int numThread, int queueSize, String poolName,
@@ -138,6 +197,25 @@ public class ThreadPoolManager {
         ThreadFactory threadFactory = namedThreadFactory(poolName);
         ThreadPoolExecutor threadPool = new ThreadPoolExecutor(corePoolSize, maximumPoolSize,
                 keepAliveTime, unit, workQueue, threadFactory, handler);
+        if (needRegisterMetric) {
+            nameToThreadPoolMap.put(poolName, threadPool);
+        }
+        return threadPool;
+    }
+
+    public static <T> ThreadPoolExecutor newDaemonPriorityThreadPool(int corePoolSize,
+                                                                 int maximumPoolSize,
+                                                                 long keepAliveTime,
+                                                                 TimeUnit unit,
+                                                                 PriorityBlockingQueue<Runnable> workQueue,
+                                                                 RejectedExecutionHandler handler,
+                                                                 Comparator<T> comparator,
+                                                                 Class<T> tClass,
+                                                                 String poolName,
+                                                                 boolean needRegisterMetric) {
+        ThreadFactory threadFactory = namedThreadFactory(poolName);
+        ThreadPoolExecutor threadPool = new PriorityThreadPoolExecutor(corePoolSize, maximumPoolSize, keepAliveTime,
+                    unit, workQueue, threadFactory, handler, comparator, tClass);
         if (needRegisterMetric) {
             nameToThreadPoolMap.put(poolName, threadPool);
         }
@@ -165,6 +243,103 @@ public class ThreadPoolManager {
         return new ThreadFactoryBuilder().setDaemon(true).setNameFormat(poolName + "-%d").build();
     }
 
+
+    public static ThreadPoolExecutor newDaemonThreadPoolWithPreAuth(
+            int corePoolSize,
+            int maximumPoolSize,
+            long keepAliveTime,
+            TimeUnit unit,
+            BlockingQueue<Runnable> workQueue,
+            RejectedExecutionHandler handler,
+            String poolName,
+            boolean needRegisterMetric,
+            PreExecutionAuthenticator preAuth) {
+        ThreadFactory threadFactory = namedThreadFactoryWithPreAuth(poolName, preAuth);
+        ThreadPoolExecutor threadPool = new ThreadPoolExecutor(corePoolSize, maximumPoolSize,
+                keepAliveTime, unit, workQueue, threadFactory, handler);
+        if (needRegisterMetric) {
+            nameToThreadPoolMap.put(poolName, threadPool);
+        }
+        return threadPool;
+    }
+
+    private static ThreadFactory namedThreadFactoryWithPreAuth(String poolName, PreExecutionAuthenticator preAuth) {
+        return new ThreadFactoryBuilder()
+            .setDaemon(true)
+            .setNameFormat(poolName + "-%d")
+            .setThreadFactory(runnable -> new Thread(() -> {
+                try {
+                    preAuth.execute(runnable);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }))
+            .build();
+    }
+
+    private static class PriorityThreadPoolExecutor<T> extends ThreadPoolExecutor {
+
+        private final Comparator<T> comparator;
+        private final Class<T> tClass;
+
+        private PriorityThreadPoolExecutor(int corePoolSize, int maximumPoolSize, long keepAliveTime, TimeUnit unit,
+                                          BlockingQueue<Runnable> workQueue, ThreadFactory threadFactory,
+                                          RejectedExecutionHandler handler, Comparator<T> comparator, Class<T> tClass) {
+            super(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue, threadFactory, handler);
+            this.comparator = comparator;
+            this.tClass = tClass;
+        }
+
+        private static class ComparableFutureTask<V, T> extends FutureTask<V>
+                    implements Comparable<ComparableFutureTask<V, T>> {
+
+            private final @NotNull T t;
+            private final Comparator<T> comparator;
+
+            public ComparableFutureTask(@NotNull Callable task, Comparator<T> comparator) {
+                super(task);
+                this.t = (T) task;
+                this.comparator = comparator;
+            }
+
+            public ComparableFutureTask(@NotNull Runnable task, V result, Comparator<T> comparator) {
+                super(task, result);
+                this.t = (T) task;
+                this.comparator = comparator;
+            }
+
+            @Override
+            public int compareTo(@NotNull ComparableFutureTask<V, T> other) {
+                return comparator.compare(t, other.t);
+            }
+
+        }
+
+        @Override
+        protected <V> RunnableFuture<V> newTaskFor(Runnable task, V value) {
+            if (!tClass.isInstance(task)) {
+                throw new RejectedExecutionException("Task must be an instance of [" + tClass.getName() + "]");
+            }
+            return new ComparableFutureTask<>(task, value, comparator);
+        }
+
+        @Override
+        protected <V> RunnableFuture<V> newTaskFor(Callable<V> task) {
+            if (!tClass.isInstance(task)) {
+                throw new RejectedExecutionException("Task must be an instance of [" + tClass.getName() + "]");
+            }
+            return new ComparableFutureTask<>(task, comparator);
+        }
+
+        @Override
+        public void execute(Runnable task) {
+            if (!(task instanceof ComparableFutureTask) && !tClass.isInstance(task)) {
+                throw new RejectedExecutionException("Task must be an instance of [" + tClass.getName() + "]");
+            }
+            super.execute(task);
+        }
+    }
+
     /**
      * A handler for rejected task that discards and log it, used for cached thread pool
      */
@@ -172,8 +347,8 @@ public class ThreadPoolManager {
 
         private static final Logger LOG = LogManager.getLogger(LogDiscardPolicy.class);
 
-        private String threadPoolName;
-        private AtomicLong rejectedNum;
+        public String threadPoolName;
+        public AtomicLong rejectedNum;
 
         public LogDiscardPolicy(String threadPoolName) {
             this.threadPoolName = threadPoolName;
@@ -184,6 +359,23 @@ public class ThreadPoolManager {
         public void rejectedExecution(Runnable r, ThreadPoolExecutor executor) {
             LOG.warn("Task " + r.toString() + " rejected from " + threadPoolName + " " + executor.toString());
             this.rejectedNum.incrementAndGet();
+        }
+    }
+
+    static class LogDiscardPolicyThrowException extends LogDiscardPolicy {
+
+        private static final Logger LOG = LogManager.getLogger(LogDiscardPolicyThrowException.class);
+
+        public LogDiscardPolicyThrowException(String threadPoolName) {
+            super(threadPoolName);
+        }
+
+        @Override
+        public void rejectedExecution(Runnable r, ThreadPoolExecutor executor) {
+            LOG.warn("Task " + r.toString() + " rejected from " + threadPoolName + " " + executor.toString());
+            this.rejectedNum.incrementAndGet();
+            throw new RejectedExecutionException("Task " + r.toString() + " rejected from "
+                                                + threadPoolName + " " + executor.toString());
         }
     }
 
@@ -238,6 +430,27 @@ public class ThreadPoolManager {
                 LOG.warn("Task: {} submit to {}, and discard the oldest task:{}", task, threadPoolName, discardTask);
                 executor.execute(task);
             }
+        }
+    }
+
+    public static void shutdownExecutorService(ExecutorService executorService) {
+        // Disable new tasks from being submitted
+        executorService.shutdown();
+        try {
+            // Wait a while for existing tasks to terminate
+            if (!executorService.awaitTermination(60, TimeUnit.SECONDS)) {
+                // Cancel currently executing tasks
+                executorService.shutdownNow();
+                // Wait a while for tasks to respond to being cancelled
+                if (!executorService.awaitTermination(60, TimeUnit.SECONDS)) {
+                    LOG.warn("ExecutorService did not terminate");
+                }
+            }
+        } catch (InterruptedException e) {
+            // (Re-)Cancel if current thread also interrupted
+            executorService.shutdownNow();
+            // Preserve interrupt status
+            Thread.currentThread().interrupt();
         }
     }
 }

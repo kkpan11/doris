@@ -30,7 +30,7 @@ class MockRowset : public Rowset {
     Status remove() override { return Status::NotSupported("MockRowset not support this method."); }
 
     Status link_files_to(const std::string& dir, RowsetId new_rowset_id, size_t start_seg_id,
-                         std::set<int32_t>* without_index_column_uids) override {
+                         std::set<int64_t>* without_index_uids) override {
         return Status::NotSupported("MockRowset not support this method.");
     }
 
@@ -42,13 +42,19 @@ class MockRowset : public Rowset {
         return Status::NotSupported("MockRowset not support this method.");
     }
 
-    bool check_path(const std::string& path) override {
+    Status check_file_exist() override {
         return Status::NotSupported("MockRowset not support this method.");
     }
 
-    bool check_file_exist() override {
+    Status upload_to(const StorageResource& dest_fs, const RowsetId& new_rowset_id) override {
         return Status::NotSupported("MockRowset not support this method.");
     }
+
+    Status get_inverted_index_size(int64_t* index_size) override {
+        return Status::NotSupported("MockRowset not support this method.");
+    }
+
+    void clear_inverted_index_cache() override {}
 
     Status get_segments_key_bounds(std::vector<KeyBoundsPB>* segments_key_bounds) override {
         // TODO(zhangchen): remove this after we implemented memrowset.
@@ -58,30 +64,24 @@ class MockRowset : public Rowset {
         return Rowset::get_segments_key_bounds(segments_key_bounds);
     }
 
-    static Status create_rowset(TabletSchemaSPtr schema, const std::string& rowset_path,
-                                RowsetMetaSharedPtr rowset_meta, RowsetSharedPtr* rowset,
-                                bool is_mem_rowset = false) {
-        rowset->reset(new MockRowset(schema, rowset_path, rowset_meta));
+    static Status create_rowset(TabletSchemaSPtr schema, RowsetMetaSharedPtr rowset_meta,
+                                RowsetSharedPtr* rowset, bool is_mem_rowset = false) {
+        rowset->reset(new MockRowset(schema, rowset_meta));
         ((MockRowset*)rowset->get())->is_mem_rowset_ = is_mem_rowset;
         return Status::OK();
     }
 
 protected:
-    MockRowset(TabletSchemaSPtr schema, const std::string& rowset_path,
-               RowsetMetaSharedPtr rowset_meta)
-            : Rowset(schema, rowset_path, rowset_meta) {}
+    MockRowset(TabletSchemaSPtr schema, RowsetMetaSharedPtr rowset_meta)
+            : Rowset(schema, rowset_meta, "") {}
 
     Status init() override { return Status::NotSupported("MockRowset not support this method."); }
-
-    Status do_load(bool use_cache) override {
-        return Status::NotSupported("MockRowset not support this method.");
-    }
 
     void do_close() override {
         // Do nothing.
     }
 
-    bool check_current_rowset_segment() override { return true; }
+    Status check_current_rowset_segment() override { return Status::OK(); }
 
 private:
     bool is_mem_rowset_;

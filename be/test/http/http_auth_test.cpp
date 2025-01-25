@@ -25,6 +25,7 @@
 #include "http/http_headers.h"
 #include "http/http_request.h"
 #include "http/utils.h"
+#include "util/defer_op.h"
 
 namespace doris {
 
@@ -49,7 +50,7 @@ static HttpAuthTestHandler s_auth_handler =
 class HttpAuthTest : public testing::Test {};
 
 TEST_F(HttpAuthTest, disable_auth) {
-    EXPECT_FALSE(config::enable_http_auth);
+    EXPECT_FALSE(config::enable_all_http_auth);
 
     auto evhttp_req = evhttp_request_new(nullptr, nullptr);
     HttpRequest req(evhttp_req);
@@ -57,8 +58,9 @@ TEST_F(HttpAuthTest, disable_auth) {
     evhttp_request_free(evhttp_req);
 }
 
-TEST_F(HttpAuthTest, enable_http_auth) {
-    config::enable_http_auth = true;
+TEST_F(HttpAuthTest, enable_all_http_auth) {
+    Defer defer {[]() { config::enable_all_http_auth = false; }};
+    config::enable_all_http_auth = true;
 
     // 1. empty auth info
     {
@@ -71,8 +73,7 @@ TEST_F(HttpAuthTest, enable_http_auth) {
     {
         auto evhttp_req = evhttp_request_new(nullptr, nullptr);
         HttpRequest req2(evhttp_req);
-        auto auth = encode_basic_auth("doris", "passwd");
-        req2._headers.emplace(HttpHeaders::AUTHORIZATION, auth);
+        req2._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
         EXPECT_EQ(s_auth_handler.on_header(&req2), -1);
     }
 
@@ -80,8 +81,7 @@ TEST_F(HttpAuthTest, enable_http_auth) {
     {
         auto evhttp_req = evhttp_request_new(nullptr, nullptr);
         HttpRequest req3(evhttp_req);
-        auto auth = encode_basic_auth("doris", "passwd");
-        req3._headers.emplace(HttpHeaders::AUTHORIZATION, auth);
+        req3._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
         req3._params.emplace("table", "T");
         EXPECT_EQ(s_auth_handler.on_header(&req3), 0);
         evhttp_request_free(evhttp_req);

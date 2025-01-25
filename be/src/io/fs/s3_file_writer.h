@@ -17,19 +17,18 @@
 
 #pragma once
 
-#include <aws/core/utils/memory/stl/AWSStringStream.h>
+#include <bthread/countdown_event.h>
 
 #include <cstddef>
-#include <list>
 #include <memory>
 #include <string>
 
 #include "common/status.h"
 #include "io/fs/file_system.h"
 #include "io/fs/file_writer.h"
+#include "io/fs/obj_storage_client.h"
 #include "io/fs/path.h"
-#include "util/s3_util.h"
-#include "util/slice.h"
+#include "io/fs/s3_file_bufferpool.h"
 
 namespace Aws::S3 {
 namespace Model {
@@ -39,96 +38,85 @@ class S3Client;
 } // namespace Aws::S3
 
 namespace doris {
+struct S3Conf;
+
 namespace io {
 struct S3FileBuffer;
+class S3FileSystem;
+struct AsyncCloseStatusPack;
+class ObjClientHolder;
 
 class S3FileWriter final : public FileWriter {
 public:
-    S3FileWriter(Path path, std::shared_ptr<Aws::S3::S3Client> client, const S3Conf& s3_conf,
-                 FileSystemSPtr fs);
+    S3FileWriter(std::shared_ptr<ObjClientHolder> client, std::string bucket, std::string key,
+                 const FileWriterOptions* opts);
     ~S3FileWriter() override;
 
-    Status close() override;
-
-    Status abort() override;
     Status appendv(const Slice* data, size_t data_cnt) override;
-    Status finalize() override;
-    Status write_at(size_t offset, const Slice& data) override {
-        return Status::NotSupported("not support");
+
+    const Path& path() const override { return _obj_storage_path_opts.path; }
+    size_t bytes_appended() const override { return _bytes_appended; }
+    State state() const override { return _state; }
+
+    FileCacheAllocatorBuilder* cache_builder() const override {
+        return _cache_builder == nullptr ? nullptr : _cache_builder.get();
     }
 
-    size_t bytes_appended() const { return _bytes_appended; }
+    const std::vector<ObjectCompleteMultiPart>& completed_parts() const { return _completed_parts; }
 
-    int64_t upload_cost_ms() const { return *_upload_cost_ms; }
+    const std::string& key() const { return _obj_storage_path_opts.key; }
+    const std::string& bucket() const { return _obj_storage_path_opts.bucket; }
+    std::string upload_id() const {
+        return _obj_storage_path_opts.upload_id.has_value()
+                       ? _obj_storage_path_opts.upload_id.value()
+                       : std::string();
+    }
+
+    Status close(bool non_block = false) override;
 
 private:
-    class WaitGroup {
-    public:
-        WaitGroup() = default;
-
-        ~WaitGroup() = default;
-
-        WaitGroup(const WaitGroup&) = delete;
-        WaitGroup(WaitGroup&&) = delete;
-        void operator=(const WaitGroup&) = delete;
-        void operator=(WaitGroup&&) = delete;
-        // add one counter indicating one more concurrent worker
-        void add(int count = 1) { _count += count; }
-
-        // decrease count if one concurrent worker finished it's work
-        void done() {
-            _count--;
-            if (_count.load() <= 0) {
-                _cv.notify_all();
-            }
-        }
-
-        // wait for all concurrent workers finish their work and return true
-        // would return false if timeout, default timeout would be 5min
-        bool wait(int64_t timeout_seconds = 300) {
-            if (_count.load() <= 0) {
-                return true;
-            }
-            std::unique_lock<std::mutex> lck {_lock};
-            _cv.wait_for(lck, std::chrono::seconds(timeout_seconds),
-                         [this]() { return _count.load() <= 0; });
-            return _count.load() <= 0;
-        }
-
-    private:
-        std::mutex _lock;
-        std::condition_variable _cv;
-        std::atomic_int64_t _count {0};
-    };
-    void _wait_until_finish(std::string task_name);
+    Status _close_impl();
+    Status _abort();
+    [[nodiscard]] std::string _dump_completed_part() const;
+    void _wait_until_finish(std::string_view task_name);
     Status _complete();
     Status _create_multi_upload_request();
-    void _put_object(S3FileBuffer& buf);
-    void _upload_one_part(int64_t part_num, S3FileBuffer& buf);
+    Status _set_upload_to_remote_less_than_buffer_size();
+    void _put_object(UploadFileBuffer& buf);
+    void _upload_one_part(int64_t part_num, UploadFileBuffer& buf);
+    bool _complete_part_task_callback(Status s);
+    Status _build_upload_buffer();
 
-    std::string _bucket;
-    std::string _key;
-    bool _closed = false;
-    bool _aborted = false;
-
-    std::unique_ptr<int64_t> _upload_cost_ms;
-
-    std::shared_ptr<Aws::S3::S3Client> _client;
-    std::string _upload_id;
-    size_t _bytes_appended {0};
+    ObjectStoragePathOptions _obj_storage_path_opts;
 
     // Current Part Num for CompletedPart
     int _cur_part_num = 1;
     std::mutex _completed_lock;
-    std::vector<std::unique_ptr<Aws::S3::Model::CompletedPart>> _completed_parts;
+    std::vector<ObjectCompleteMultiPart> _completed_parts;
 
-    WaitGroup _wait;
+    // **Attention** call add_count() before submitting buf to async thread pool
+    bthread::CountdownEvent _countdown_event {0};
 
     std::atomic_bool _failed = false;
-    Status _st = Status::OK();
-    size_t _bytes_written = 0;
 
-    std::shared_ptr<S3FileBuffer> _pending_buf = nullptr;
+    Status _st;
+    size_t _bytes_appended = 0;
+
+    std::shared_ptr<FileBuffer> _pending_buf;
+    std::unique_ptr<FileCacheAllocatorBuilder>
+            _cache_builder; // nullptr if disable write file cache
+
+    // S3 committer will start multipart uploading all files on BE side,
+    // and then complete multipart upload these files on FE side.
+    // If you do not complete multi parts of a file, the file will not be visible.
+    // So in this way, the atomicity of a single file can be guaranteed. But it still cannot
+    // guarantee the atomicity of multiple files.
+    // Because hive committers have best-effort semantics,
+    // this shortens the inconsistent time window.
+    bool _used_by_s3_committer;
+    std::unique_ptr<AsyncCloseStatusPack> _async_close_pack;
+    State _state {State::OPENED};
+    std::shared_ptr<ObjClientHolder> _obj_client;
 };
 
 } // namespace io

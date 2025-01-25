@@ -20,12 +20,16 @@
 #include "vec/sink/vdata_stream_sender.h"
 
 namespace doris::pipeline {
+#include "common/compile_check_begin.h"
 
+class Dependency;
 struct MultiCastBlock {
-    MultiCastBlock(vectorized::Block* block, int used_count, size_t mem_size);
+    MultiCastBlock(vectorized::Block* block, int need_copy, size_t mem_size);
 
     std::unique_ptr<vectorized::Block> _block;
-    int _used_count;
+    // Each block is copied during pull. If _un_finish_copy == 0,
+    // it indicates that this block has been fully used and can be released.
+    int _un_finish_copy;
     size_t _mem_size;
 };
 
@@ -33,52 +37,53 @@ struct MultiCastBlock {
 // code
 class MultiCastDataStreamer {
 public:
-    MultiCastDataStreamer(const RowDescriptor& row_desc, ObjectPool* pool, int cast_sender_count)
+    MultiCastDataStreamer(const RowDescriptor& row_desc, ObjectPool* pool, int cast_sender_count,
+                          bool with_dependencies = false)
             : _row_desc(row_desc),
               _profile(pool->add(new RuntimeProfile("MultiCastDataStreamSink"))),
               _cast_sender_count(cast_sender_count) {
         _sender_pos_to_read.resize(cast_sender_count, _multi_cast_blocks.end());
+        if (with_dependencies) {
+            _dependencies.resize(cast_sender_count, nullptr);
+        }
+
         _peak_mem_usage = ADD_COUNTER(profile(), "PeakMemUsage", TUnit::BYTES);
         _process_rows = ADD_COUNTER(profile(), "ProcessRows", TUnit::UNIT);
     };
 
     ~MultiCastDataStreamer() = default;
 
-    void pull(int sender_idx, vectorized::Block* block, bool* eos);
-
-    void close_sender(int sender_idx);
+    Status pull(int sender_idx, vectorized::Block* block, bool* eos);
 
     Status push(RuntimeState* state, vectorized::Block* block, bool eos);
-
-    // use sink to check can_write, now always true after we support spill to disk
-    bool can_write() { return true; }
-
-    bool can_read(int sender_idx) {
-        std::lock_guard l(_mutex);
-        return _sender_pos_to_read[sender_idx] != _multi_cast_blocks.end() || _eos;
-    }
 
     const RowDescriptor& row_desc() { return _row_desc; }
 
     RuntimeProfile* profile() { return _profile; }
 
-    void set_eos() {
-        std::lock_guard l(_mutex);
-        _eos = true;
+    void set_dep_by_sender_idx(int sender_idx, Dependency* dep) {
+        _dependencies[sender_idx] = dep;
+        _block_reading(sender_idx);
     }
 
 private:
+    void _set_ready_for_read(int sender_idx);
+    void _block_reading(int sender_idx);
+
+    void _copy_block(vectorized::Block* block, int& un_finish_copy);
     const RowDescriptor& _row_desc;
-    RuntimeProfile* _profile;
+    RuntimeProfile* _profile = nullptr;
     std::list<MultiCastBlock> _multi_cast_blocks;
     std::vector<std::list<MultiCastBlock>::iterator> _sender_pos_to_read;
     std::mutex _mutex;
     bool _eos = false;
     int _cast_sender_count = 0;
-    int _closed_sender_count = 0;
     int64_t _cumulative_mem_size = 0;
 
-    RuntimeProfile::Counter* _process_rows;
-    RuntimeProfile::Counter* _peak_mem_usage;
+    RuntimeProfile::Counter* _process_rows = nullptr;
+    RuntimeProfile::Counter* _peak_mem_usage = nullptr;
+
+    std::vector<Dependency*> _dependencies;
 };
+#include "common/compile_check_end.h"
 } // namespace doris::pipeline

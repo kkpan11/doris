@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include "vec/common/string_ref.h"
 #ifdef __AVX2__
 #include <immintrin.h>
 
@@ -72,14 +73,7 @@ public:
     // non-equal values will have the same hash value) is 0.
     void insert(uint32_t hash) noexcept;
     // Same as above with convenience of hashing the key.
-    void insert(const Slice& key) noexcept {
-        if (key.data) {
-            insert(HashUtil::murmur_hash3_32(key.data, key.size, _hash_seed));
-        }
-    }
-
-    // This function is only to be used if the be_exec_version may be less than 2. If updated, please delete it.
-    void insert_crc32_hash(const Slice& key) noexcept {
+    void insert(const StringRef& key) noexcept {
         if (key.data) {
             insert(HashUtil::crc_hash(key.data, key.size, _hash_seed));
         }
@@ -123,22 +117,46 @@ public:
 #endif
     }
     // Same as above with convenience of hashing the key.
-    bool find(const Slice& key) const noexcept {
-        if (key.data) {
-            return find(HashUtil::murmur_hash3_32(key.data, key.size, _hash_seed));
-        } else {
-            return false;
-        }
-    }
-
-    // This function is only to be used if the be_exec_version may be less than 2. If updated, please delete it.
-    bool find_crc32_hash(const Slice& key) const noexcept {
+    bool find(const StringRef& key) const noexcept {
         if (key.data) {
             return find(HashUtil::crc_hash(key.data, key.size, _hash_seed));
-        } else {
-            return false;
+        }
+        return false;
+    }
+
+#ifdef __ARM_NEON
+    void make_find_mask(uint32_t key, uint32x4_t* masks) const noexcept {
+        uint32x4_t hash_data_1 = vdupq_n_u32(key);
+        uint32x4_t hash_data_2 = vdupq_n_u32(key);
+
+        uint32x4_t rehash_1 = vld1q_u32(&kRehash[0]);
+        uint32x4_t rehash_2 = vld1q_u32(&kRehash[4]);
+
+        //  masks[i] = key * kRehash[i];
+        hash_data_1 = vmulq_u32(rehash_1, hash_data_1);
+        hash_data_2 = vmulq_u32(rehash_2, hash_data_2);
+        //  masks[i] = masks[i] >> shift_num;
+        hash_data_1 = vshrq_n_u32(hash_data_1, shift_num);
+        hash_data_2 = vshrq_n_u32(hash_data_2, shift_num);
+
+        const uint32x4_t ones = vdupq_n_u32(1);
+
+        // masks[i] = 0x1 << masks[i];
+        masks[0] = vshlq_u32(ones, reinterpret_cast<int32x4_t>(hash_data_1));
+        masks[1] = vshlq_u32(ones, reinterpret_cast<int32x4_t>(hash_data_2));
+    }
+#else
+    void make_find_mask(uint32_t key, uint32_t* masks) const noexcept {
+        for (int i = 0; i < kBucketWords; ++i) {
+            masks[i] = key * kRehash[i];
+
+            masks[i] = masks[i] >> shift_num;
+
+            masks[i] = 0x1 << masks[i];
         }
     }
+#endif
+
     // Computes the logical OR of this filter with 'other' and stores the result in this
     // filter.
     // Notes:
@@ -178,7 +196,8 @@ private:
     // log2(number of bits in a BucketWord)
     static constexpr int kLogBucketWordBits = 5;
     static constexpr BucketWord kBucketWordMask = (1 << kLogBucketWordBits) - 1;
-
+    // (>> 27) is equivalent to (mod 32)
+    static constexpr auto shift_num = ((1 << kLogBucketWordBits) - kLogBucketWordBits);
     // log2(number of bytes in a bucket)
     static constexpr int kLogBucketByteSize = 5;
     // Bucket size in bytes.

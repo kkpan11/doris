@@ -18,11 +18,15 @@
 package org.apache.doris.nereids.trees.expressions;
 
 import org.apache.doris.nereids.exceptions.UnboundException;
+import org.apache.doris.nereids.trees.expressions.functions.Monotonic;
+import org.apache.doris.nereids.trees.expressions.literal.Literal;
 import org.apache.doris.nereids.trees.expressions.shape.UnaryExpression;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
 import org.apache.doris.nereids.types.DataType;
+import org.apache.doris.nereids.types.coercion.DateLikeType;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
 
 import java.util.List;
 import java.util.Objects;
@@ -30,13 +34,33 @@ import java.util.Objects;
 /**
  * cast function.
  */
-public class Cast extends Expression implements UnaryExpression {
+public class Cast extends Expression implements UnaryExpression, Monotonic {
+
+    // CAST can be from SQL Query or Type Coercion.
+    private final boolean isExplicitType;
 
     private final DataType targetType;
 
+    public Cast(Expression child, DataType targetType, boolean isExplicitType) {
+        super(ImmutableList.of(child));
+        this.targetType = Objects.requireNonNull(targetType, "targetType can not be null");
+        this.isExplicitType = isExplicitType;
+    }
+
     public Cast(Expression child, DataType targetType) {
+        super(ImmutableList.of(child));
+        this.targetType = Objects.requireNonNull(targetType, "targetType can not be null");
+        this.isExplicitType = false;
+    }
+
+    private Cast(List<Expression> child, DataType targetType, boolean isExplicitType) {
         super(child);
         this.targetType = Objects.requireNonNull(targetType, "targetType can not be null");
+        this.isExplicitType = isExplicitType;
+    }
+
+    public boolean isExplicitType() {
+        return isExplicitType;
     }
 
     @Override
@@ -56,6 +80,12 @@ public class Cast extends Expression implements UnaryExpression {
             return true;
         } else if (!childDataType.isDateLikeType() && targetType.isDateLikeType()) {
             return true;
+        } else if (!childDataType.isTimeLikeType() && targetType.isTimeLikeType()) {
+            return true;
+        } else if (childDataType.isJsonType() || targetType.isJsonType()) {
+            return true;
+        } else if (childDataType.isVariantType() || targetType.isVariantType()) {
+            return true;
         } else {
             return child().nullable();
         }
@@ -64,12 +94,12 @@ public class Cast extends Expression implements UnaryExpression {
     @Override
     public Cast withChildren(List<Expression> children) {
         Preconditions.checkArgument(children.size() == 1);
-        return new Cast(children.get(0), getDataType());
+        return new Cast(children, targetType, isExplicitType);
     }
 
     @Override
-    public String toSql() throws UnboundException {
-        return "cast(" + child().toSql() + " as " + targetType + ")";
+    public String computeToSql() throws UnboundException {
+        return "cast(" + child().toSql() + " as " + targetType.toSql() + ")";
     }
 
     @Override
@@ -87,7 +117,31 @@ public class Cast extends Expression implements UnaryExpression {
     }
 
     @Override
-    public int hashCode() {
-        return Objects.hash(super.hashCode(), targetType);
+    public int computeHashCode() {
+        return Objects.hash(super.computeHashCode(), targetType);
+    }
+
+    @Override
+    public boolean isPositive() {
+        return true;
+    }
+
+    @Override
+    public int getMonotonicFunctionChildIndex() {
+        return 0;
+    }
+
+    @Override
+    public Expression withConstantArgs(Expression literal) {
+        return new Cast(literal, targetType, isExplicitType);
+    }
+
+    @Override
+    public boolean isMonotonic(Literal lower, Literal upper) {
+        // Both upward and downward casting of date types satisfy monotonicity.
+        if (child().getDataType() instanceof DateLikeType && targetType instanceof DateLikeType) {
+            return true;
+        }
+        return false;
     }
 }

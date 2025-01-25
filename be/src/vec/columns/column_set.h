@@ -38,12 +38,10 @@ public:
     ColumnSet(size_t s_, const ConstSetPtr& data_) : data(data_) { s = s_; }
     ColumnSet(const ColumnSet&) = default;
 
-    const char* get_family_name() const override { return "Set"; }
+    std::string get_name() const override { return "Set"; }
     MutableColumnPtr clone_dummy(size_t s_) const override { return ColumnSet::create(s_, data); }
 
     ConstSetPtr get_data() const { return data; }
-
-    TypeIndex get_data_type() const override { return TypeIndex::String; }
 
 private:
     ConstSetPtr data;

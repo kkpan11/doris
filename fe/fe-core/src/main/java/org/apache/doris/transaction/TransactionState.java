@@ -17,7 +17,9 @@
 
 package org.apache.doris.transaction;
 
+import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.MaterializedIndexMeta;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeMetaVersion;
@@ -30,11 +32,14 @@ import org.apache.doris.task.PublishVersionTask;
 import org.apache.doris.thrift.TUniqueId;
 
 import com.google.common.base.Joiner;
+import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.google.gson.annotations.SerializedName;
+import lombok.Getter;
+import lombok.Setter;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -42,10 +47,14 @@ import org.apache.logging.log4j.Logger;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -69,6 +78,7 @@ public class TransactionState implements Writable {
         ROUTINE_LOAD_TASK(4), // routine load task use this type
         BATCH_LOAD_JOB(5); // load job v2 for broker load
 
+        @SerializedName("f")
         private final int flag;
 
         private LoadJobSourceType(int flag) {
@@ -102,7 +112,8 @@ public class TransactionState implements Writable {
         TIMEOUT,
         OFFSET_OUT_OF_RANGE,
         PAUSE,
-        NO_PARTITIONS;
+        NO_PARTITIONS,
+        INVALID_JSON_PATH;
 
         public static TxnStatusChangeReason fromString(String reasonString) {
             for (TxnStatusChangeReason txnStatusChangeReason : TxnStatusChangeReason.values()) {
@@ -155,15 +166,26 @@ public class TransactionState implements Writable {
     public static class TxnCoordinator {
         @SerializedName(value = "sourceType")
         public TxnSourceType sourceType;
+        // backendId for backend, 0 for frontend
+        @SerializedName(value = "id")
+        public long id = 0;
         @SerializedName(value = "ip")
         public String ip;
+        // frontend/backend start time
+        @SerializedName(value = "st")
+        public long startTime = 0;
+        // True if this txn if created by system(such as writing data to audit table)
+        @SerializedName(value = "ii")
+        public boolean isFromInternal = false;
 
         public TxnCoordinator() {
         }
 
-        public TxnCoordinator(TxnSourceType sourceType, String ip) {
+        public TxnCoordinator(TxnSourceType sourceType, long id, String ip, long startTime) {
             this.sourceType = sourceType;
+            this.id = id;
             this.ip = ip;
+            this.startTime = startTime;
         }
 
         @Override
@@ -175,8 +197,9 @@ public class TransactionState implements Writable {
     @SerializedName(value = "dbId")
     private long dbId;
     @SerializedName(value = "tableIdList")
+    @Setter
+    @Getter
     private List<Long> tableIdList;
-    private int replicaNum = 0;
     @SerializedName(value = "txnId")
     private long transactionId;
     @SerializedName(value = "label")
@@ -209,14 +232,27 @@ public class TransactionState implements Writable {
     // this latch will be counted down when txn status change to VISIBLE
     private CountDownLatch visibleLatch;
 
-    // this state need not be serialized
-    private Map<Long, PublishVersionTask> publishVersionTasks;
+    // this state need not be serialized. the map key is backend_id
+    private Map<Long, List<PublishVersionTask>> publishVersionTasks;
     private boolean hasSendTask;
-    private long publishVersionTime = -1;
     private TransactionStatus preStatus = null;
+
+    // When publish txn, if every tablet has at least 1 replica published succ, but not quorum replicas succ,
+    // and time since firstPublishVersionTime has exceeds Config.publish_wait_time_second,
+    // then this transaction will become visible.
+    private long firstPublishVersionTime = -1;
+
+    private long lastPublishVersionTime = -1;
+
+    private long publishCount = 0;
+
+    // txn may try finish many times and generate a lot of log.
+    // use lastPublishLogTime to reduce log.
+    private long lastPublishLogTime = 0;
 
     @SerializedName(value = "callbackId")
     private long callbackId = -1;
+
     // In the beforeStateTransform() phase, we will get the callback object through the callbackId,
     // and if we get it, we will save it in this variable.
     // The main function of this variable is to retain a reference to this callback object.
@@ -243,6 +279,11 @@ public class TransactionState implements Writable {
     // tbl id -> (index ids)
     private Map<Long, Set<Long>> loadedTblIndexes = Maps.newHashMap();
 
+    /**
+     * the value is the num delta rows of all replicas in each tablet
+     */
+    private final Map<Long, Map<Long, Long>> tableIdToTabletDeltaRows = Maps.newHashMap();
+
     private String errorLogUrl = null;
 
     // record some error msgs during the transaction operation.
@@ -250,13 +291,42 @@ public class TransactionState implements Writable {
     // no need to persist.
     private String errMsg = "";
 
+    public class SchemaInfo {
+        public List<Column> schema;
+        public int schemaVersion;
+
+        public SchemaInfo(OlapTable olapTable) {
+            Map<Long, MaterializedIndexMeta> indexIdToMeta = olapTable.getIndexIdToMeta();
+            for (MaterializedIndexMeta indexMeta : indexIdToMeta.values()) {
+                schema = indexMeta.getSchema();
+                schemaVersion = indexMeta.getSchemaVersion();
+                break;
+            }
+        }
+    }
+
+    private boolean isPartialUpdate = false;
+    // table id -> schema info
+    private Map<Long, SchemaInfo> txnSchemas = new HashMap<>();
+
+    @Getter
+    @SerializedName(value = "sti")
+    private List<Long> subTxnIds;
+    @Getter
+    @SerializedName(value = "stot")
+    private Map<Long, TableCommitInfo> subTxnIdToTableCommitInfo = new TreeMap<>();
+    @Getter
+    @Setter
+    private Set<Long> involvedBackends = Sets.newHashSet();
+
     public TransactionState() {
         this.dbId = -1;
         this.tableIdList = Lists.newArrayList();
         this.transactionId = -1;
         this.label = "";
         this.idToTableCommitInfos = Maps.newHashMap();
-        this.txnCoordinator = new TxnCoordinator(TxnSourceType.FE, "127.0.0.1"); // mocked, to avoid NPE
+        // mocked, to avoid NPE
+        this.txnCoordinator = new TxnCoordinator(TxnSourceType.FE, 0, "127.0.0.1", System.currentTimeMillis());
         this.transactionStatus = TransactionStatus.PREPARE;
         this.sourceType = LoadJobSourceType.FRONTEND;
         this.prepareTime = -1;
@@ -294,25 +364,61 @@ public class TransactionState implements Writable {
         this.timeoutMs = timeoutMs;
     }
 
+    //for TxnInfoPB convert to TransactionState
+    public TransactionState(long dbId, List<Long> tableIdList, long transactionId, String label, TUniqueId requestId,
+            LoadJobSourceType sourceType, TxnCoordinator txnCoordinator, TransactionStatus transactionStatus,
+            String reason, long callbackId, long timeoutMs, TxnCommitAttachment txnCommitAttachment, long prepareTime,
+            long preCommitTime, long commitTime, long finishTime) {
+        this(dbId, tableIdList, transactionId, label, requestId, sourceType, txnCoordinator, callbackId, timeoutMs);
+
+        this.transactionStatus = transactionStatus;
+        this.prepareTime = prepareTime;
+        this.preCommitTime = preCommitTime;
+        this.commitTime = commitTime;
+        this.finishTime = finishTime;
+        this.reason = reason;
+        this.txnCommitAttachment = txnCommitAttachment;
+    }
+
+    public void addSubTxnTableCommitInfo(SubTransactionState subTransactionState, TableCommitInfo tableCommitInfo) {
+        subTxnIdToTableCommitInfo.put(subTransactionState.getSubTransactionId(), tableCommitInfo);
+    }
+
     public void setErrorReplicas(Set<Long> newErrorReplicas) {
         this.errorReplicas = newErrorReplicas;
     }
 
     public void addPublishVersionTask(Long backendId, PublishVersionTask task) {
-        this.publishVersionTasks.put(backendId, task);
+        if (this.subTxnIds == null) {
+            this.publishVersionTasks.put(backendId, Lists.newArrayList(task));
+        } else {
+            this.publishVersionTasks.computeIfAbsent(backendId, k -> Lists.newArrayList()).add(task);
+        }
     }
 
-    public void setHasSendTask(boolean hasSendTask) {
-        this.hasSendTask = hasSendTask;
-        this.publishVersionTime = System.currentTimeMillis();
+    public void setSendedTask() {
+        this.hasSendTask = true;
+        updateSendTaskTime();
     }
 
     public void updateSendTaskTime() {
-        this.publishVersionTime = System.currentTimeMillis();
+        this.publishCount++;
+        this.lastPublishVersionTime = System.currentTimeMillis();
+        if (this.firstPublishVersionTime <= 0) {
+            this.firstPublishVersionTime = lastPublishVersionTime;
+        }
     }
 
-    public long getPublishVersionTime() {
-        return this.publishVersionTime;
+    public long getFirstPublishVersionTime() {
+        return firstPublishVersionTime;
+    }
+
+    public long getLastPublishVersionTime() {
+        return this.lastPublishVersionTime;
+    }
+
+    public long getPublishCount() {
+        return publishCount;
     }
 
     public boolean hasSendTask() {
@@ -321,6 +427,10 @@ public class TransactionState implements Writable {
 
     public TUniqueId getRequestId() {
         return requestId;
+    }
+
+    public void setTransactionId(long transactionId) {
+        this.transactionId = transactionId;
     }
 
     public long getTransactionId() {
@@ -381,6 +491,14 @@ public class TransactionState implements Writable {
 
     public String getErrorLogUrl() {
         return errorLogUrl;
+    }
+
+    public long getLastPublishLogTime() {
+        return lastPublishLogTime;
+    }
+
+    public void setLastPublishLogTime(long lastPublishLogTime) {
+        this.lastPublishLogTime = lastPublishLogTime;
     }
 
     public void setTransactionStatus(TransactionStatus transactionStatus) {
@@ -503,6 +621,19 @@ public class TransactionState implements Writable {
         return dbId;
     }
 
+    // TODO should we add a lock between addTableId, removeTableId and getTableIdList?
+    public void addTableId(long tableId) {
+        this.tableIdList.add(tableId);
+    }
+
+    public void removeTableId(long tableId) {
+        Preconditions.checkState(this.tableIdList.size() > 0, "table id list is empty");
+        Preconditions.checkState(this.tableIdList.get(this.tableIdList.size() - 1) == tableId,
+                "table id is not match, expect: %s, actual: %s", tableId,
+                this.tableIdList.get(this.tableIdList.size() - 1));
+        this.tableIdList.remove(this.tableIdList.size() - 1);
+    }
+
     public List<Long> getTableIdList() {
         return tableIdList;
     }
@@ -517,10 +648,6 @@ public class TransactionState implements Writable {
 
     public TableCommitInfo getTableCommitInfo(long tableId) {
         return this.idToTableCommitInfos.get(tableId);
-    }
-
-    public void removeTable(long tableId) {
-        this.idToTableCommitInfos.remove(tableId);
     }
 
     public void setTxnCommitAttachment(TxnCommitAttachment txnCommitAttachment) {
@@ -555,16 +682,10 @@ public class TransactionState implements Writable {
     }
 
     public synchronized void addTableIndexes(OlapTable table) {
-        Set<Long> indexIds = loadedTblIndexes.get(table.getId());
-        if (indexIds == null) {
-            indexIds = Sets.newHashSet();
-            loadedTblIndexes.put(table.getId(), indexIds);
-        }
+        Set<Long> indexIds = loadedTblIndexes.computeIfAbsent(table.getId(), k -> Sets.newHashSet());
         // always equal the index ids
         indexIds.clear();
-        for (Long indexId : table.getIndexIdToMeta().keySet()) {
-            indexIds.add(indexId);
-        }
+        indexIds.addAll(table.getIndexIdToMeta().keySet());
     }
 
     public Map<Long, Set<Long>> getLoadedTblIndexes() {
@@ -579,7 +700,7 @@ public class TransactionState implements Writable {
         sb.append(", db id: ").append(dbId);
         sb.append(", table id list: ").append(StringUtils.join(tableIdList, ","));
         sb.append(", callback id: ").append(callbackId);
-        sb.append(", coordinator: ").append(txnCoordinator.toString());
+        sb.append(", coordinator: ").append(txnCoordinator);
         sb.append(", transaction status: ").append(transactionStatus);
         sb.append(", error replicas num: ").append(errorReplicas.size());
         sb.append(", replica ids: ").append(Joiner.on(",").join(errorReplicas.stream().limit(5).toArray()));
@@ -588,7 +709,16 @@ public class TransactionState implements Writable {
         sb.append(", finish time: ").append(finishTime);
         sb.append(", reason: ").append(reason);
         if (txnCommitAttachment != null) {
-            sb.append(" attactment: ").append(txnCommitAttachment);
+            sb.append(", attachment: ").append(txnCommitAttachment);
+        }
+        if (idToTableCommitInfos != null && !idToTableCommitInfos.isEmpty()) {
+            sb.append(", table commit info: ").append(idToTableCommitInfos);
+        }
+        if (subTxnIds != null) {
+            sb.append(", sub txn ids: ").append(subTxnIds);
+        }
+        if (!subTxnIdToTableCommitInfo.isEmpty()) {
+            sb.append(", sub txn table commit info: ").append(subTxnIdToTableCommitInfo);
         }
         return sb.toString();
     }
@@ -601,7 +731,7 @@ public class TransactionState implements Writable {
         return sourceType;
     }
 
-    public Map<Long, PublishVersionTask> getPublishVersionTasks() {
+    public Map<Long, List<PublishVersionTask>> getPublishVersionTasks() {
         return publishVersionTasks;
     }
 
@@ -611,7 +741,7 @@ public class TransactionState implements Writable {
         if (prolongPublishTimeout) {
             timeoutMillis *= 2;
         }
-        return System.currentTimeMillis() - publishVersionTime > timeoutMillis;
+        return System.currentTimeMillis() - lastPublishVersionTime > timeoutMillis;
     }
 
     public void prolongPublishTimeout() {
@@ -621,52 +751,31 @@ public class TransactionState implements Writable {
 
     @Override
     public void write(DataOutput out) throws IOException {
-        out.writeLong(transactionId);
-        Text.writeString(out, label);
-        out.writeLong(dbId);
-        out.writeInt(idToTableCommitInfos.size());
-        for (TableCommitInfo info : idToTableCommitInfos.values()) {
-            info.write(out);
-        }
-        out.writeInt(txnCoordinator.sourceType.value());
-        Text.writeString(out, txnCoordinator.ip);
-        out.writeInt(transactionStatus.value());
-        out.writeInt(sourceType.value());
-        out.writeLong(prepareTime);
-        out.writeLong(preCommitTime);
-        out.writeLong(commitTime);
-        out.writeLong(finishTime);
-        Text.writeString(out, reason);
-        out.writeInt(errorReplicas.size());
-        for (long errorReplciaId : errorReplicas) {
-            out.writeLong(errorReplciaId);
-        }
+        Text.writeString(out, GsonUtils.GSON.toJson(this));
+    }
 
-        if (txnCommitAttachment == null) {
-            out.writeBoolean(false);
+    public static TransactionState read(DataInput in) throws IOException {
+        if (Env.getCurrentEnvJournalVersion() < FeMetaVersion.VERSION_132) {
+            TransactionState transactionState = new TransactionState();
+            transactionState.readFields(in);
+            return transactionState;
         } else {
-            out.writeBoolean(true);
-            txnCommitAttachment.write(out);
-        }
-        out.writeLong(callbackId);
-        out.writeLong(timeoutMs);
-        out.writeInt(tableIdList.size());
-        for (int i = 0; i < tableIdList.size(); i++) {
-            out.writeLong(tableIdList.get(i));
+            String json = Text.readString(in);
+            return GsonUtils.GSON.fromJson(json, TransactionState.class);
         }
     }
 
+    @Deprecated
     public void readFields(DataInput in) throws IOException {
         transactionId = in.readLong();
         label = Text.readString(in);
         dbId = in.readLong();
         int size = in.readInt();
         for (int i = 0; i < size; i++) {
-            TableCommitInfo info = new TableCommitInfo();
-            info.readFields(in);
+            TableCommitInfo info = TableCommitInfo.read(in);
             idToTableCommitInfos.put(info.getTableId(), info);
         }
-        txnCoordinator = new TxnCoordinator(TxnSourceType.valueOf(in.readInt()), Text.readString(in));
+        txnCoordinator = new TxnCoordinator(TxnSourceType.valueOf(in.readInt()), 0, Text.readString(in), 0);
         transactionStatus = TransactionStatus.valueOf(in.readInt());
         sourceType = LoadJobSourceType.valueOf(in.readInt());
         prepareTime = in.readLong();
@@ -693,6 +802,14 @@ public class TransactionState implements Writable {
         }
     }
 
+    public Map<Long, Map<Long, Long>> getTableIdToTabletDeltaRows() {
+        return tableIdToTabletDeltaRows;
+    }
+
+    public void setTableIdToTabletDeltaRows(Map<Long, Map<Long, Long>> tableIdToTabletDeltaRows) {
+        this.tableIdToTabletDeltaRows.putAll(tableIdToTabletDeltaRows);
+    }
+
     public void setErrorMsg(String errMsg) {
         this.errMsg = errMsg;
     }
@@ -703,5 +820,74 @@ public class TransactionState implements Writable {
 
     public String getErrMsg() {
         return this.errMsg;
+    }
+
+    // reduce memory
+    public void pruneAfterVisible() {
+        publishVersionTasks.clear();
+        tableIdToTabletDeltaRows.clear();
+        involvedBackends.clear();
+    }
+
+    public void setSchemaForPartialUpdate(OlapTable olapTable) {
+        // the caller should hold the read lock of the table
+        isPartialUpdate = true;
+        txnSchemas.put(olapTable.getId(), new SchemaInfo(olapTable));
+    }
+
+    public boolean isPartialUpdate() {
+        return isPartialUpdate;
+    }
+
+    public SchemaInfo getTxnSchema(long id) {
+        return txnSchemas.get(id);
+    }
+
+    public boolean checkSchemaCompatibility(OlapTable olapTable) {
+        SchemaInfo currentSchemaInfo = new SchemaInfo(olapTable);
+        SchemaInfo txnSchemaInfo = txnSchemas.get(olapTable.getId());
+        if (txnSchemaInfo == null) {
+            return true;
+        }
+        if (txnSchemaInfo.schemaVersion >= currentSchemaInfo.schemaVersion) {
+            return true;
+        }
+        for (Column txnCol : txnSchemaInfo.schema) {
+            if (!txnCol.isVisible() || !txnCol.getType().isStringType()) {
+                continue;
+            }
+            int uniqueId = txnCol.getUniqueId();
+            Optional<Column> currentCol = currentSchemaInfo.schema.stream()
+                    .filter(col -> col.getUniqueId() == uniqueId).findFirst();
+            // for now Doris's light schema change only supports adding columns,
+            // dropping columns, and type conversions that increase the varchar length
+            if (currentCol.isPresent() && currentCol.get().getType().isStringType()) {
+                if (currentCol.get().getStrLen() != txnCol.getStrLen()) {
+                    LOG.warn("Check schema compatibility failed, txnId={}, table={}",
+                            transactionId, olapTable.getName());
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    public void setSubTxnIds(List<Long> subTxnIds) {
+        this.subTxnIds = subTxnIds;
+    }
+
+    public TableCommitInfo getTableCommitInfoBySubTxnId(long subTxnId) {
+        return subTxnIdToTableCommitInfo.get(subTxnId);
+    }
+
+    public List<TableCommitInfo> getSubTxnTableCommitInfos() {
+        List<TableCommitInfo> tableCommitInfos = new ArrayList<>();
+        for (Long subTxnId : subTxnIds) {
+            TableCommitInfo tableCommitInfo = subTxnIdToTableCommitInfo.get(subTxnId);
+            if (tableCommitInfo != null) {
+                tableCommitInfos.add(tableCommitInfo);
+            }
+        }
+        return tableCommitInfos;
     }
 }

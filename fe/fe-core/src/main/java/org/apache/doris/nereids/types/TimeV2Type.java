@@ -17,24 +17,39 @@
 
 package org.apache.doris.nereids.types;
 
+import org.apache.doris.catalog.ScalarType;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.nereids.types.coercion.PrimitiveType;
+import org.apache.doris.nereids.types.coercion.RangeScalable;
 
 /**
  * Datetime type in Nereids.
  */
-public class TimeV2Type extends PrimitiveType {
+public class TimeV2Type extends PrimitiveType implements RangeScalable {
 
     public static final TimeV2Type INSTANCE = new TimeV2Type();
 
     private static final int WIDTH = 8;
+    private final int scale;
+
+    private TimeV2Type(int scale) {
+        this.scale = scale;
+    }
 
     private TimeV2Type() {
+        scale = 0;
     }
 
     @Override
     public Type toCatalogDataType() {
-        return Type.TIMEV2;
+        return ScalarType.createTimeV2Type(scale);
+    }
+
+    /**
+     * create TimeV2Type from scale
+     */
+    public static TimeV2Type of(int scale) {
+        return new TimeV2Type(scale);
     }
 
     @Override
@@ -45,5 +60,9 @@ public class TimeV2Type extends PrimitiveType {
     @Override
     public int width() {
         return WIDTH;
+    }
+
+    public int getScale() {
+        return scale;
     }
 }

@@ -58,18 +58,32 @@ public class PlanPostProcessors {
     public List<PlanPostProcessor> getProcessors() {
         // add processor if we need
         Builder<PlanPostProcessor> builder = ImmutableList.builder();
+        builder.add(new PushDownFilterThroughProject());
+        builder.add(new RemoveUselessProjectPostProcessor());
         builder.add(new MergeProjectPostProcessor());
-        builder.add(new PushdownFilterThroughProject());
+        builder.add(new RecomputeLogicalPropertiesProcessor());
+        if (cascadesContext.getConnectContext().getSessionVariable().enableAggregateCse) {
+            builder.add(new ProjectAggregateExpressionsForCse());
+        }
+        builder.add(new CommonSubExpressionOpt());
+        // DO NOT replace PLAN NODE from here
+        if (cascadesContext.getConnectContext().getSessionVariable().pushTopnToAgg) {
+            builder.add(new PushTopnToAgg());
+        }
+        builder.add(new TopNScanOpt());
+        builder.add(new FragmentProcessor());
         if (!cascadesContext.getConnectContext().getSessionVariable().getRuntimeFilterMode()
                         .toUpperCase().equals(TRuntimeFilterMode.OFF.name())) {
+            builder.add(new RegisterParent());
             builder.add(new RuntimeFilterGenerator());
             if (ConnectContext.get().getSessionVariable().enableRuntimeFilterPrune) {
                 builder.add(new RuntimeFilterPruner());
+                if (ConnectContext.get().getSessionVariable().runtimeFilterPruneForExternal) {
+                    builder.add(new RuntimeFilterPrunerForExternalTable());
+                }
             }
         }
         builder.add(new Validator());
-        builder.add(new TopNScanOpt());
-        builder.add(new TwoPhaseReadOpt());
         return builder.build();
     }
 }

@@ -21,18 +21,22 @@ import org.apache.doris.analysis.BrokerDesc;
 import org.apache.doris.analysis.ModifyBrokerClause;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.DdlException;
+import org.apache.doris.common.FeMetaVersion;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.common.proc.BaseProcResult;
 import org.apache.doris.common.proc.ProcNodeInterface;
 import org.apache.doris.common.proc.ProcResult;
+import org.apache.doris.common.util.NetUtils;
 import org.apache.doris.common.util.TimeUtils;
+import org.apache.doris.persist.gson.GsonUtils;
 
 import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.google.gson.annotations.SerializedName;
 
 import java.io.DataInput;
 import java.io.DataOutput;
@@ -219,7 +223,8 @@ public class BrokerMgr {
                 List<FsBroker> addressList = brokerAddrsMap.get(pair.first);
                 for (FsBroker addr : addressList) {
                     if (addr.port == pair.second) {
-                        throw new DdlException("Broker(" + pair.first + ":" + pair.second
+                        throw new DdlException("Broker(" + NetUtils
+                                .getHostPortInAccessibleFormat(pair.first, pair.second)
                                 + ") has already in brokers.");
                     }
                 }
@@ -274,7 +279,8 @@ public class BrokerMgr {
                     }
                 }
                 if (!found) {
-                    throw new DdlException("Broker(" + pair.first + ":" + pair.second + ") has not in brokers.");
+                    throw new DdlException("Broker(" + NetUtils
+                            .getHostPortInAccessibleFormat(pair.first, pair.second) + ") has not in brokers.");
                 }
             }
             Env.getCurrentEnv().getEditLog().logDropBroker(new ModifyBrokerInfo(name, droppedAddressList));
@@ -380,7 +386,9 @@ public class BrokerMgr {
     }
 
     public static class ModifyBrokerInfo implements Writable {
+        @SerializedName(value = "n")
         public String brokerName;
+        @SerializedName(value = "a")
         public List<FsBroker> brokerAddresses;
 
         public ModifyBrokerInfo() {
@@ -393,13 +401,20 @@ public class BrokerMgr {
 
         @Override
         public void write(DataOutput out) throws IOException {
-            Text.writeString(out, brokerName);
-            out.writeInt(brokerAddresses.size());
-            for (FsBroker address : brokerAddresses) {
-                address.write(out);
+            Text.writeString(out, GsonUtils.GSON.toJson(this));
+        }
+
+        public static ModifyBrokerInfo read(DataInput in) throws IOException {
+            if (Env.getCurrentEnvJournalVersion() < FeMetaVersion.VERSION_134) {
+                ModifyBrokerInfo modifyBrokerInfo = new ModifyBrokerInfo();
+                modifyBrokerInfo.readFields(in);
+                return modifyBrokerInfo;
+            } else {
+                return GsonUtils.GSON.fromJson(Text.readString(in), ModifyBrokerInfo.class);
             }
         }
 
+        @Deprecated
         public void readFields(DataInput in) throws IOException {
             brokerName = Text.readString(in);
             int size = in.readInt();
@@ -407,12 +422,6 @@ public class BrokerMgr {
             for (int i = 0; i < size; ++i) {
                 brokerAddresses.add(FsBroker.readIn(in));
             }
-        }
-
-        public static ModifyBrokerInfo readIn(DataInput in) throws IOException {
-            ModifyBrokerInfo info = new ModifyBrokerInfo();
-            info.readFields(in);
-            return info;
         }
     }
 }

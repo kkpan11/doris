@@ -24,7 +24,7 @@ import org.apache.doris.nereids.types.DoubleType;
 /**
  * Abstract class for all numeric type in Nereids.
  */
-public class NumericType extends PrimitiveType {
+public class NumericType extends PrimitiveType implements RangeScalable {
 
     public static final NumericType INSTANCE = new NumericType();
 
@@ -39,7 +39,7 @@ public class NumericType extends PrimitiveType {
     }
 
     @Override
-    public boolean acceptsType(AbstractDataType other) {
+    public boolean acceptsType(DataType other) {
         return other instanceof NumericType;
     }
 

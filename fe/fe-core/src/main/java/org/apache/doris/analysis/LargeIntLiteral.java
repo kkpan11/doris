@@ -20,16 +20,15 @@ package org.apache.doris.analysis;
 import org.apache.doris.catalog.PrimitiveType;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.FormatOptions;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.thrift.TExprNode;
 import org.apache.doris.thrift.TExprNodeType;
 import org.apache.doris.thrift.TLargeIntLiteral;
 
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
+import com.google.gson.annotations.SerializedName;
 
 import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.math.BigInteger;
@@ -38,9 +37,7 @@ import java.nio.ByteOrder;
 import java.util.Objects;
 
 // large int for the num that native types can not
-public class LargeIntLiteral extends LiteralExpr {
-    private static final Logger LOG = LogManager.getLogger(LargeIntLiteral.class);
-
+public class LargeIntLiteral extends NumericLiteralExpr {
     // -2^127
     public static final BigInteger LARGE_INT_MIN = new BigInteger("-170141183460469231731687303715884105728");
     // 2^127 - 1
@@ -48,6 +45,7 @@ public class LargeIntLiteral extends LiteralExpr {
     // 2^127
     public static final BigInteger LARGE_INT_MAX_ABS = new BigInteger("170141183460469231731687303715884105728");
 
+    @SerializedName("v")
     private BigInteger value;
 
     public LargeIntLiteral() {
@@ -143,24 +141,30 @@ public class LargeIntLiteral extends LiteralExpr {
     // little endian for hash code
     @Override
     public ByteBuffer getHashValue(PrimitiveType type) {
-        ByteBuffer buffer = ByteBuffer.allocate(16);
+        int buffLen = 0;
+        if (type == PrimitiveType.DECIMAL256) {
+            buffLen = 32;
+        } else {
+            buffLen = 16;
+        }
+        ByteBuffer buffer = ByteBuffer.allocate(buffLen);
         buffer.order(ByteOrder.LITTLE_ENDIAN);
         byte[] byteArray = value.toByteArray();
         int len = byteArray.length;
         int end = 0;
-        if (len > 16) {
-            end = len - 16;
+        if (len > buffLen) {
+            end = len - buffLen;
         }
 
         for (int i = len - 1; i >= end; --i) {
             buffer.put(byteArray[i]);
         }
         if (value.signum() >= 0) {
-            while (len++ < 16) {
+            while (len++ < buffLen) {
                 buffer.put((byte) 0);
             }
         } else {
-            while (len++ < 16) {
+            while (len++ < buffLen) {
                 buffer.put((byte) 0xFF);
             }
         }
@@ -171,6 +175,9 @@ public class LargeIntLiteral extends LiteralExpr {
 
     @Override
     public int compareLiteral(LiteralExpr expr) {
+        if (expr instanceof PlaceHolderExpr) {
+            return this.compareLiteral(((PlaceHolderExpr) expr).getLiteral());
+        }
         if (expr instanceof NullLiteral) {
             return 1;
         }
@@ -191,8 +198,8 @@ public class LargeIntLiteral extends LiteralExpr {
     }
 
     @Override
-    public String getStringValueForArray() {
-        return "\"" + getStringValue() + "\"";
+    public String getStringValueForArray(FormatOptions options) {
+        return options.getNestedStringWrapper() + getStringValue() + options.getNestedStringWrapper();
     }
 
     @Override
@@ -235,15 +242,14 @@ public class LargeIntLiteral extends LiteralExpr {
     }
 
     @Override
-    public void swapSign() {
-        // swapping sign does not change the type
-        value = value.negate();
+    public void setupParamFromBinary(ByteBuffer data, boolean isUnsigned) {
+        value = new BigInteger(Long.toUnsignedString(data.getLong()));
     }
 
     @Override
-    public void write(DataOutput out) throws IOException {
-        super.write(out);
-        Text.writeString(out, value.toString());
+    public void swapSign() {
+        // swapping sign does not change the type
+        value = value.negate();
     }
 
     public void readFields(DataInput in) throws IOException {

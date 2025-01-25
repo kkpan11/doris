@@ -26,6 +26,8 @@
 #include "olap/rowset/segment_v2/bloom_filter.h"
 
 namespace doris {
+static constexpr uint64_t SEED_GEN = 217728422;
+
 namespace segment_v2 {
 enum HashStrategyPB : int;
 
@@ -48,7 +50,15 @@ public:
     bool is_ngram_bf() const override { return true; }
 
 private:
+// FIXME: non-static data member '_size' of 'NGramBloomFilter' shadows member inherited from type 'BloomFilter'
+#ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wshadow-field"
+#endif
     size_t _size;
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif
     size_t words;
     std::vector<uint64_t> filter;
 };

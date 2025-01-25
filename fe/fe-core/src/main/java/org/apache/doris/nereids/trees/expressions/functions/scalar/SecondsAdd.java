@@ -19,6 +19,7 @@ package org.apache.doris.nereids.trees.expressions.functions.scalar;
 
 import org.apache.doris.catalog.FunctionSignature;
 import org.apache.doris.nereids.trees.expressions.Expression;
+import org.apache.doris.nereids.trees.expressions.functions.DateAddSubMonotonic;
 import org.apache.doris.nereids.trees.expressions.functions.ExplicitlyCastableSignature;
 import org.apache.doris.nereids.trees.expressions.functions.PropagateNullableOnDateLikeV2Args;
 import org.apache.doris.nereids.trees.expressions.shape.BinaryExpression;
@@ -38,13 +39,15 @@ import java.util.List;
  * ScalarFunction 'minutes_add'.
  */
 public class SecondsAdd extends ScalarFunction
-        implements BinaryExpression, ExplicitlyCastableSignature, PropagateNullableOnDateLikeV2Args {
-    public static final List<FunctionSignature> SIGNATURES = ImmutableList.of(
-            FunctionSignature.ret(DateTimeType.INSTANCE).args(DateTimeType.INSTANCE, IntegerType.INSTANCE),
+        implements BinaryExpression, ExplicitlyCastableSignature, PropagateNullableOnDateLikeV2Args,
+        DateAddSubMonotonic {
+
+    private static final List<FunctionSignature> SIGNATURES = ImmutableList.of(
             FunctionSignature.ret(DateTimeV2Type.SYSTEM_DEFAULT)
                     .args(DateTimeV2Type.SYSTEM_DEFAULT, IntegerType.INSTANCE),
-            FunctionSignature.ret(DateTimeType.INSTANCE).args(DateType.INSTANCE, IntegerType.INSTANCE),
-            FunctionSignature.ret(DateTimeV2Type.SYSTEM_DEFAULT).args(DateV2Type.INSTANCE, IntegerType.INSTANCE)
+            FunctionSignature.ret(DateTimeV2Type.SYSTEM_DEFAULT).args(DateV2Type.INSTANCE, IntegerType.INSTANCE),
+            FunctionSignature.ret(DateTimeType.INSTANCE).args(DateTimeType.INSTANCE, IntegerType.INSTANCE),
+            FunctionSignature.ret(DateTimeType.INSTANCE).args(DateType.INSTANCE, IntegerType.INSTANCE)
     );
 
     public SecondsAdd(Expression arg0, Expression arg1) {
@@ -65,5 +68,10 @@ public class SecondsAdd extends ScalarFunction
     @Override
     public <R, C> R accept(ExpressionVisitor<R, C> visitor, C context) {
         return visitor.visitSecondsAdd(this, context);
+    }
+
+    @Override
+    public Expression withConstantArgs(Expression literal) {
+        return new SecondsAdd(literal, child(1));
     }
 }

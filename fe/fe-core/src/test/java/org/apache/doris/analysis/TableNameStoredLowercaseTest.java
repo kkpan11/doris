@@ -48,7 +48,6 @@ public class TableNameStoredLowercaseTest {
     @BeforeClass
     public static void setUp() throws Exception {
         Config.lower_case_table_names = 1;
-        Config.enable_batch_delete_by_default = true;
         Config.enable_http_server_v2 = false;
         UtFrameUtils.createDorisCluster(runningDir);
         String table1 = "CREATE TABLE db1.TABLE1 (\n"
@@ -81,7 +80,7 @@ public class TableNameStoredLowercaseTest {
 
     @Test
     public void testTableNameLowerCase() {
-        Set<String> tableNames = Env.getCurrentInternalCatalog().getDbNullable("default_cluster:db1")
+        Set<String> tableNames = Env.getCurrentInternalCatalog().getDbNullable("db1")
                 .getTableNamesWithLock();
         Assert.assertEquals(2, tableNames.size());
         Assert.assertTrue(tableNames.contains("table1"));

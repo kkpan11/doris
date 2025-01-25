@@ -36,7 +36,6 @@ import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.PartitionInfo;
 import org.apache.doris.catalog.PartitionItem;
 import org.apache.doris.catalog.PartitionType;
-import org.apache.doris.catalog.Type;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
@@ -46,21 +45,23 @@ import org.apache.doris.common.UserException;
 import org.apache.doris.common.util.TimeUtils;
 import org.apache.doris.load.BrokerFileGroup;
 import org.apache.doris.load.loadv2.LoadTask;
-import org.apache.doris.load.routineload.RoutineLoadJob;
+import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.service.FrontendOptions;
 import org.apache.doris.task.LoadTaskInfo;
+import org.apache.doris.task.StreamLoadTask;
 import org.apache.doris.thrift.PaloInternalServiceVersion;
 import org.apache.doris.thrift.TBrokerFileStatus;
-import org.apache.doris.thrift.TExecPlanFragmentParams;
 import org.apache.doris.thrift.TFileType;
 import org.apache.doris.thrift.TNetworkAddress;
-import org.apache.doris.thrift.TPlanFragmentExecParams;
+import org.apache.doris.thrift.TPipelineFragmentParams;
+import org.apache.doris.thrift.TPipelineInstanceParams;
 import org.apache.doris.thrift.TQueryGlobals;
 import org.apache.doris.thrift.TQueryOptions;
 import org.apache.doris.thrift.TQueryType;
 import org.apache.doris.thrift.TScanRangeLocations;
 import org.apache.doris.thrift.TScanRangeParams;
 import org.apache.doris.thrift.TUniqueId;
+import org.apache.doris.thrift.TUniqueKeyUpdateMode;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -100,7 +101,7 @@ public class StreamLoadPlanner {
         analyzer = new Analyzer(Env.getCurrentEnv(), null);
         // TODO(cmy): currently we do not support UDF in stream load command.
         // Because there is no way to check the privilege of accessing UDF..
-        analyzer.setUDFAllowed(false);
+        analyzer.setUDFAllowed(Config.enable_udf_in_load);
         descTable = analyzer.getDescTbl();
     }
 
@@ -109,8 +110,14 @@ public class StreamLoadPlanner {
         return destTable;
     }
 
+    // the caller should get table read lock when call this method
+    public TPipelineFragmentParams plan(TUniqueId loadId) throws UserException {
+        return this.plan(loadId, 1);
+    }
+
+    // the caller should get table read lock when call this method
     // create the plan. the plan's query id and load id are same, using the parameter 'loadId'
-    public TExecPlanFragmentParams plan(TUniqueId loadId) throws UserException {
+    public TPipelineFragmentParams plan(TUniqueId loadId, int fragmentInstanceIdIndex) throws UserException {
         if (destTable.getKeysType() != KeysType.UNIQUE_KEYS
                 && taskInfo.getMergeType() != LoadTask.MergeType.APPEND) {
             throw new AnalysisException("load by MERGE or DELETE is only supported in unique tables.");
@@ -119,8 +126,9 @@ public class StreamLoadPlanner {
                 && !destTable.hasDeleteSign()) {
             throw new AnalysisException("load by MERGE or DELETE need to upgrade table to support batch delete.");
         }
-
-        if (destTable.hasSequenceCol() && !taskInfo.hasSequenceCol() && destTable.getSequenceMapCol() == null) {
+        TUniqueKeyUpdateMode uniquekeyUpdateMode = taskInfo.getUniqueKeyUpdateMode();
+        if (uniquekeyUpdateMode != TUniqueKeyUpdateMode.UPDATE_FLEXIBLE_COLUMNS
+                && destTable.hasSequenceCol() && !taskInfo.hasSequenceCol() && destTable.getSequenceMapCol() == null) {
             throw new UserException("Table " + destTable.getName()
                     + " has sequence column, need to specify the sequence column");
         }
@@ -136,44 +144,116 @@ public class StreamLoadPlanner {
         scanTupleDesc = descTable.createTupleDescriptor("ScanTuple");
         boolean negative = taskInfo.getNegative();
         // get partial update related info
-        boolean isPartialUpdate = taskInfo.isPartialUpdate();
-        if (isPartialUpdate && !destTable.getEnableUniqueKeyMergeOnWrite()) {
+        if (uniquekeyUpdateMode != TUniqueKeyUpdateMode.UPSERT && !destTable.getEnableUniqueKeyMergeOnWrite()) {
             throw new UserException("Only unique key merge on write support partial update");
         }
+
+        // try to convert to upsert if only has missing auto-increment key column
+        boolean hasMissingColExceptAutoIncKey = false;
+        if (taskInfo.getColumnExprDescs().descs.isEmpty()
+                && uniquekeyUpdateMode == TUniqueKeyUpdateMode.UPDATE_FIXED_COLUMNS) {
+            uniquekeyUpdateMode = TUniqueKeyUpdateMode.UPSERT;
+        }
+
+        if (uniquekeyUpdateMode == TUniqueKeyUpdateMode.UPDATE_FIXED_COLUMNS
+                || uniquekeyUpdateMode == TUniqueKeyUpdateMode.UPDATE_FLEXIBLE_COLUMNS) {
+            boolean hasSyncMaterializedView = destTable.getFullSchema().stream()
+                    .anyMatch(col -> col.isMaterializedViewColumn());
+            if (hasSyncMaterializedView) {
+                throw new DdlException("Can't do partial update on merge-on-write Unique table"
+                        + " with sync materialized view.");
+            }
+            if (destTable.isUniqKeyMergeOnWriteWithClusterKeys()) {
+                throw new UserException("Can't do partial update on merge-on-write Unique table with cluster keys");
+            }
+        }
+
+        if (uniquekeyUpdateMode == TUniqueKeyUpdateMode.UPDATE_FLEXIBLE_COLUMNS && !destTable.hasSkipBitmapColumn()) {
+            String tblName = destTable.getName();
+            throw new UserException("Flexible partial update can only support table with skip bitmap hidden column."
+                    + " But table " + tblName + " doesn't have it. You can use `ALTER TABLE " + tblName
+                            + " ENABLE FEATURE \"UPDATE_FLEXIBLE_COLUMNS\";` to add it to the table.");
+        }
+        if (uniquekeyUpdateMode == TUniqueKeyUpdateMode.UPDATE_FLEXIBLE_COLUMNS
+                && !destTable.getEnableLightSchemaChange()) {
+            throw new UserException("Flexible partial update can only support table with light_schema_change enabled."
+                    + " But table " + destTable.getName() + "'s property light_schema_change is false");
+        }
+        if (uniquekeyUpdateMode == TUniqueKeyUpdateMode.UPDATE_FLEXIBLE_COLUMNS
+                && destTable.hasVariantColumns()) {
+            throw new UserException("Flexible partial update can only support table without variant columns.");
+        }
         HashSet<String> partialUpdateInputColumns = new HashSet<>();
-        if (isPartialUpdate) {
+        if (uniquekeyUpdateMode == TUniqueKeyUpdateMode.UPDATE_FIXED_COLUMNS) {
             for (Column col : destTable.getFullSchema()) {
                 boolean existInExpr = false;
+                if (col.hasOnUpdateDefaultValue()) {
+                    partialUpdateInputColumns.add(col.getName());
+                }
                 for (ImportColumnDesc importColumnDesc : taskInfo.getColumnExprDescs().descs) {
                     if (importColumnDesc.getColumnName() != null
                             && importColumnDesc.getColumnName().equals(col.getName())) {
-                        if (!col.isVisible()) {
-                            throw new UserException("Partial update should not include invisible column: "
-                                + col.getName());
+                        if (!col.isVisible() && !Column.DELETE_SIGN.equals(col.getName())) {
+                            throw new UserException("Partial update should not include invisible column except"
+                                    + " delete sign column: " + col.getName());
                         }
                         partialUpdateInputColumns.add(col.getName());
+                        if (destTable.hasSequenceCol() && (taskInfo.hasSequenceCol() || (
+                                destTable.getSequenceMapCol() != null
+                                        && destTable.getSequenceMapCol().equalsIgnoreCase(col.getName())))) {
+                            partialUpdateInputColumns.add(Column.SEQUENCE_COL);
+                        }
                         existInExpr = true;
                         break;
                     }
                 }
-                if (col.isKey() && !existInExpr) {
-                    throw new UserException("Partial update should include all key columns, missing: " + col.getName());
+                if (!existInExpr) {
+                    if (col.isKey() && !col.isAutoInc()) {
+                        throw new UserException("Partial update should include all key columns, missing: "
+                                + col.getName());
+                    }
+                    if (!(col.isKey() && col.isAutoInc()) && col.isVisible()) {
+                        hasMissingColExceptAutoIncKey = true;
+                    }
+                }
+
+                if (!col.getGeneratedColumnsThatReferToThis().isEmpty()
+                        && col.getGeneratedColumnInfo() == null && !existInExpr) {
+                    throw new UserException("Partial update should include"
+                            + " all ordinary columns referenced"
+                            + " by generated columns, missing: " + col.getName());
                 }
             }
+            if (taskInfo.getMergeType() == LoadTask.MergeType.DELETE
+                    || taskInfo.getMergeType() == LoadTask.MergeType.MERGE) {
+                partialUpdateInputColumns.add(Column.DELETE_SIGN);
+            }
+        }
+        if (uniquekeyUpdateMode == TUniqueKeyUpdateMode.UPDATE_FIXED_COLUMNS && !hasMissingColExceptAutoIncKey) {
+            uniquekeyUpdateMode = TUniqueKeyUpdateMode.UPSERT;
         }
         // here we should be full schema to fill the descriptor table
         for (Column col : destTable.getFullSchema()) {
-            if (isPartialUpdate && !partialUpdateInputColumns.contains(col.getName())) {
+            if (uniquekeyUpdateMode == TUniqueKeyUpdateMode.UPDATE_FIXED_COLUMNS
+                    && !partialUpdateInputColumns.contains(col.getName())) {
                 continue;
             }
             SlotDescriptor slotDesc = descTable.addSlotDescriptor(tupleDesc);
             slotDesc.setIsMaterialized(true);
             slotDesc.setColumn(col);
             slotDesc.setIsNullable(col.isAllowNull());
+            slotDesc.setAutoInc(col.isAutoInc());
             SlotDescriptor scanSlotDesc = descTable.addSlotDescriptor(scanTupleDesc);
             scanSlotDesc.setIsMaterialized(true);
             scanSlotDesc.setColumn(col);
             scanSlotDesc.setIsNullable(col.isAllowNull());
+            scanSlotDesc.setAutoInc(col.isAutoInc());
+            if (col.isAutoInc()) {
+                // auto-increment column should be non-nullable
+                // however, here we use `NullLiteral` to indicate that a cell should
+                // be filled with generated value in `VOlapTableSink::_fill_auto_inc_cols()`
+                scanSlotDesc.setIsNullable(true);
+            }
             for (ImportColumnDesc importColumnDesc : taskInfo.getColumnExprDescs().descs) {
                 try {
                     if (!importColumnDesc.isColumn() && importColumnDesc.getColumnName() != null
@@ -191,29 +271,20 @@ public class StreamLoadPlanner {
             }
         }
 
-        // Plan scan tuple of dynamic table
-        if (destTable.isDynamicSchema()) {
-            descTable.addReferencedTable(destTable);
-            scanTupleDesc.setTable(destTable);
-            // add a implict container column "DORIS_DYNAMIC_COL" for dynamic columns
-            SlotDescriptor slotDesc = descTable.addSlotDescriptor(scanTupleDesc);
-            Column col = new Column(Column.DYNAMIC_COLUMN_NAME, Type.VARIANT, false, null, false, "",
-                                    "stream load auto dynamic column");
-            slotDesc.setIsMaterialized(true);
-            slotDesc.setColumn(col);
-            // Non-nullable slots will have 0 for the byte offset and -1 for the bit mask
-            slotDesc.setNullIndicatorBit(-1);
-            slotDesc.setNullIndicatorByte(0);
-            slotDesc.setIsNullable(false);
-            LOG.debug("plan tupleDesc {}", scanTupleDesc.toString());
+        scanTupleDesc.setTable(destTable);
+        analyzer.registerTupleDescriptor(scanTupleDesc);
+        Expr whereExpr = null;
+        if (null != taskInfo.getWhereExpr()) {
+            whereExpr = taskInfo.getWhereExpr().clone();
+            whereExpr.analyze(analyzer);
         }
-
         // create scan node
         FileLoadScanNode fileScanNode = new FileLoadScanNode(new PlanNodeId(0), scanTupleDesc);
         // 1. create file group
         DataDescription dataDescription = new DataDescription(destTable.getName(), taskInfo);
         dataDescription.analyzeWithoutCheckPriv(db.getFullName());
         BrokerFileGroup fileGroup = new BrokerFileGroup(dataDescription);
+        fileGroup.setWhereExpr(whereExpr);
         fileGroup.parse(db, dataDescription);
         // 2. create dummy file status
         TBrokerFileStatus fileStatus = new TBrokerFileStatus();
@@ -229,7 +300,7 @@ public class StreamLoadPlanner {
         // The load id will pass to csv reader to find the stream load context from new load stream manager
         fileScanNode.setLoadInfo(loadId, taskInfo.getTxnId(), destTable, BrokerDesc.createForStreamLoad(),
                 fileGroup, fileStatus, taskInfo.isStrictMode(), taskInfo.getFileType(), taskInfo.getHiddenColumns(),
-                taskInfo.isPartialUpdate());
+                uniquekeyUpdateMode, destTable.getSequenceMapCol());
         scanNode = fileScanNode;
 
         scanNode.init(analyzer);
@@ -237,20 +308,26 @@ public class StreamLoadPlanner {
         descTable.computeStatAndMemLayout();
 
         int timeout = taskInfo.getTimeout();
-        if (taskInfo instanceof RoutineLoadJob) {
-            // For routine load, make the timeout fo plan fragment larger than MaxIntervalS config.
-            // So that the execution won't be killed before consuming finished.
-            timeout *= 2;
-        }
-
+        final boolean enableMemtableOnSinkNode =
+                destTable.getTableProperty().getUseSchemaLightChange()
+                ? taskInfo.isMemtableOnSinkNode() : false;
+        final boolean enableSingleReplicaLoad = enableMemtableOnSinkNode
+                ? false : Config.enable_single_replica_load;
         // create dest sink
         List<Long> partitionIds = getAllPartitionIds();
-        OlapTableSink olapTableSink = new OlapTableSink(destTable, tupleDesc, partitionIds,
-                Config.enable_single_replica_load);
-        olapTableSink.init(loadId, taskInfo.getTxnId(), db.getId(), timeout,
-                taskInfo.getSendBatchParallelism(), taskInfo.isLoadToSingleTablet());
-        olapTableSink.setPartialUpdateInputColumns(isPartialUpdate, partialUpdateInputColumns);
-        olapTableSink.complete();
+        OlapTableSink olapTableSink;
+        if (taskInfo instanceof StreamLoadTask && ((StreamLoadTask) taskInfo).getGroupCommit() != null) {
+            olapTableSink = new GroupCommitBlockSink(destTable, tupleDesc, partitionIds,
+                    enableSingleReplicaLoad, ((StreamLoadTask) taskInfo).getGroupCommit(),
+                    taskInfo.getMaxFilterRatio());
+        } else {
+            olapTableSink = new OlapTableSink(destTable, tupleDesc, partitionIds, enableSingleReplicaLoad);
+        }
+        int txnTimeout = timeout == 0 ? ConnectContext.get().getExecTimeout() : timeout;
+        olapTableSink.init(loadId, taskInfo.getTxnId(), db.getId(), timeout, taskInfo.getSendBatchParallelism(),
+                taskInfo.isLoadToSingleTablet(), taskInfo.isStrictMode(), txnTimeout);
+        olapTableSink.setPartialUpdateInfo(uniquekeyUpdateMode, partialUpdateInputColumns);
+        olapTableSink.complete(analyzer);
 
         // for stream load, we only need one fragment, ScanNode -> DataSink.
         // OlapTableSink can dispatch data to corresponding node.
@@ -259,19 +336,20 @@ public class StreamLoadPlanner {
 
         fragment.finalize(null);
 
-        TExecPlanFragmentParams params = new TExecPlanFragmentParams();
+        TPipelineFragmentParams params = new TPipelineFragmentParams();
         params.setProtocolVersion(PaloInternalServiceVersion.V1);
         params.setFragment(fragment.toThrift());
 
         params.setDescTbl(analyzer.getDescTbl().toThrift());
         params.setCoord(new TNetworkAddress(FrontendOptions.getLocalHostAddress(), Config.rpc_port));
+        params.setCurrentConnectFe(new TNetworkAddress(FrontendOptions.getLocalHostAddress(), Config.rpc_port));
 
-        TPlanFragmentExecParams execParams = new TPlanFragmentExecParams();
+        TPipelineInstanceParams execParams = new TPipelineInstanceParams();
         // user load id (streamLoadTask.id) as query id
-        execParams.setQueryId(loadId);
-        execParams.setFragmentInstanceId(new TUniqueId(loadId.hi, loadId.lo + 1));
-        execParams.per_exch_num_senders = Maps.newHashMap();
-        execParams.destinations = Lists.newArrayList();
+        params.setQueryId(loadId);
+        execParams.setFragmentInstanceId(new TUniqueId(loadId.hi, loadId.lo + fragmentInstanceIdIndex));
+        params.per_exch_num_senders = Maps.newHashMap();
+        params.destinations = Lists.newArrayList();
         Map<Integer, List<TScanRangeParams>> perNodeScanRange = Maps.newHashMap();
         List<TScanRangeParams> scanRangeParams = Lists.newArrayList();
         for (TScanRangeLocations locations : scanNode.getScanRangeLocations(0)) {
@@ -279,32 +357,39 @@ public class StreamLoadPlanner {
         }
         // For stream load, only one sender
         execParams.setSenderId(0);
-        execParams.setNumSenders(1);
+        params.setNumSenders(1);
         perNodeScanRange.put(scanNode.getId().asInt(), scanRangeParams);
         execParams.setPerNodeScanRanges(perNodeScanRange);
-        params.setParams(execParams);
+        params.addToLocalParams(execParams);
+        params.setLoadStreamPerNode(taskInfo.getStreamPerNode());
+        params.setTotalLoadStreams(taskInfo.getStreamPerNode());
+        params.setNumLocalSink(1);
         TQueryOptions queryOptions = new TQueryOptions();
         queryOptions.setQueryType(TQueryType.LOAD);
         queryOptions.setQueryTimeout(timeout);
         queryOptions.setExecutionTimeout(timeout);
+        if (timeout < 1) {
+            LOG.info("try set timeout less than 1", new RuntimeException(""));
+        }
         queryOptions.setMemLimit(taskInfo.getMemLimit());
         // for stream load, we use exec_mem_limit to limit the memory usage of load channel.
         queryOptions.setLoadMemLimit(taskInfo.getMemLimit());
-        //load
-        queryOptions.setEnablePipelineEngine(Config.enable_pipeline_load);
+        // load
         queryOptions.setBeExecVersion(Config.be_exec_version);
         queryOptions.setIsReportSuccess(taskInfo.getEnableProfile());
-
+        queryOptions.setEnableProfile(taskInfo.getEnableProfile());
+        queryOptions.setEnableMemtableOnSinkNode(enableMemtableOnSinkNode);
         params.setQueryOptions(queryOptions);
         TQueryGlobals queryGlobals = new TQueryGlobals();
-        queryGlobals.setNowString(TimeUtils.DATETIME_FORMAT.format(LocalDateTime.now()));
+        queryGlobals.setNowString(TimeUtils.getDatetimeFormatWithTimeZone().format(LocalDateTime.now()));
         queryGlobals.setTimestampMs(System.currentTimeMillis());
         queryGlobals.setTimeZone(taskInfo.getTimezone());
         queryGlobals.setLoadZeroTolerance(taskInfo.getMaxFilterRatio() <= 0.0);
         queryGlobals.setNanoSeconds(LocalDateTime.now().getNano());
 
         params.setQueryGlobals(queryGlobals);
-
+        params.setTableName(destTable.getName());
+        params.setIsMowTable(destTable.getEnableUniqueKeyMergeOnWrite());
         // LOG.debug("stream load txn id: {}, plan: {}", streamLoadTask.getTxnId(), params);
         return params;
     }
@@ -335,7 +420,7 @@ public class StreamLoadPlanner {
                 if (null == slotDesc) {
                     continue;
                 }
-                ColumnRange columnRange = ScanNode.createColumnRange(slotDesc, conjuncts);
+                ColumnRange columnRange = ScanNode.createColumnRange(slotDesc, conjuncts, partitionInfo);
                 if (columnRange != null) {
                     columnNameToRange.put(column.getName(), columnRange);
                 }
@@ -357,5 +442,8 @@ public class StreamLoadPlanner {
         }
         return null;
     }
-}
 
+    public DescriptorTable getDescTable() {
+        return descTable;
+    }
+}

@@ -20,49 +20,51 @@ package org.apache.doris.planner;
 import org.apache.doris.analysis.Analyzer;
 import org.apache.doris.analysis.TupleDescriptor;
 import org.apache.doris.common.UserException;
+import org.apache.doris.datasource.ExternalScanNode;
 import org.apache.doris.statistics.StatisticalType;
 import org.apache.doris.statistics.StatsRecursiveDerive;
 import org.apache.doris.thrift.TExplainLevel;
 import org.apache.doris.thrift.TPlanNode;
 import org.apache.doris.thrift.TPlanNodeType;
-import org.apache.doris.thrift.TScanRangeLocations;
 import org.apache.doris.thrift.TTestExternalScanNode;
 
 import com.google.common.base.MoreObjects;
+import com.google.common.collect.Lists;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-import java.util.List;
+import java.util.stream.Collectors;
 
-public class TestExternalTableScanNode extends ScanNode {
+public class TestExternalTableScanNode extends ExternalScanNode {
     private static final Logger LOG = LogManager.getLogger(TestExternalTableScanNode.class);
     private String tableName;
 
     public TestExternalTableScanNode(PlanNodeId id, TupleDescriptor desc) {
-        super(id, desc, "TestExternalTableScanNode", StatisticalType.TEST_EXTERNAL_TABLE);
+        super(id, desc, "TestExternalTableScanNode", StatisticalType.TEST_EXTERNAL_TABLE, true);
         tableName = desc.getTable().getName();
-    }
-
-    @Override
-    public void init(Analyzer analyzer) throws UserException {
-        super.init(analyzer);
-        computeStats(analyzer);
-    }
-
-    @Override
-    public List<TScanRangeLocations> getScanRangeLocations(long maxScanRangeLength) {
-        return null;
     }
 
     @Override
     public String getNodeExplainString(String prefix, TExplainLevel detailLevel) {
         StringBuilder output = new StringBuilder();
         output.append(prefix).append("TABLE: ").append(tableName).append("\n");
+        if (useTopnFilter()) {
+            String topnFilterSources = String.join(",",
+                    topnFilterSortNodes.stream()
+                            .map(node -> node.getId().asInt() + "").collect(Collectors.toList()));
+            output.append(prefix).append("TOPN OPT:").append(topnFilterSources).append("\n");
+        }
         return output.toString();
     }
 
     @Override
     public void finalize(Analyzer analyzer) throws UserException {
+        createScanRangeLocations();
+    }
+
+    @Override
+    protected void createScanRangeLocations() throws UserException {
+        scanRangeLocations = Lists.newArrayList(createSingleScanRangeLocations(backendPolicy));
     }
 
     @Override
@@ -80,16 +82,12 @@ public class TestExternalTableScanNode extends ScanNode {
         msg.test_external_scan_node = new TTestExternalScanNode();
         msg.test_external_scan_node.setTupleId(desc.getId().asInt());
         msg.test_external_scan_node.setTableName(tableName);
+        super.toThrift(msg);
     }
 
     @Override
     protected String debugString() {
         MoreObjects.ToStringHelper helper = MoreObjects.toStringHelper(this);
         return helper.addValue(super.debugString()).toString();
-    }
-
-    @Override
-    public int getNumInstances() {
-        return 1;
     }
 }

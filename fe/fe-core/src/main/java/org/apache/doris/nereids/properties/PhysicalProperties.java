@@ -34,9 +34,23 @@ public class PhysicalProperties {
 
     public static PhysicalProperties ANY = new PhysicalProperties();
 
+    public static PhysicalProperties STORAGE_ANY = new PhysicalProperties(DistributionSpecStorageAny.INSTANCE);
+
+    public static PhysicalProperties EXECUTION_ANY = new PhysicalProperties(DistributionSpecExecutionAny.INSTANCE);
+
     public static PhysicalProperties REPLICATED = new PhysicalProperties(DistributionSpecReplicated.INSTANCE);
 
     public static PhysicalProperties GATHER = new PhysicalProperties(DistributionSpecGather.INSTANCE);
+
+    public static PhysicalProperties STORAGE_GATHER = new PhysicalProperties(DistributionSpecStorageGather.INSTANCE);
+
+    public static PhysicalProperties MUST_SHUFFLE = new PhysicalProperties(DistributionSpecMustShuffle.INSTANCE);
+
+    public static PhysicalProperties TABLET_ID_SHUFFLE
+            = new PhysicalProperties(DistributionSpecTabletIdShuffle.INSTANCE);
+
+    public static PhysicalProperties SINK_RANDOM_PARTITIONED
+            = new PhysicalProperties(DistributionSpecTableSinkRandomPartitioned.INSTANCE);
 
     private final OrderSpec orderSpec;
 
@@ -64,21 +78,37 @@ public class PhysicalProperties {
         this.orderSpec = orderSpec;
     }
 
+    /**
+     * create hash info from orderedShuffledColumns, ignore non slot reference expression.
+     */
     public static PhysicalProperties createHash(
             Collection<? extends Expression> orderedShuffledColumns, ShuffleType shuffleType) {
         List<ExprId> partitionedSlots = orderedShuffledColumns.stream()
+                .filter(SlotReference.class::isInstance)
                 .map(SlotReference.class::cast)
                 .map(SlotReference::getExprId)
                 .collect(Collectors.toList());
-        return createHash(partitionedSlots, shuffleType);
+        return partitionedSlots.isEmpty() ? PhysicalProperties.GATHER : createHash(partitionedSlots, shuffleType);
     }
 
     public static PhysicalProperties createHash(List<ExprId> orderedShuffledColumns, ShuffleType shuffleType) {
-        return new PhysicalProperties(new DistributionSpecHash(orderedShuffledColumns, shuffleType));
+        return orderedShuffledColumns.isEmpty()
+                ? PhysicalProperties.GATHER
+                : new PhysicalProperties(new DistributionSpecHash(orderedShuffledColumns, shuffleType));
     }
 
     public static PhysicalProperties createHash(DistributionSpecHash distributionSpecHash) {
         return new PhysicalProperties(distributionSpecHash);
+    }
+
+    /** createAnyFromHash */
+    public static PhysicalProperties createAnyFromHash(DistributionSpecHash... childSpecs) {
+        for (DistributionSpecHash childSpec : childSpecs) {
+            if (childSpec.getShuffleType() == ShuffleType.NATURAL) {
+                return PhysicalProperties.STORAGE_ANY;
+            }
+        }
+        return PhysicalProperties.ANY;
     }
 
     public PhysicalProperties withOrderSpec(OrderSpec orderSpec) {
@@ -96,6 +126,10 @@ public class PhysicalProperties {
 
     public DistributionSpec getDistributionSpec() {
         return distributionSpec;
+    }
+
+    public boolean isDistributionOnlyProperties() {
+        return orderSpec.getOrderKeys().isEmpty();
     }
 
     @Override

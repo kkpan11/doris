@@ -19,14 +19,14 @@ package org.apache.doris.common.util;
 
 import org.apache.doris.common.Config;
 import org.apache.doris.common.ConfigBase.ConfField;
-import org.apache.doris.common.ExperimentalUtil;
-import org.apache.doris.common.ExperimentalUtil.ExperimentalType;
+import org.apache.doris.common.LogUtils;
 import org.apache.doris.qe.GlobalVariable;
 import org.apache.doris.qe.SessionVariable;
 import org.apache.doris.qe.VariableMgr;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.Maps;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.io.output.FileWriterWithEncoding;
 import org.jetbrains.annotations.NotNull;
 
@@ -42,8 +42,8 @@ import java.util.Map;
  * This class is used to generate doc for FE config and session variable.
  * The doc is generated from Config.java and SessionVariable.java
  */
+@Slf4j
 public class DocGenerator {
-
     private static final String PLACEHOLDER = "<--DOC_PLACEHOLDER-->";
     private static final String[] TYPE = new String[] {"类型：", "Type: "};
     private static final String[] DEFAULT_VALYUE = new String[] {"默认值：", "Default: "};
@@ -53,6 +53,7 @@ public class DocGenerator {
             "Master only: "};
     private static final String[] VAR_READ_ONLY = new String[] {"只读变量：", "Read Only: "};
     private static final String[] VAR_GLOBAL_ONLY = new String[] {"仅全局变量：", "Global only: "};
+
 
     private String configDocTemplatePath;
     private String configDocTemplatePathCN;
@@ -148,7 +149,7 @@ public class DocGenerator {
                     sortedDoc.put(field.getName(), res);
                 }
             } catch (Exception e) {
-                System.out.println("Failed to generate doc for field: " + field.getName());
+                LogUtils.stderr("Failed to generate doc for field: " + field.getName());
                 throw e;
             }
         }
@@ -162,10 +163,7 @@ public class DocGenerator {
         if (confField == null) {
             return null;
         }
-        String configName = field.getName();
-        if (confField.expType() == ExperimentalType.EXPERIMENTAL) {
-            configName = ExperimentalUtil.EXPERIMENTAL_PREFIX + configName;
-        }
+        String configName = confField.varType().getPrefix() + field.getName();
         sb.append("### `").append(configName).append("`\n\n");
         sb.append(confField.description()[lang.idx]).append("\n\n");
         sb.append(TYPE[lang.idx]).append("`").append(field.getType().getSimpleName()).append("`\n\n");
@@ -207,7 +205,7 @@ public class DocGenerator {
                     sortedDoc.put(field.getAnnotation(VariableMgr.VarAttr.class).name(), res);
                 }
             } catch (Exception e) {
-                System.out.println("Failed to generate doc for " + field.getName());
+                LogUtils.stderr("Failed to generate doc for " + field.getName());
                 throw e;
             }
         }
@@ -220,7 +218,7 @@ public class DocGenerator {
                     sortedDoc.put(field.getAnnotation(VariableMgr.VarAttr.class).name(), res);
                 }
             } catch (Exception e) {
-                System.out.println("Failed to generate doc for field: " + field.getName());
+                LogUtils.stderr("Failed to generate doc for field: " + field.getName());
                 throw e;
             }
         }
@@ -243,10 +241,7 @@ public class DocGenerator {
             return null;
         }
         StringBuilder sb = new StringBuilder();
-        String varName = varAttr.name();
-        if (varAttr.expType() == ExperimentalType.EXPERIMENTAL) {
-            varName = ExperimentalUtil.EXPERIMENTAL_PREFIX + varName;
-        }
+        String varName = varAttr.varType().getPrefix() + varAttr.name();
         sb.append("### `").append(varName).append("`\n\n");
         sb.append(varAttr.description()[lang.idx]).append("\n\n");
         sb.append(TYPE[lang.idx]).append("`").append(field.getType().getSimpleName()).append("`\n\n");
@@ -261,8 +256,10 @@ public class DocGenerator {
             }
             sb.append("\n\n");
         }
-        sb.append(VAR_READ_ONLY[lang.idx]).append("`").append(varAttr.flag() == VariableMgr.READ_ONLY).append("`\n\n");
-        sb.append(VAR_GLOBAL_ONLY[lang.idx]).append("`").append(varAttr.flag() == VariableMgr.GLOBAL).append("`\n\n");
+        sb.append(VAR_READ_ONLY[lang.idx]).append("`")
+                .append((varAttr.flag() & VariableMgr.READ_ONLY) != 0).append("`\n\n");
+        sb.append(VAR_GLOBAL_ONLY[lang.idx]).append("`")
+                .append((varAttr.flag() & VariableMgr.GLOBAL) != 0).append("`\n\n");
         return sb.toString();
     }
 
@@ -294,9 +291,9 @@ public class DocGenerator {
                 sessionVariableDocOutputPath, sessionVariableDocOutputPathCN);
         try {
             docGenerator.generate();
-            System.out.println("Done!");
+            LogUtils.stdout("Done!");
         } catch (Exception e) {
-            e.printStackTrace();
+            log.info("failed to generate doc", e);
             System.exit(-1);
         }
     }

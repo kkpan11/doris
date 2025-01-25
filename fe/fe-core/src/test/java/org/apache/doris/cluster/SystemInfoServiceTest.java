@@ -233,7 +233,7 @@ public class SystemInfoServiceTest {
 
         Assert.assertTrue(Env.getCurrentSystemInfo().getBackendReportVersion(backendId) == 0L);
 
-        Env.getCurrentSystemInfo().updateBackendReportVersion(backendId, 2L, 20000L, 30000L);
+        Env.getCurrentSystemInfo().updateBackendReportVersion(backendId, 2L, 20000L, 30000L, true);
         Assert.assertTrue(Env.getCurrentSystemInfo().getBackendReportVersion(backendId) == 2L);
     }
 
@@ -249,6 +249,33 @@ public class SystemInfoServiceTest {
         }
 
         DropBackendClause dropStmt = new DropBackendClause(Lists.newArrayList("192.168.0.1:1234"));
+        dropStmt.analyze(analyzer);
+        try {
+            Env.getCurrentSystemInfo().dropBackends(dropStmt.getHostInfos());
+        } catch (DdlException e) {
+            e.printStackTrace();
+            Assert.fail();
+        }
+
+        try {
+            Env.getCurrentSystemInfo().dropBackends(dropStmt.getHostInfos());
+        } catch (DdlException e) {
+            Assert.assertTrue(e.getMessage().contains("does not exist"));
+        }
+    }
+
+    @Test
+    public void removeBackendTestByBackendId() throws UserException {
+        clearAllBackend();
+        AddBackendClause stmt = new AddBackendClause(Lists.newArrayList("192.168.0.1:1234"));
+        stmt.analyze(analyzer);
+        try {
+            Env.getCurrentSystemInfo().addBackends(stmt.getHostInfos(), true);
+        } catch (DdlException e) {
+            e.printStackTrace();
+        }
+
+        DropBackendClause dropStmt = new DropBackendClause(Lists.newArrayList(String.valueOf(backendId)));
         dropStmt.analyze(analyzer);
         try {
             Env.getCurrentSystemInfo().dropBackends(dropStmt.getHostInfos());
@@ -284,7 +311,7 @@ public class SystemInfoServiceTest {
         DataInputStream dis = new DataInputStream(new BufferedInputStream(new FileInputStream(file)));
         long checksum2 = systemInfoService.loadBackends(dis, 0);
         Assert.assertEquals(checksum1, checksum2);
-        Assert.assertEquals(1, systemInfoService.getIdToBackend().size());
+        Assert.assertEquals(1, systemInfoService.getAllBackendsByAllCluster().size());
         Backend back2 = systemInfoService.getBackend(1);
         Assert.assertEquals(back1, back2);
         dis.close();

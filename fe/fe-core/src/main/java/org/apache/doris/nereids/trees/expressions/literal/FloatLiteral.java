@@ -25,7 +25,7 @@ import org.apache.doris.nereids.types.FloatType;
 /**
  * float type literal
  */
-public class FloatLiteral extends Literal {
+public class FloatLiteral extends FractionalLiteral {
 
     private final float value;
 
@@ -46,6 +46,6 @@ public class FloatLiteral extends Literal {
 
     @Override
     public LiteralExpr toLegacyLiteral() {
-        return new org.apache.doris.analysis.FloatLiteral((double) value, Type.FLOAT);
+        return new org.apache.doris.analysis.FloatLiteral(getDouble(), Type.FLOAT);
     }
 }

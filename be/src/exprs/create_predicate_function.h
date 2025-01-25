@@ -17,12 +17,16 @@
 
 #pragma once
 
+#include "common/exception.h"
+#include "common/status.h"
 #include "exprs/hybrid_set.h"
 #include "exprs/minmax_predicate.h"
+#include "function_filter.h"
 #include "olap/bitmap_filter_predicate.h"
 #include "olap/bloom_filter_predicate.h"
 #include "olap/column_predicate.h"
 #include "olap/in_list_predicate.h"
+#include "olap/like_column_predicate.h"
 #include "runtime/define_primitive_type.h"
 
 namespace doris {
@@ -32,10 +36,9 @@ public:
     using BasePtr = MinMaxFuncBase*;
     template <PrimitiveType type, size_t N>
     static BasePtr get_function() {
-        return new MinMaxNumFunc<std::conditional_t<
-                type == TYPE_DECIMAL32 || type == TYPE_DECIMAL64 || type == TYPE_DECIMAL128I,
-                vectorized::Decimal<typename PrimitiveTypeTraits<type>::CppType>,
-                typename PrimitiveTypeTraits<type>::CppType>>();
+        using CppType = typename PrimitiveTypeTraits<type>::CppType;
+        return new MinMaxNumFunc<
+                std::conditional_t<std::is_same_v<CppType, StringRef>, std::string, CppType>>();
     }
 };
 
@@ -49,13 +52,12 @@ public:
             using Set = std::conditional_t<
                     std::is_same_v<CppType, StringRef>, StringSet<>,
                     HybridSet<type,
-                              FixedContainer<typename VecPrimitiveTypeTraits<type>::CppType, N>>>;
+                              FixedContainer<typename PrimitiveTypeTraits<type>::CppType, N>>>;
             return new Set();
         } else {
             using Set = std::conditional_t<
                     std::is_same_v<CppType, StringRef>, StringSet<>,
-                    HybridSet<type,
-                              DynamicContainer<typename VecPrimitiveTypeTraits<type>::CppType>>>;
+                    HybridSet<type, DynamicContainer<typename PrimitiveTypeTraits<type>::CppType>>>;
             return new Set();
         }
     }
@@ -105,7 +107,10 @@ public:
     M(TYPE_STRING)            \
     M(TYPE_DECIMAL32)         \
     M(TYPE_DECIMAL64)         \
-    M(TYPE_DECIMAL128I)
+    M(TYPE_DECIMAL128I)       \
+    M(TYPE_DECIMAL256)        \
+    M(TYPE_IPV4)              \
+    M(TYPE_IPV6)
 
 template <class Traits, size_t N = 0>
 typename Traits::BasePtr create_predicate_function(PrimitiveType type) {
@@ -125,7 +130,8 @@ typename Traits::BasePtr create_predicate_function(PrimitiveType type) {
         APPLY_FOR_PRIMTYPE(M)
 #undef M
     default:
-        DCHECK(false) << "Invalid type: " << type_to_string(type);
+        throw doris::Exception(ErrorCode::NOT_IMPLEMENTED_ERROR,
+                               "predicate with type " + type_to_string(type));
     }
 
     return nullptr;
@@ -161,7 +167,9 @@ inline auto create_set(PrimitiveType type) {
 }
 
 inline auto create_set(PrimitiveType type, size_t size) {
-    if (size == 1) {
+    if (size == 0) {
+        return create_set<0>(type);
+    } else if (size == 1) {
         return create_set<1>(type);
     } else if (size == 2) {
         return create_set<2>(type);
@@ -224,54 +232,64 @@ inline auto create_bitmap_filter(PrimitiveType type) {
 template <PrimitiveType PT>
 ColumnPredicate* create_olap_column_predicate(uint32_t column_id,
                                               const std::shared_ptr<BloomFilterFuncBase>& filter,
-                                              int be_exec_version, const TabletColumn*) {
+                                              const TabletColumn*) {
     std::shared_ptr<BloomFilterFuncBase> filter_olap;
     filter_olap.reset(create_bloom_filter(PT));
     filter_olap->light_copy(filter.get());
-    return new BloomFilterColumnPredicate<PT>(column_id, filter, be_exec_version);
+    // create a new filter to match the input filter and PT. For example, filter may be varchar, but PT is char
+    return new BloomFilterColumnPredicate<PT>(column_id, filter_olap);
 }
 
 template <PrimitiveType PT>
 ColumnPredicate* create_olap_column_predicate(uint32_t column_id,
                                               const std::shared_ptr<BitmapFilterFuncBase>& filter,
-                                              int be_exec_version, const TabletColumn*) {
+                                              const TabletColumn*) {
     if constexpr (PT == TYPE_TINYINT || PT == TYPE_SMALLINT || PT == TYPE_INT ||
                   PT == TYPE_BIGINT) {
-        std::shared_ptr<BitmapFilterFuncBase> filter_olap;
-        filter_olap.reset(create_bitmap_filter(PT));
-        filter_olap->light_copy(filter.get());
-        return new BitmapFilterColumnPredicate<PT>(column_id, filter, be_exec_version);
+        return new BitmapFilterColumnPredicate<PT>(column_id, filter);
     } else {
-        return nullptr;
+        throw Exception(ErrorCode::INTERNAL_ERROR, "bitmap filter do not support type {}", PT);
     }
 }
 
 template <PrimitiveType PT>
 ColumnPredicate* create_olap_column_predicate(uint32_t column_id,
-                                              const std::shared_ptr<HybridSetBase>& filter, int,
+                                              const std::shared_ptr<HybridSetBase>& filter,
                                               const TabletColumn* column = nullptr) {
     return create_in_list_predicate<PT, PredicateType::IN_LIST>(column_id, filter,
                                                                 column->length());
 }
 
+template <PrimitiveType PT>
+ColumnPredicate* create_olap_column_predicate(uint32_t column_id,
+                                              const std::shared_ptr<FunctionFilter>& filter,
+                                              const TabletColumn* column = nullptr) {
+    // currently only support like predicate
+    if constexpr (PT == TYPE_CHAR) {
+        return new LikeColumnPredicate<TYPE_CHAR>(filter->_opposite, column_id, filter->_fn_ctx,
+                                                  filter->_string_param);
+    } else if constexpr (PT == TYPE_VARCHAR || PT == TYPE_STRING) {
+        return new LikeColumnPredicate<TYPE_STRING>(filter->_opposite, column_id, filter->_fn_ctx,
+                                                    filter->_string_param);
+    }
+    throw Exception(ErrorCode::INTERNAL_ERROR, "function filter do not support type {}", PT);
+}
+
 template <typename T>
 ColumnPredicate* create_column_predicate(uint32_t column_id, const std::shared_ptr<T>& filter,
-                                         FieldType type, int be_exec_version,
-                                         const TabletColumn* column = nullptr) {
+                                         FieldType type, const TabletColumn* column = nullptr) {
     switch (type) {
-#define M(NAME)                                                                                \
-    case FieldType::OLAP_FIELD_##NAME: {                                                       \
-        return create_olap_column_predicate<NAME>(column_id, filter, be_exec_version, column); \
+#define M(NAME)                                                               \
+    case FieldType::OLAP_FIELD_##NAME: {                                      \
+        return create_olap_column_predicate<NAME>(column_id, filter, column); \
     }
         APPLY_FOR_PRIMTYPE(M)
 #undef M
     case FieldType::OLAP_FIELD_TYPE_DECIMAL: {
-        return create_olap_column_predicate<TYPE_DECIMALV2>(column_id, filter, be_exec_version,
-                                                            column);
+        return create_olap_column_predicate<TYPE_DECIMALV2>(column_id, filter, column);
     }
     case FieldType::OLAP_FIELD_TYPE_BOOL: {
-        return create_olap_column_predicate<TYPE_BOOLEAN>(column_id, filter, be_exec_version,
-                                                          column);
+        return create_olap_column_predicate<TYPE_BOOLEAN>(column_id, filter, column);
     }
     default:
         return nullptr;

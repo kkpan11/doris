@@ -16,6 +16,8 @@
 // under the License.
 
 import org.codehaus.groovy.runtime.IOGroovyMethods
+import java.util.concurrent.TimeUnit
+import org.awaitility.Awaitility
 
 suite ("test_uniq_rollup_schema_change") {
     def tableName = "schema_change_uniq_rollup_regression_test"
@@ -28,18 +30,14 @@ suite ("test_uniq_rollup_schema_change") {
          return jobStateResult[0][9]
     }
     def waitForMVJob =  (tbName, timeout) -> {
-        while (timeout--){
+        Awaitility.await().atMost(timeout, TimeUnit.SECONDS).with().pollDelay(100, TimeUnit.MILLISECONDS).await().until(() -> {
             String result = getMVJobState(tbName)
             if (result == "FINISHED") {
-                sleep(3000)
-                break
-            } else {
-                sleep(100)
-                if (timeout < 1){
-                    assertEquals(1,2)
-                }
+                return true;
             }
-        }
+            return false;
+        });
+        // when timeout awaitlity will raise a exception.
     }
 
     try {
@@ -48,30 +46,6 @@ suite ("test_uniq_rollup_schema_change") {
         def backendId_to_backendHttpPort = [:]
         getBackendIpHttpPort(backendId_to_backendIP, backendId_to_backendHttpPort);
 
-        backend_id = backendId_to_backendIP.keySet()[0]
-        StringBuilder showConfigCommand = new StringBuilder();
-        showConfigCommand.append("curl -X GET http://")
-        showConfigCommand.append(backendId_to_backendIP.get(backend_id))
-        showConfigCommand.append(":")
-        showConfigCommand.append(backendId_to_backendHttpPort.get(backend_id))
-        showConfigCommand.append("/api/show_config")
-        logger.info(showConfigCommand.toString())
-        def process = showConfigCommand.toString().execute()
-        int code = process.waitFor()
-        String err = IOGroovyMethods.getText(new BufferedReader(new InputStreamReader(process.getErrorStream())));
-        String out = process.getText()
-        logger.info("Show config: code=" + code + ", out=" + out + ", err=" + err)
-        assertEquals(code, 0)
-        def configList = parseJson(out.trim())
-        assert configList instanceof List
-
-        boolean disableAutoCompaction = true
-        for (Object ele in (List) configList) {
-            assert ele instanceof List<String>
-            if (((List<String>) ele)[0] == "disable_auto_compaction") {
-                disableAutoCompaction = Boolean.parseBoolean(((List<String>) ele)[2])
-            }
-        }
     sql """ DROP TABLE IF EXISTS ${tableName} """
 
     sql """
@@ -88,7 +62,7 @@ suite ("test_uniq_rollup_schema_change") {
                 `max_dwell_time` INT DEFAULT "0" COMMENT "用户最大停留时间",
                 `min_dwell_time` INT DEFAULT "99999" COMMENT "用户最小停留时间")
             UNIQUE KEY(`user_id`, `date`, `city`, `age`, `sex`) DISTRIBUTED BY HASH(`user_id`)
-            BUCKETS 1
+            BUCKETS 8
             PROPERTIES ( "replication_num" = "1", "light_schema_change" = "false", 'enable_unique_key_merge_on_write' = 'false');
         """
 
@@ -103,14 +77,16 @@ suite ("test_uniq_rollup_schema_change") {
     //add rollup
     def rollupName = "rollup_cost"
     sql "ALTER TABLE ${tableName} ADD ROLLUP ${rollupName}(`user_id`,`date`,`city`,`sex`, `age`,`cost`);"
-    waitForMVJob(tableName, 3000)
+    waitForMVJob(tableName, 300)
 
     sql """ INSERT INTO ${tableName} VALUES
              (2, '2017-10-01', 'Beijing', 10, 1, '2020-01-02', '2020-01-02', '2020-01-02', 1, 31, 21)
         """
 
-        // alter and test light schema change
-    sql """ALTER TABLE ${tableName} SET ("light_schema_change" = "true");"""
+    // alter and test light schema change
+    if (!isCloudMode()) {
+        sql """ALTER TABLE ${tableName} SET ("light_schema_change" = "true");"""
+    }
 
     sql """ INSERT INTO ${tableName} VALUES
              (2, '2017-10-01', 'Beijing', 10, 1, '2020-01-03', '2020-01-03', '2020-01-03', 1, 32, 20)
@@ -121,7 +97,7 @@ suite ("test_uniq_rollup_schema_change") {
 
     // add column
     sql """
-        ALTER table ${tableName} ADD COLUMN new_column INT default "1" 
+        ALTER table ${tableName} ADD COLUMN new_column INT default "1"
         """
 
     sql """ SELECT * FROM ${tableName} WHERE user_id=2 """
@@ -143,24 +119,26 @@ suite ("test_uniq_rollup_schema_change") {
 
     qt_sc """ select count(*) from ${tableName} """
 
+    test {
+        sql "ALTER TABLE ${tableName} DROP COLUMN cost"
+        exception "Can not drop column contained by mv, mv=rollup_cost"
+    }
+
+    sql""" drop materialized view rollup_cost on ${tableName}; """
+
     // drop column
     sql """
           ALTER TABLE ${tableName} DROP COLUMN cost
           """
 
-    max_try_time = 3000
-    while (max_try_time--){
+    def max_try_time = 300
+    Awaitility.await().atMost(max_try_time, TimeUnit.SECONDS).with().pollDelay(100, TimeUnit.MILLISECONDS).await().until(() -> {
         String result = getJobState(tableName)
         if (result == "FINISHED") {
-            sleep(3000)
-            break
-        } else {
-            sleep(100)
-            if (max_try_time < 1){
-                assertEquals(1,2)
-            }
+            return true;
         }
-    }
+        return false;
+    });
 
     qt_sc """ select * from ${tableName} where user_id = 3 """
 
@@ -190,56 +168,8 @@ suite ("test_uniq_rollup_schema_change") {
         """
 
     // compaction
-    String[][] tablets = sql """ show tablets from ${tableName}; """
-    for (String[] tablet in tablets) {
-            String tablet_id = tablet[0]
-            backend_id = tablet[2]
-            logger.info("run compaction:" + tablet_id)
-            StringBuilder sb = new StringBuilder();
-            sb.append("curl -X POST http://")
-            sb.append(backendId_to_backendIP.get(backend_id))
-            sb.append(":")
-            sb.append(backendId_to_backendHttpPort.get(backend_id))
-            sb.append("/api/compaction/run?tablet_id=")
-            sb.append(tablet_id)
-            sb.append("&compact_type=cumulative")
+    trigger_and_wait_compaction(tableName, "cumulative")
 
-            String command = sb.toString()
-            process = command.execute()
-            code = process.waitFor()
-            err = IOGroovyMethods.getText(new BufferedReader(new InputStreamReader(process.getErrorStream())));
-            out = process.getText()
-            logger.info("Run compaction: code=" + code + ", out=" + out + ", err=" + err)
-            //assertEquals(code, 0)
-    }
-
-    // wait for all compactions done
-    for (String[] tablet in tablets) {
-            boolean running = true
-            do {
-                Thread.sleep(100)
-                String tablet_id = tablet[0]
-                backend_id = tablet[2]
-                StringBuilder sb = new StringBuilder();
-                sb.append("curl -X GET http://")
-                sb.append(backendId_to_backendIP.get(backend_id))
-                sb.append(":")
-                sb.append(backendId_to_backendHttpPort.get(backend_id))
-                sb.append("/api/compaction/run_status?tablet_id=")
-                sb.append(tablet_id)
-
-                String command = sb.toString()
-                process = command.execute()
-                code = process.waitFor()
-                err = IOGroovyMethods.getText(new BufferedReader(new InputStreamReader(process.getErrorStream())));
-                out = process.getText()
-                logger.info("Get compaction status: code=" + code + ", out=" + out + ", err=" + err)
-                assertEquals(code, 0)
-                def compactionStatus = parseJson(out.trim())
-                assertEquals("success", compactionStatus.status.toLowerCase())
-                running = compactionStatus.run_status
-            } while (running)
-    }
     qt_sc """ select count(*) from ${tableName} """
 
     qt_sc """  SELECT * FROM ${tableName} WHERE user_id=2 """

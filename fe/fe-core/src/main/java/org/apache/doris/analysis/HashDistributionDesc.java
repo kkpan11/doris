@@ -47,6 +47,7 @@ public class HashDistributionDesc extends DistributionDesc {
         this.distributionColumnNames = distributionColumnNames;
     }
 
+    @Override
     public List<String> getDistributionColumnNames() {
         return distributionColumnNames;
     }
@@ -131,7 +132,9 @@ public class HashDistributionDesc extends DistributionDesc {
                                 + column.getName() + "].");
                     }
 
-                    distributionColumns.add(column);
+                    // distribution info and base columns persist seperately inside OlapTable, so we need deep copy
+                    // to avoid modify table columns also modify columns inside distribution info.
+                    distributionColumns.add(new Column(column));
                     find = true;
                     break;
                 }

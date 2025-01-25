@@ -55,11 +55,11 @@ public class AvgDistinctToSumDivCount extends OneRewriteRuleFactory {
                                         new Sum(true, ((Avg) function).isAlwaysNullable(), ((Avg) function).child()));
                                 Count count = (Count) TypeCoercionUtils.processBoundFunction(
                                         new Count(true, ((Avg) function).child()));
-                                return TypeCoercionUtils.processDivide(new Divide(sum, count), sum, count);
+                                return TypeCoercionUtils.processDivide(new Divide(sum, count));
                             }));
                     if (!avgToSumDivCount.isEmpty()) {
                         List<NamedExpression> newOutput = agg.getOutputExpressions().stream()
-                                .map(expr -> (NamedExpression) ExpressionUtils.replace(expr, avgToSumDivCount))
+                                .map(expr -> ExpressionUtils.replaceNameExpression(expr, avgToSumDivCount))
                                 .collect(ImmutableList.toImmutableList());
                         return new LogicalAggregate<>(agg.getGroupByExpressions(), newOutput, agg.child());
                     } else {
@@ -69,4 +69,3 @@ public class AvgDistinctToSumDivCount extends OneRewriteRuleFactory {
         );
     }
 }
-

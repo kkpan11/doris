@@ -19,13 +19,14 @@ package org.apache.doris.nereids.rules.expression.rules;
 
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.Slot;
+import org.apache.doris.nereids.trees.expressions.literal.BooleanLiteral;
 
 import java.util.List;
 import java.util.Map;
 
 /** the evaluator of the partition which represent one partition */
-public interface OnePartitionEvaluator {
-    long getPartitionId();
+public interface OnePartitionEvaluator<K> {
+    K getPartitionIdent();
 
     /**
      * return a slot to expression mapping to replace the input.
@@ -45,4 +46,13 @@ public interface OnePartitionEvaluator {
      * we will return a context which result expression is BooleanLiteral.FALSE
      */
     Expression evaluate(Expression expression, Map<Slot, PartitionSlotInput> currentInputs);
+
+    default Expression evaluateWithDefaultPartition(Expression expression, Map<Slot, PartitionSlotInput> inputs) {
+        if (isDefaultPartition()) {
+            return BooleanLiteral.TRUE;
+        }
+        return evaluate(expression, inputs);
+    }
+
+    boolean isDefaultPartition();
 }

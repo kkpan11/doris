@@ -25,14 +25,15 @@ import org.apache.doris.analysis.SlotRef;
 import org.apache.doris.analysis.TupleDescriptor;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.MysqlTable;
+import org.apache.doris.catalog.TableIf.TableType;
 import org.apache.doris.common.UserException;
+import org.apache.doris.datasource.ExternalScanNode;
 import org.apache.doris.statistics.StatisticalType;
 import org.apache.doris.statistics.StatsRecursiveDerive;
 import org.apache.doris.thrift.TExplainLevel;
 import org.apache.doris.thrift.TMySQLScanNode;
 import org.apache.doris.thrift.TPlanNode;
 import org.apache.doris.thrift.TPlanNodeType;
-import org.apache.doris.thrift.TScanRangeLocations;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.MoreObjects;
@@ -42,11 +43,12 @@ import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.stream.Collectors;
 
 /**
  * Full scan of an MySQL table.
  */
-public class MysqlScanNode extends ScanNode {
+public class MysqlScanNode extends ExternalScanNode {
     private static final Logger LOG = LogManager.getLogger(MysqlScanNode.class);
 
     private final List<String> columns = new ArrayList<String>();
@@ -57,14 +59,8 @@ public class MysqlScanNode extends ScanNode {
      * Constructs node to scan given data files of table 'tbl'.
      */
     public MysqlScanNode(PlanNodeId id, TupleDescriptor desc, MysqlTable tbl) {
-        super(id, desc, "SCAN MYSQL", StatisticalType.MYSQL_SCAN_NODE);
+        super(id, desc, "SCAN MYSQL", StatisticalType.MYSQL_SCAN_NODE, false);
         tblName = "`" + tbl.getMysqlTableName() + "`";
-    }
-
-    @Override
-    public void init(Analyzer analyzer) throws UserException {
-        super.init(analyzer);
-        computeStats(analyzer);
     }
 
     @Override
@@ -78,6 +74,12 @@ public class MysqlScanNode extends ScanNode {
         // Convert predicates to MySQL columns and filters.
         createMySQLColumns(analyzer);
         createMySQLFilters(analyzer);
+        createScanRangeLocations();
+    }
+
+    @Override
+    protected void createScanRangeLocations() throws UserException {
+        scanRangeLocations = Lists.newArrayList(createSingleScanRangeLocations(backendPolicy));
     }
 
     @Override
@@ -88,6 +90,16 @@ public class MysqlScanNode extends ScanNode {
             return output.toString();
         }
         output.append(prefix).append("Query: ").append(getMysqlQueryStr()).append("\n");
+        if (!conjuncts.isEmpty()) {
+            Expr expr = convertConjunctsToAndCompoundPredicate(conjuncts);
+            output.append(prefix).append("PREDICATES: ").append(expr.toSql()).append("\n");
+        }
+        if (useTopnFilter()) {
+            String topnFilterSources = String.join(",",
+                    topnFilterSortNodes.stream()
+                            .map(node -> node.getId().asInt() + "").collect(Collectors.toList()));
+            output.append(prefix).append("TOPN OPT:").append(topnFilterSources).append("\n");
+        }
         return output.toString();
     }
 
@@ -140,7 +152,7 @@ public class MysqlScanNode extends ScanNode {
         }
         ArrayList<Expr> mysqlConjuncts = Expr.cloneList(conjuncts, sMap);
         for (Expr p : mysqlConjuncts) {
-            filters.add(p.toMySql());
+            filters.add(p.toExternalSql(TableType.MYSQL, null));
         }
     }
 
@@ -148,15 +160,7 @@ public class MysqlScanNode extends ScanNode {
     protected void toThrift(TPlanNode msg) {
         msg.node_type = TPlanNodeType.MYSQL_SCAN_NODE;
         msg.mysql_scan_node = new TMySQLScanNode(desc.getId().asInt(), tblName, columns, filters);
-    }
-
-    /**
-     * We query MySQL Meta to get request's data location
-     * extra result info will pass to backend ScanNode
-     */
-    @Override
-    public List<TScanRangeLocations> getScanRangeLocations(long maxScanRangeLength) {
-        return null;
+        super.toThrift(msg);
     }
 
     @Override
