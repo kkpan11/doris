@@ -45,10 +45,6 @@ public class RemoteFile {
         this(name, null, isFile, !isFile, size, blockSize, modificationTime, null);
     }
 
-    public RemoteFile(Path path, boolean isDirectory, long size, long blockSize, BlockLocation[] blockLocations) {
-        this(path.getName(), path, !isDirectory, isDirectory, size, blockSize, 0, blockLocations);
-    }
-
     public RemoteFile(Path path, boolean isDirectory, long size, long blockSize, long modificationTime,
             BlockLocation[] blockLocations) {
         this(path.getName(), path, !isDirectory, isDirectory, size, blockSize, modificationTime, blockLocations);
@@ -73,6 +69,10 @@ public class RemoteFile {
 
     public Path getPath() {
         return path;
+    }
+
+    public void setPath(Path path) {
+        this.path = path;
     }
 
     public boolean isFile() {

@@ -18,7 +18,7 @@
 import org.codehaus.groovy.runtime.IOGroovyMethods
 
 
-suite("test_compaction_uniq_keys_row_store") {
+suite("test_compaction_uniq_keys_row_store", "p0") {
     def realDb = "regression_test_serving_p0"
     def tableName = realDb + ".compaction_uniq_keys_row_store_regression_test"
     sql "CREATE DATABASE IF NOT EXISTS ${realDb}"
@@ -43,17 +43,8 @@ suite("test_compaction_uniq_keys_row_store") {
         getBackendIpHttpPort(backendId_to_backendIP, backendId_to_backendHttpPort);
 
         backend_id = backendId_to_backendIP.keySet()[0]
-        StringBuilder showConfigCommand = new StringBuilder();
-        showConfigCommand.append("curl -X GET http://")
-        showConfigCommand.append(backendId_to_backendIP.get(backend_id))
-        showConfigCommand.append(":")
-        showConfigCommand.append(backendId_to_backendHttpPort.get(backend_id))
-        showConfigCommand.append("/api/show_config")
-        logger.info(showConfigCommand.toString())
-        def process = showConfigCommand.toString().execute()
-        int code = process.waitFor()
-        String err = IOGroovyMethods.getText(new BufferedReader(new InputStreamReader(process.getErrorStream())));
-        String out = process.getText()
+        def (code, out, err) = show_be_config(backendId_to_backendIP.get(backend_id), backendId_to_backendHttpPort.get(backend_id))
+
         logger.info("Show config: code=" + code + ", out=" + out + ", err=" + err)
         assertEquals(code, 0)
         def configList = parseJson(out.trim())
@@ -84,8 +75,28 @@ suite("test_compaction_uniq_keys_row_store") {
             }
             // set server side prepared statment url
             def url="jdbc:mysql://" + sql_ip + ":" + sql_port + "/" + realDb + "?&useServerPrepStmts=true"
-            def result1 = connect(user=user, password=password, url=url) {
-                def stmt = prepareStatement """ SELECT * FROM ${tableName} t where user_id = ? and date = ? and datev2 = ? and datetimev2_1 = ? and datetimev2_2 = ? and city = ? and age = ? and sex = ?; """
+            def result1 = connect(user, password, url) {
+                def stmt = prepareStatement """ SELECT  /*+ SET_VAR(enable_nereids_planner=true,enable_fallback_to_original_planner=false) */ * FROM ${tableName} t where user_id = ? and date = ? and datev2 = ? and datetimev2_1 = ? and datetimev2_2 = ? and city = ? and age = ? and sex = ?; """
+                setPrepareStmtArgs stmt, 1, '2017-10-01', '2017-10-01', '2017-10-01 11:11:11.21', '2017-10-01 11:11:11.11', 'Beijing', 10, 1
+                qe_point_select stmt
+                setPrepareStmtArgs stmt, 1, '2017-10-01', '2017-10-01', '2017-10-01 11:11:11.22', '2017-10-01 11:11:11.12', 'Beijing', 10, 1
+                qe_point_select stmt
+                setPrepareStmtArgs stmt, 2, '2017-10-01', '2017-10-01', '2017-10-01 11:11:11.23', '2017-10-01 11:11:11.13', 'Beijing', 10, 1
+                qe_point_select stmt
+                setPrepareStmtArgs stmt, 2, '2017-10-01', '2017-10-01', '2017-10-01 11:11:11.24', '2017-10-01 11:11:11.14', 'Beijing', 10, 1
+                qe_point_select stmt
+                setPrepareStmtArgs stmt, 3, '2017-10-01', '2017-10-01', '2017-10-01 11:11:11.25', '2017-10-01 11:11:11.15', 'Beijing', 10, 1
+                qe_point_select stmt
+                setPrepareStmtArgs stmt, 3, '2017-10-01', '2017-10-01', '2017-10-01 11:11:11.26', '2017-10-01 11:11:11.16', 'Beijing', 10, 1
+                qe_point_select stmt
+                setPrepareStmtArgs stmt, 3, '2017-10-01', '2017-10-01', '2017-10-01 11:11:11.27', '2017-10-01 11:11:11.17', 'Beijing', 10, 1
+                qe_point_select stmt
+                setPrepareStmtArgs stmt, 4, '2017-10-01', '2017-10-01', '2017-10-01 11:11:11.28', '2017-10-01 11:11:11.18', 'Beijing', 10, 1
+                qe_point_select stmt
+            }
+
+            def result2 = connect(user, password, url) {
+                def stmt = prepareStatement """ SELECT datetimev2_1,datetime_val1,datetime_val2,max_dwell_time FROM ${tableName} t where user_id = ? and date = ? and datev2 = ? and datetimev2_1 = ? and datetimev2_2 = ? and city = ? and age = ? and sex = ?; """
                 setPrepareStmtArgs stmt, 1, '2017-10-01', '2017-10-01', '2017-10-01 11:11:11.21', '2017-10-01 11:11:11.11', 'Beijing', 10, 1
                 qe_point_select stmt
                 setPrepareStmtArgs stmt, 1, '2017-10-01', '2017-10-01', '2017-10-01 11:11:11.22', '2017-10-01 11:11:11.12', 'Beijing', 10, 1
@@ -128,7 +139,12 @@ suite("test_compaction_uniq_keys_row_store") {
                 `max_dwell_time` INT DEFAULT "0" COMMENT "用户最大停留时间",
                 `min_dwell_time` INT DEFAULT "99999" COMMENT "用户最小停留时间")
             UNIQUE KEY(`user_id`, `date`, `datev2`, `datetimev2_1`, `datetimev2_2`, `city`, `age`, `sex`) DISTRIBUTED BY HASH(`user_id`)
-            PROPERTIES ( "replication_num" = "1", "enable_unique_key_merge_on_write" = "true", "light_schema_change" = "true", "store_row_column" = "true" );
+            PROPERTIES ( "replication_num" = "1",
+                    "enable_unique_key_merge_on_write" = "true",
+                    "light_schema_change" = "true",
+                    "enable_unique_key_skip_bitmap_column" = "false",
+                    "store_row_column" = "true"
+            );
         """
 
         sql """ INSERT INTO ${tableName} VALUES
@@ -162,83 +178,21 @@ suite("test_compaction_uniq_keys_row_store") {
         sql """ INSERT INTO ${tableName} VALUES
              (4, '2017-10-01', '2017-10-01', '2017-10-01 11:11:11.028', '2017-10-01 11:11:11.018', 'Beijing', 10, 1, NULL, NULL, NULL, NULL, '2020-01-05', 1, 34, 20)
             """
+        qt_sql_row_size "select sum(length(__DORIS_ROW_STORE_COL__)) from ${tableName}"
         //TabletId,ReplicaIdBackendId,SchemaHash,Version,LstSuccessVersion,LstFailedVersion,LstFailedTime,LocalDataSize,RemoteDataSize,RowCount,State,LstConsistencyCheckTime,CheckVersion,VersionCount,QueryHits,PathHash,MetaUrl,CompactionStatus
-        tablets = sql """ show tablets from ${tableName}; """
+        tablets = sql_return_maparray """ show tablets from ${tableName}; """
 
         checkValue()
 
         // trigger compactions for all tablets in ${tableName}
-        for (String[] tablet in tablets) {
-            String tablet_id = tablet[0]
-            backend_id = tablet[2]
-            StringBuilder sb = new StringBuilder();
-            sb.append("curl -X POST http://")
-            sb.append(backendId_to_backendIP.get(backend_id))
-            sb.append(":")
-            sb.append(backendId_to_backendHttpPort.get(backend_id))
-            sb.append("/api/compaction/run?tablet_id=")
-            sb.append(tablet_id)
-            sb.append("&compact_type=cumulative")
+        trigger_and_wait_compaction(tableName, "cumulative")
 
-            String command = sb.toString()
-            process = command.execute()
-            code = process.waitFor()
-            err = IOGroovyMethods.getText(new BufferedReader(new InputStreamReader(process.getErrorStream())));
-            out = process.getText()
-            logger.info("Run compaction: code=" + code + ", out=" + out + ", err=" + err)
-            assertEquals(code, 0)
-            def compactJson = parseJson(out.trim())
-            if (compactJson.status.toLowerCase() == "fail") {
-                assertEquals(disableAutoCompaction, false)
-                logger.info("Compaction was done automatically!")
-            }
-            if (disableAutoCompaction) {
-                assertEquals("success", compactJson.status.toLowerCase())
-            }
-        }
-
-        // wait for all compactions done
-        for (String[] tablet in tablets) {
-            boolean running = true
-            do {
-                Thread.sleep(1000)
-                String tablet_id = tablet[0]
-                backend_id = tablet[2]
-                StringBuilder sb = new StringBuilder();
-                sb.append("curl -X GET http://")
-                sb.append(backendId_to_backendIP.get(backend_id))
-                sb.append(":")
-                sb.append(backendId_to_backendHttpPort.get(backend_id))
-                sb.append("/api/compaction/run_status?tablet_id=")
-                sb.append(tablet_id)
-
-                String command = sb.toString()
-                logger.info(command)
-                process = command.execute()
-                code = process.waitFor()
-                err = IOGroovyMethods.getText(new BufferedReader(new InputStreamReader(process.getErrorStream())));
-                out = process.getText()
-                logger.info("Get compaction status: code=" + code + ", out=" + out + ", err=" + err)
-                assertEquals(code, 0)
-                def compactionStatus = parseJson(out.trim())
-                assertEquals("success", compactionStatus.status.toLowerCase())
-                running = compactionStatus.run_status
-            } while (running)
-        }
-
+        def replicaNum = get_table_replica_num(tableName)
+        logger.info("get table replica num: " + replicaNum)
         int rowCount = 0
-        for (String[] tablet in tablets) {
-            String tablet_id = tablet[0]
-            StringBuilder sb = new StringBuilder();
-            def compactionStatusUrlIndex = 18
-            sb.append("curl -X GET ")
-            sb.append(tablet[compactionStatusUrlIndex])
-            String command = sb.toString()
-            // wait for cleaning stale_rowsets
-            process = command.execute()
-            code = process.waitFor()
-            err = IOGroovyMethods.getText(new BufferedReader(new InputStreamReader(process.getErrorStream())));
-            out = process.getText()
+        for (def tablet in tablets) {
+            String tablet_id = tablet.TabletId
+            (code, out, err) = curl("GET", tablet.CompactionStatus)
             logger.info("Show tablets status: code=" + code + ", out=" + out + ", err=" + err)
             assertEquals(code, 0)
             def tabletJson = parseJson(out.trim())
@@ -247,8 +201,9 @@ suite("test_compaction_uniq_keys_row_store") {
                 rowCount += Integer.parseInt(rowset.split(" ")[1])
             }
         }
-        assert (rowCount < 8)
+        assert (rowCount < 8 * replicaNum)
         checkValue()
+        qt_sql_row_size "select sum(length(__DORIS_ROW_STORE_COL__)) from ${tableName}"
     } finally {
         // try_sql("DROP TABLE IF EXISTS ${tableName}")
     }

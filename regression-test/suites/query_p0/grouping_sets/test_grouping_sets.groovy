@@ -44,22 +44,6 @@ suite("test_grouping_sets", "p0") {
                  group by grouping sets((k_if, k1),()) order by k_if, k1, k2_sum
                """
 
-    test {
-        sql """
-              SELECT k1, k2, SUM(k3) FROM test_query_db.test
-              GROUP BY GROUPING SETS ((k1, k2), (k1), (k2), ( ), (k3) ) order by k1, k2
-            """
-        exception "errCode = 2, detailMessage = column: `k3` cannot both in select list and aggregate functions"
-    }
-
-    test {
-        sql """
-              SELECT k1, k2, SUM(k3)/(SUM(k3)+1) FROM test_query_db.test
-              GROUP BY GROUPING SETS ((k1, k2), (k1), (k2), ( ), (k3) ) order by k1, k2
-            """
-        exception "errCode = 2, detailMessage = column: `k3` cannot both in select list and aggregate functions"
-    }
-
     qt_select7 """ select k1,k2,sum(k3) from test_query_db.test where 1 = 2 group by grouping sets((k1), (k1,k2)) """
 
     qt_select8 """ WITH dt AS 
@@ -114,7 +98,7 @@ suite("test_grouping_sets", "p0") {
             SELECT k1, k3, MAX( k8 ) FROM test_query_db.test 
             GROUP BY k1, GROUPING SETS ( (k1, k3), (k1), ( ) ), ROLLUP(k1, k3)
             """
-        exception "Syntax error"
+        exception "mismatched input 'SETS'"
     }
 
     qt_select13"""
@@ -165,8 +149,9 @@ suite("test_grouping_sets", "p0") {
     qt_select20 """SELECT k1 ,GROUPING(k1) FROM test_query_db.test GROUP BY CUBE (k1) ORDER BY k1"""
     test {
         sql "SELECT k1 ,GROUPING(k2) FROM test_query_db.test GROUP BY CUBE (k1) ORDER BY k1"
-        exception "Column `k2` in GROUP_ID() does not exist in GROUP BY clause"
+        exception "Column in Grouping does not exist in GROUP BY clause"
     }
+
     // test grouping sets id contain null data
     sql """drop table if exists test_query_db.test_grouping_sets_id_null"""
     sql """create table if not exists test_query_db.test_grouping_sets_id_null like test_query_db.test"""
@@ -192,8 +177,6 @@ suite("test_grouping_sets", "p0") {
         """
     sql """drop table if exists test_query_db.test_grouping_sets_id_null"""
     // test grouping sets shoot rollup
-    // because nereids cannot support rollup correctly forbid it temporary
-    sql """set enable_nereids_planner=false"""
     sql "drop table if exists test_query_db.test_grouping_sets_rollup"
     sql """
         create table if not exists test_query_db.test_grouping_sets_rollup(
@@ -230,10 +213,9 @@ suite("test_grouping_sets", "p0") {
         contains "(idx1)"
     }
     sql "drop table if exists test_query_db.test_grouping_sets_rollup"
-    // test_grouping_select
-    test {
-        sql "select k1, if(grouping(k1)=1, count(k1), 0) from test_query_db.test group by grouping sets((k1))"
-        exception "`k1` cannot both in select list and aggregate functions " +
-                "when using GROUPING SETS/CUBE/ROLLUP, please use union instead."
-    }
+
+    qt_select24 """
+        select k1, if(grouping(k1)=1, count(k1), 0) from test_query_db.test group by grouping sets((k1))
+        order by 1,2
+        """
 }

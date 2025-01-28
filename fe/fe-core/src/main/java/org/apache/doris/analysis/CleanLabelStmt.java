@@ -18,13 +18,12 @@
 package org.apache.doris.analysis;
 
 import org.apache.doris.catalog.Env;
-import org.apache.doris.cluster.ClusterNamespace;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.UserException;
+import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.qe.ConnectContext;
-import org.apache.doris.system.SystemInfoService;
 
 import com.google.common.base.Strings;
 
@@ -32,7 +31,7 @@ import com.google.common.base.Strings;
  * CLEAN LABEL FROM db;
  * CLEAN LABEL my_label FROM db;
  */
-public class CleanLabelStmt extends DdlStmt {
+public class CleanLabelStmt extends DdlStmt implements NotFallbackInParser {
     private String db;
     private String label;
 
@@ -52,10 +51,10 @@ public class CleanLabelStmt extends DdlStmt {
     @Override
     public void analyze(Analyzer analyzer) throws UserException {
         super.analyze(analyzer);
-        db = ClusterNamespace.getFullName(SystemInfoService.DEFAULT_CLUSTER, db);
         label = Strings.nullToEmpty(label);
         // check auth
-        if (!Env.getCurrentEnv().getAccessManager().checkDbPriv(ConnectContext.get(), db, PrivPredicate.LOAD)) {
+        if (!Env.getCurrentEnv().getAccessManager()
+                .checkDbPriv(ConnectContext.get(), InternalCatalog.INTERNAL_CATALOG_NAME, db, PrivPredicate.LOAD)) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR, "LOAD");
         }
     }
@@ -68,5 +67,10 @@ public class CleanLabelStmt extends DdlStmt {
     @Override
     public RedirectStatus getRedirectStatus() {
         return RedirectStatus.FORWARD_WITH_SYNC;
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.CLEAN;
     }
 }

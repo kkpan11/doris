@@ -30,6 +30,7 @@
 
 #include "common/status.h" // for Status
 #include "olap/field.h"    // for Field
+#include "olap/rowset/segment_v2/bloom_filter.h"
 #include "olap/rowset/segment_v2/common.h"
 #include "olap/rowset/segment_v2/inverted_index_writer.h"
 #include "util/bitmap.h" // for BitmapChange
@@ -51,7 +52,7 @@ struct ColumnWriterOptions {
     // input and output parameter:
     // - input: column_id/unique_id/type/length/encoding/compression/is_nullable members
     // - output: encoding/indexes/dict_page members
-    ColumnMetaPB* meta;
+    ColumnMetaPB* meta = nullptr;
     size_t data_page_size = 64 * 1024;
     // store compressed page only when space saving is above the threshold.
     // space saving = 1 - compressed_size / uncompressed_size
@@ -60,10 +61,13 @@ struct ColumnWriterOptions {
     bool need_bitmap_index = false;
     bool need_bloom_filter = false;
     bool is_ngram_bf_index = false;
+    bool need_inverted_index = false;
     uint8_t gram_size;
     uint16_t gram_bf_size;
-    std::vector<const TabletIndex*> indexes;
+    BloomFilterOptions bf_options;
+    std::vector<const TabletIndex*> indexes; // unused
     const TabletIndex* inverted_index = nullptr;
+    InvertedIndexFileWriter* inverted_index_file_writer;
     std::string to_string() const {
         std::stringstream ss;
         ss << std::boolalpha << "meta=" << meta->DebugString()
@@ -87,6 +91,18 @@ class ColumnWriter {
 public:
     static Status create(const ColumnWriterOptions& opts, const TabletColumn* column,
                          io::FileWriter* file_writer, std::unique_ptr<ColumnWriter>* writer);
+    static Status create_struct_writer(const ColumnWriterOptions& opts, const TabletColumn* column,
+                                       io::FileWriter* file_writer,
+                                       std::unique_ptr<ColumnWriter>* writer);
+    static Status create_array_writer(const ColumnWriterOptions& opts, const TabletColumn* column,
+                                      io::FileWriter* file_writer,
+                                      std::unique_ptr<ColumnWriter>* writer);
+    static Status create_map_writer(const ColumnWriterOptions& opts, const TabletColumn* column,
+                                    io::FileWriter* file_writer,
+                                    std::unique_ptr<ColumnWriter>* writer);
+    static Status create_agg_state_writer(const ColumnWriterOptions& opts,
+                                          const TabletColumn* column, io::FileWriter* file_writer,
+                                          std::unique_ptr<ColumnWriter>* writer);
 
     explicit ColumnWriter(std::unique_ptr<Field> field, bool is_nullable)
             : _field(std::move(field)), _is_nullable(is_nullable) {}
@@ -162,14 +178,14 @@ private:
 class FlushPageCallback {
 public:
     virtual ~FlushPageCallback() = default;
-    virtual Status put_extra_info_in_page(DataPageFooterPB* footer) { return Status::OK(); }
+    virtual void put_extra_info_in_page(DataPageFooterPB* footer) {}
 };
 
 // Encode one column's data into some memory slice.
 // Because some columns would be stored in a file, we should wait
 // until all columns has been finished, and then data can be written
 // to file
-class ScalarColumnWriter final : public ColumnWriter {
+class ScalarColumnWriter : public ColumnWriter {
 public:
     ScalarColumnWriter(const ColumnWriterOptions& opts, std::unique_ptr<Field> field,
                        io::FileWriter* file_writer);
@@ -203,8 +219,15 @@ public:
     // used for append not null data. When page is full, will append data not reach num_rows.
     Status append_data_in_current_page(const uint8_t** ptr, size_t* num_written);
 
-    Status append_data_in_current_page(const uint8_t* ptr, size_t* num_written);
+    Status append_data_in_current_page(const uint8_t* ptr, size_t* num_written) {
+        RETURN_IF_CATCH_EXCEPTION(
+                { return _internal_append_data_in_current_page(ptr, num_written); });
+    }
     friend class ArrayColumnWriter;
+    friend class OffsetColumnWriter;
+
+private:
+    Status _internal_append_data_in_current_page(const uint8_t* ptr, size_t* num_written);
 
 private:
     std::unique_ptr<PageBuilder> _page_builder;
@@ -226,28 +249,16 @@ private:
         // use vector for easier management for lifetime of OwnedSlice
         std::vector<OwnedSlice> data;
         PageFooterPB footer;
-        Page* next = nullptr;
     };
 
-    struct PageHead {
-        Page* head = nullptr;
-        Page* tail = nullptr;
-    };
-
-    void _push_back_page(Page* page) {
-        // add page to pages' tail
-        if (_pages.tail != nullptr) {
-            _pages.tail->next = page;
-        }
-        _pages.tail = page;
-        if (_pages.head == nullptr) {
-            _pages.head = page;
-        }
+    void _push_back_page(std::unique_ptr<Page> page) {
         for (auto& data_slice : page->data) {
             _data_size += data_slice.slice().size;
         }
         // estimate (page footer + footer size + checksum) took 20 bytes
         _data_size += 20;
+        // add page to pages' tail
+        _pages.emplace_back(std::move(page));
     }
 
     Status _write_data_page(Page* page);
@@ -258,7 +269,7 @@ private:
     uint64_t _data_size;
 
     // cached generated pages,
-    PageHead _pages;
+    std::vector<std::unique_ptr<Page>> _pages;
     ordinal_t _first_rowid = 0;
 
     BlockCompressionCodec* _compress_codec;
@@ -271,6 +282,26 @@ private:
 
     // call before flush data page.
     FlushPageCallback* _new_page_callback = nullptr;
+};
+
+// offsetColumnWriter is used column which has offset column, like array, map.
+//  column type is only uint64 and should response for whole column value [start, end], end will set
+//  in footer.next_array_item_ordinal which in finish_cur_page() callback put_extra_info_in_page()
+class OffsetColumnWriter final : public ScalarColumnWriter, FlushPageCallback {
+public:
+    OffsetColumnWriter(const ColumnWriterOptions& opts, std::unique_ptr<Field> field,
+                       io::FileWriter* file_writer);
+
+    ~OffsetColumnWriter() override;
+
+    Status init() override;
+
+    Status append_data(const uint8_t** ptr, size_t num_rows) override;
+
+private:
+    void put_extra_info_in_page(DataPageFooterPB* footer) override;
+
+    uint64_t _next_offset;
 };
 
 class StructColumnWriter final : public ColumnWriter {
@@ -324,10 +355,10 @@ private:
     ColumnWriterOptions _opts;
 };
 
-class ArrayColumnWriter final : public ColumnWriter, public FlushPageCallback {
+class ArrayColumnWriter final : public ColumnWriter {
 public:
     explicit ArrayColumnWriter(const ColumnWriterOptions& opts, std::unique_ptr<Field> field,
-                               ScalarColumnWriter* offset_writer, ScalarColumnWriter* null_writer,
+                               OffsetColumnWriter* offset_writer, ScalarColumnWriter* null_writer,
                                std::unique_ptr<ColumnWriter> item_writer);
     ~ArrayColumnWriter() override = default;
 
@@ -341,6 +372,7 @@ public:
     Status write_data() override;
     Status write_ordinal_index() override;
     Status append_nulls(size_t num_rows) override;
+    Status append_nullable(const uint8_t* null_map, const uint8_t** ptr, size_t num_rows) override;
 
     Status finish_current_page() override;
 
@@ -367,22 +399,21 @@ public:
     ordinal_t get_next_rowid() const override { return _offset_writer->get_next_rowid(); }
 
 private:
-    Status put_extra_info_in_page(DataPageFooterPB* header) override;
     Status write_null_column(size_t num_rows, bool is_null); // 写入num_rows个null标记
     bool has_empty_items() const { return _item_writer->get_next_rowid() == 0; }
 
 private:
-    std::unique_ptr<ScalarColumnWriter> _offset_writer;
+    std::unique_ptr<OffsetColumnWriter> _offset_writer;
     std::unique_ptr<ScalarColumnWriter> _null_writer;
     std::unique_ptr<ColumnWriter> _item_writer;
     std::unique_ptr<InvertedIndexColumnWriter> _inverted_index_builder;
     ColumnWriterOptions _opts;
 };
 
-class MapColumnWriter final : public ColumnWriter, public FlushPageCallback {
+class MapColumnWriter final : public ColumnWriter {
 public:
     explicit MapColumnWriter(const ColumnWriterOptions& opts, std::unique_ptr<Field> field,
-                             ScalarColumnWriter* null_writer, ScalarColumnWriter* offsets_writer,
+                             ScalarColumnWriter* null_writer, OffsetColumnWriter* offsets_writer,
                              std::vector<std::unique_ptr<ColumnWriter>>& _kv_writers);
 
     ~MapColumnWriter() override = default;
@@ -425,12 +456,10 @@ public:
     ordinal_t get_next_rowid() const override { return _offsets_writer->get_next_rowid(); }
 
 private:
-    Status put_extra_info_in_page(DataPageFooterPB* header) override;
-
     std::vector<std::unique_ptr<ColumnWriter>> _kv_writers;
     // we need null writer to make sure a row is null or not
     std::unique_ptr<ScalarColumnWriter> _null_writer;
-    std::unique_ptr<ScalarColumnWriter> _offsets_writer;
+    std::unique_ptr<OffsetColumnWriter> _offsets_writer;
     std::unique_ptr<InvertedIndexColumnWriter> _inverted_index_builder;
     ColumnWriterOptions _opts;
 };

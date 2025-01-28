@@ -17,21 +17,18 @@
 
 package org.apache.doris.analysis;
 
-import org.apache.doris.analysis.CompoundPredicate.Operator;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.util.Util;
-import org.apache.doris.mysql.privilege.PrivBitSet;
 import org.apache.doris.mysql.privilege.PrivPredicate;
-import org.apache.doris.mysql.privilege.Privilege;
 import org.apache.doris.qe.ConnectContext;
 
 import com.google.common.base.Strings;
 
-public class RecoverTableStmt extends DdlStmt {
+public class RecoverTableStmt extends DdlStmt implements NotFallbackInParser {
     private TableName dbTblName;
     private long tableId = -1;
     private String newTableName = "";
@@ -67,13 +64,12 @@ public class RecoverTableStmt extends DdlStmt {
         Util.prohibitExternalCatalog(dbTblName.getCtl(), this.getClass().getSimpleName());
 
         if (!Env.getCurrentEnv().getAccessManager().checkTblPriv(
-                ConnectContext.get(), dbTblName.getDb(), dbTblName.getTbl(), PrivPredicate.of(
-                        PrivBitSet.of(Privilege.ALTER_PRIV, Privilege.CREATE_PRIV, Privilege.ADMIN_PRIV),
-                        Operator.OR))) {
+                ConnectContext.get(), dbTblName.getCtl(), dbTblName.getDb(), dbTblName.getTbl(),
+                PrivPredicate.ALTER_CREATE)) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "RECOVERY",
-                                                ConnectContext.get().getQualifiedUser(),
-                                                ConnectContext.get().getRemoteIP(),
-                                                dbTblName.getDb() + ": " + dbTblName.getTbl());
+                    ConnectContext.get().getQualifiedUser(),
+                    ConnectContext.get().getRemoteIP(),
+                    dbTblName.getDb() + ": " + dbTblName.getTbl());
         }
     }
 
@@ -94,5 +90,10 @@ public class RecoverTableStmt extends DdlStmt {
             sb.append(this.newTableName);
         }
         return sb.toString();
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.RECOVER;
     }
 }

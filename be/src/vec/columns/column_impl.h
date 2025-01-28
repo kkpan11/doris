@@ -33,56 +33,37 @@
 namespace doris::vectorized {
 
 template <typename Derived>
-std::vector<IColumn::MutablePtr> IColumn::scatter_impl(ColumnIndex num_columns,
-                                                       const Selector& selector) const {
-    size_t num_rows = size();
-
-    if (num_rows != selector.size()) {
-        LOG(FATAL) << fmt::format("Size of selector: {}, doesn't match size of column:{}",
-                                  selector.size(), num_rows);
-    }
-
-    std::vector<MutablePtr> columns(num_columns);
-    for (auto& column : columns) column = clone_empty();
-
-    {
-        size_t reserve_size =
-                num_rows * 1.1 / num_columns; /// 1.1 is just a guess. Better to use n-sigma rule.
-
-        if (reserve_size > 1)
-            for (auto& column : columns) column->reserve(reserve_size);
-    }
-
-    for (size_t i = 0; i < num_rows; ++i)
-        static_cast<Derived&>(*columns[selector[i]]).insert_from(*this, i);
-
-    return columns;
-}
-
-template <typename Derived>
-void IColumn::append_data_by_selector_impl(MutablePtr& res, const Selector& selector) const {
+void IColumn::append_data_by_selector_impl(MutablePtr& res, const Selector& selector, size_t begin,
+                                           size_t end) const {
     size_t num_rows = size();
 
     if (num_rows < selector.size()) {
-        LOG(FATAL) << fmt::format("Size of selector: {}, is larger than size of column:{}",
-                                  selector.size(), num_rows);
+        throw doris::Exception(ErrorCode::INTERNAL_ERROR,
+                               "Size of selector: {} is larger than size of column: {}",
+                               selector.size(), num_rows);
     }
+    DCHECK_GE(end, begin);
+    DCHECK_LE(end, selector.size());
+    // here wants insert some value from this column, and the nums is (end - begin)
+    // and many be this column num_rows is 4096, but only need insert num is (1 - 0) = 1
+    // so can't call res->reserve(num_rows), it's will be too mush waste memory
+    res->reserve(res->size() + (end - begin));
 
-    res->reserve(num_rows);
-
-    for (size_t i = 0; i < selector.size(); ++i)
+    for (size_t i = begin; i < end; ++i) {
         static_cast<Derived&>(*res).insert_from(*this, selector[i]);
+    }
+}
+template <typename Derived>
+void IColumn::append_data_by_selector_impl(MutablePtr& res, const Selector& selector) const {
+    append_data_by_selector_impl<Derived>(res, selector, 0, selector.size());
 }
 
 template <typename Derived>
-void IColumn::get_indices_of_non_default_rows_impl(IColumn::Offsets64& indices, size_t from,
-                                                   size_t limit) const {
-    size_t to = limit && from + limit < size() ? from + limit : size();
-    indices.reserve(indices.size() + to - from);
-    for (size_t i = from; i < to; ++i) {
-        if (!static_cast<const Derived&>(*this).is_default_at(i)) {
-            indices.push_back(i);
-        }
+void IColumn::insert_from_multi_column_impl(const std::vector<const IColumn*>& srcs,
+                                            const std::vector<size_t>& positions) {
+    reserve(size() + srcs.size());
+    for (size_t i = 0; i < srcs.size(); ++i) {
+        static_cast<Derived&>(*this).insert_from(*srcs[i], positions[i]);
     }
 }
 

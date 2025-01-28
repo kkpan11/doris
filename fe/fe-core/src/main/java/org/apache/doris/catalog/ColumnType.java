@@ -17,13 +17,17 @@
 
 package org.apache.doris.catalog;
 
+import org.apache.doris.common.DdlException;
+import org.apache.doris.common.FeMetaVersion;
 import org.apache.doris.common.io.Text;
+import org.apache.doris.persist.gson.GsonUtils;
 
 import com.google.common.base.Preconditions;
 
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
+import java.util.ArrayList;
 
 /**
  * 这个是对Column类型的一个封装，对于大多数类型，primitive type足够了，这里有两个例外需要用到这个信息
@@ -156,47 +160,113 @@ public abstract class ColumnType {
         schemaChangeMatrix[PrimitiveType.DATETIMEV2.ordinal()][PrimitiveType.DATETIMEV2.ordinal()] = true;
 
         // Currently, we do not support schema change between complex types with subtypes.
-        schemaChangeMatrix[PrimitiveType.ARRAY.ordinal()][PrimitiveType.ARRAY.ordinal()] = false;
-        schemaChangeMatrix[PrimitiveType.STRUCT.ordinal()][PrimitiveType.STRUCT.ordinal()] = false;
-        schemaChangeMatrix[PrimitiveType.MAP.ordinal()][PrimitiveType.MAP.ordinal()] = false;
+        schemaChangeMatrix[PrimitiveType.ARRAY.ordinal()][PrimitiveType.ARRAY.ordinal()] = true;
+        schemaChangeMatrix[PrimitiveType.STRUCT.ordinal()][PrimitiveType.STRUCT.ordinal()] = true;
+        schemaChangeMatrix[PrimitiveType.MAP.ordinal()][PrimitiveType.MAP.ordinal()] = true;
     }
 
     static boolean isSchemaChangeAllowed(Type lhs, Type rhs) {
         return schemaChangeMatrix[lhs.getPrimitiveType().ordinal()][rhs.getPrimitiveType().ordinal()];
     }
 
-    public static void write(DataOutput out, Type type) throws IOException {
-        Preconditions.checkArgument(type.isScalarType() || type.isArrayType(),
-                "only support scalar type and array serialization");
-        if (type.isScalarType()) {
-            ScalarType scalarType = (ScalarType) type;
-            Text.writeString(out, scalarType.getPrimitiveType().name());
-            out.writeInt(scalarType.getScalarScale());
-            out.writeInt(scalarType.getScalarPrecision());
-            out.writeInt(scalarType.getLength());
-            // Actually, varcharLimit need not to write here, write true to back compatible
-            out.writeBoolean(true);
-        } else if (type.isArrayType()) {
-            ArrayType arrayType = (ArrayType) type;
-            Text.writeString(out, arrayType.getPrimitiveType().name());
-            write(out, arrayType.getItemType());
-            out.writeBoolean(arrayType.getContainsNull());
+    // This method defines the char type
+    // to support the schema-change behavior of length growth.
+    // return true if the checkType and other are both char-type otherwise return false,
+    // which used in checkSupportSchemaChangeForComplexType
+    public static boolean checkSupportSchemaChangeForCharType(Type checkType, Type other) throws DdlException {
+        if ((checkType.getPrimitiveType() == PrimitiveType.VARCHAR && other.getPrimitiveType() == PrimitiveType.VARCHAR)
+                || (checkType.getPrimitiveType() == PrimitiveType.CHAR
+                && other.getPrimitiveType() == PrimitiveType.VARCHAR)
+                || (checkType.getPrimitiveType() == PrimitiveType.CHAR
+                && other.getPrimitiveType() == PrimitiveType.CHAR)) {
+            if (checkType.getLength() > other.getLength()) {
+                throw new DdlException("Cannot shorten string length");
+            }
+            return true;
+        } else {
+            // types equal can return true
+            return checkType.equals(other);
         }
     }
 
-    public static Type read(DataInput in) throws IOException {
-        PrimitiveType primitiveType = PrimitiveType.valueOf(Text.readString(in));
-        if (primitiveType == PrimitiveType.ARRAY) {
-            Type itermType = read(in);
-            boolean containsNull = in.readBoolean();
-            return ArrayType.create(itermType, containsNull);
+    // This method defines the complex type which is struct, array, map if nested char-type
+    // to support the schema-change behavior of length growth.
+    public static void checkSupportSchemaChangeForComplexType(Type checkType, Type other, boolean nested)
+            throws DdlException {
+        if (checkType.isStructType() && other.isStructType()) {
+            StructType thisStructType = (StructType) checkType;
+            StructType otherStructType = (StructType) other;
+            if (thisStructType.getFields().size() != otherStructType.getFields().size()) {
+                throw new DdlException("Cannot change struct type with different field size");
+            }
+            for (int i = 0; i < thisStructType.getFields().size(); i++) {
+                checkSupportSchemaChangeForComplexType(thisStructType.getFields().get(i).getType(),
+                        otherStructType.getFields().get(i).getType(), true);
+            }
+        } else if (checkType.isArrayType()) {
+            if (!other.isArrayType()) {
+                throw new DdlException("Cannot change " + checkType.toSql() + " to " + other.toSql());
+            }
+            checkSupportSchemaChangeForComplexType(((ArrayType) checkType).getItemType(),
+                    ((ArrayType) other).getItemType(), true);
+        } else if (checkType.isMapType() && other.isMapType()) {
+            checkSupportSchemaChangeForComplexType(((MapType) checkType).getKeyType(),
+                    ((MapType) other).getKeyType(), true);
+            checkSupportSchemaChangeForComplexType(((MapType) checkType).getValueType(),
+                    ((MapType) other).getValueType(), true);
         } else {
-            int scale = in.readInt();
-            int precision = in.readInt();
-            int len = in.readInt();
-            // Useless, just for back compatible
-            in.readBoolean();
-            return ScalarType.createType(primitiveType, len, precision, scale);
+            // only support char-type schema change behavior for nested complex type
+            // if nested is false, we do not check return value.
+            if (nested && !checkSupportSchemaChangeForCharType(checkType, other)) {
+                throw new DdlException("Cannot change " + checkType.toSql() + " to " + other.toSql());
+            }
+        }
+    }
+
+    public static void write(DataOutput out, Type type) throws IOException {
+        Preconditions.checkArgument(type.isScalarType() || type.isAggStateType()
+                        || type.isArrayType() || type.isMapType() || type.isStructType(),
+                "not support serialize this type " + type.toSql());
+        Text.writeString(out, GsonUtils.GSON.toJson(type));
+    }
+
+    public static Type read(DataInput in) throws IOException {
+        if (Env.getCurrentEnvJournalVersion() >= FeMetaVersion.VERSION_133) {
+            return GsonUtils.GSON.fromJson(Text.readString(in), Type.class);
+        } else {
+            PrimitiveType primitiveType = PrimitiveType.valueOf(Text.readString(in));
+            if (primitiveType == PrimitiveType.ARRAY) {
+                Type itermType = read(in);
+                boolean containsNull = in.readBoolean();
+                return ArrayType.create(itermType, containsNull);
+            } else if (primitiveType == PrimitiveType.MAP) {
+                Type keyType = read(in);
+                Type valueType = read(in);
+                boolean keyContainsNull = in.readBoolean();
+                boolean valueContainsNull = in.readBoolean();
+                return new MapType(keyType, valueType, keyContainsNull, valueContainsNull);
+            } else if (primitiveType == PrimitiveType.STRUCT) {
+                int size = in.readInt();
+                ArrayList<StructField> fields = new ArrayList<>();
+                for (int i = 0; i < size; ++i) {
+                    String name = Text.readString(in);
+                    Type type = read(in);
+                    String comment = Text.readString(in);
+                    int pos = in.readInt();
+                    boolean containsNull = in.readBoolean();
+                    StructField field = new StructField(name, type, comment, containsNull);
+                    field.setPosition(pos);
+                    fields.add(field);
+                }
+                return new StructType(fields);
+            } else {
+                int scale = in.readInt();
+                int precision = in.readInt();
+                int len = in.readInt();
+                // Useless, just for back compatible
+                in.readBoolean();
+                return ScalarType.createType(primitiveType, len, precision, scale);
+            }
         }
     }
 }

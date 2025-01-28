@@ -88,10 +88,9 @@ public class BrokerUtil {
         try {
             RemoteFileSystem fileSystem = FileSystemFactory.get(
                     brokerDesc.getName(), brokerDesc.getStorageType(), brokerDesc.getProperties());
-            Status st = fileSystem.list(path, rfiles, false);
+            Status st = fileSystem.globList(path, rfiles, false);
             if (!st.ok()) {
-                throw new UserException(brokerDesc.getName() + " list path failed. path=" + path
-                        + ",msg=" + st.getErrMsg());
+                throw new UserException(st.getErrMsg());
             }
         } catch (Exception e) {
             LOG.warn("{} list path exception, path={}", brokerDesc.getName(), path, e);
@@ -108,23 +107,36 @@ public class BrokerUtil {
         }
     }
 
+    public static void deleteDirectoryWithFileSystem(String path, BrokerDesc brokerDesc) throws UserException {
+        RemoteFileSystem fileSystem = FileSystemFactory.get(
+                brokerDesc.getName(), brokerDesc.getStorageType(), brokerDesc.getProperties());
+        Status st = fileSystem.deleteDirectory(path);
+        if (!st.ok()) {
+            throw new UserException(brokerDesc.getName() +  " delete directory exception. path="
+                    + path + ", err: " + st.getErrMsg());
+        }
+    }
+
     public static String printBroker(String brokerName, TNetworkAddress address) {
         return brokerName + "[" + address.toString() + "]";
     }
 
     public static List<String> parseColumnsFromPath(String filePath, List<String> columnsFromPath)
             throws UserException {
-        return parseColumnsFromPath(filePath, columnsFromPath, true);
+        return parseColumnsFromPath(filePath, columnsFromPath, true, false);
     }
 
     public static List<String> parseColumnsFromPath(
             String filePath,
             List<String> columnsFromPath,
-            boolean caseSensitive)
+            boolean caseSensitive,
+            boolean isACID)
             throws UserException {
         if (columnsFromPath == null || columnsFromPath.isEmpty()) {
             return Collections.emptyList();
         }
+        // if it is ACID, the path count is 3. The hdfs path is hdfs://xxx/table_name/par=xxx/delta(or base)_xxx/.
+        int pathCount = isACID ? 3 : 2;
         if (!caseSensitive) {
             for (int i = 0; i < columnsFromPath.size(); i++) {
                 String path = columnsFromPath.remove(i);
@@ -138,15 +150,21 @@ public class BrokerUtil {
         }
         String[] columns = new String[columnsFromPath.size()];
         int size = 0;
-        for (int i = strings.length - 2; i >= 0; i--) {
+        boolean skipOnce = true;
+        for (int i = strings.length - pathCount; i >= 0; i--) {
             String str = strings[i];
             if (str != null && str.isEmpty()) {
                 continue;
             }
             if (str == null || !str.contains("=")) {
+                if (!isACID && skipOnce) {
+                    skipOnce = false;
+                    continue;
+                }
                 throw new UserException("Fail to parse columnsFromPath, expected: "
                         + columnsFromPath + ", filePath: " + filePath);
             }
+            skipOnce = false;
             String[] pair = str.split("=", 2);
             if (pair.length != 2) {
                 throw new UserException("Fail to parse columnsFromPath, expected: "
@@ -208,7 +226,8 @@ public class BrokerUtil {
             long fileSize = fileStatuses.get(0).getSize();
 
             // open reader
-            String clientId = FrontendOptions.getLocalHostAddress() + ":" + Config.rpc_port;
+            String clientId = NetUtils
+                    .getHostPortInAccessibleFormat(FrontendOptions.getLocalHostAddress(), Config.rpc_port);
             TBrokerOpenReaderRequest tOpenReaderRequest = new TBrokerOpenReaderRequest(
                     TBrokerVersion.VERSION_ONE, path, 0, clientId, brokerDesc.getProperties());
             TBrokerOpenReaderResponse tOpenReaderResponse = null;
@@ -349,7 +368,7 @@ public class BrokerUtil {
      * @param brokerDesc
      * @throws UserException if broker op failed
      */
-    public static void deletePath(String path, BrokerDesc brokerDesc) throws UserException {
+    public static void deletePathWithBroker(String path, BrokerDesc brokerDesc) throws UserException {
         TNetworkAddress address = getAddress(brokerDesc);
         TPaloBrokerService.Client client = borrowClient(address);
         boolean failed = true;
@@ -492,7 +511,8 @@ public class BrokerUtil {
             address = BrokerUtil.getAddress(brokerDesc);
             client = BrokerUtil.borrowClient(address);
             try {
-                String clientId = FrontendOptions.getLocalHostAddress() + ":" + Config.rpc_port;
+                String clientId = NetUtils
+                        .getHostPortInAccessibleFormat(FrontendOptions.getLocalHostAddress(), Config.rpc_port);
                 TBrokerOpenWriterRequest tOpenWriterRequest = new TBrokerOpenWriterRequest(
                         TBrokerVersion.VERSION_ONE, brokerFilePath, TBrokerOpenMode.APPEND,
                         clientId, brokerDesc.getProperties());
@@ -583,4 +603,3 @@ public class BrokerUtil {
 
     }
 }
-

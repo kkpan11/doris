@@ -17,6 +17,8 @@
 
 #pragma once
 
+#if !defined(__SANITIZE_ADDRESS__) && !defined(ADDRESS_SANITIZER) && !defined(LEAK_SANITIZER) && \
+        !defined(THREAD_SANITIZER) && !defined(USE_JEMALLOC)
 #include <gperftools/malloc_hook.h>
 #include <gperftools/nallocx.h>
 #include <gperftools/tcmalloc.h>
@@ -36,11 +38,11 @@
 //  destructor to control the behavior of consume can lead to unexpected behavior,
 //  like this: if (LIKELY(doris::start_thread_mem_tracker)) {
 void new_hook(const void* ptr, size_t size) {
-    CONSUME_MEM_TRACKER(tc_nallocx(size, 0));
+    CONSUME_THREAD_MEM_TRACKER_BY_HOOK(tc_nallocx(size, 0));
 }
 
 void delete_hook(const void* ptr) {
-    RELEASE_MEM_TRACKER(tc_malloc_size(const_cast<void*>(ptr)));
+    RELEASE_THREAD_MEM_TRACKER_BY_HOOK(tc_malloc_size(const_cast<void*>(ptr)));
 }
 
 void init_hook() {
@@ -53,3 +55,4 @@ void init_hook() {
 //     MallocHook::RemoveNewHook(&new_hook);
 //     MallocHook::RemoveDeleteHook(&delete_hook);
 // }
+#endif

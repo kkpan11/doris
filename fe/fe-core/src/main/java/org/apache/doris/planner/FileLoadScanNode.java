@@ -25,7 +25,6 @@ import org.apache.doris.analysis.ExprSubstitutionMap;
 import org.apache.doris.analysis.FunctionCallExpr;
 import org.apache.doris.analysis.IntLiteral;
 import org.apache.doris.analysis.NullLiteral;
-import org.apache.doris.analysis.SchemaChangeExpr;
 import org.apache.doris.analysis.SlotDescriptor;
 import org.apache.doris.analysis.SlotRef;
 import org.apache.doris.analysis.StringLiteral;
@@ -36,19 +35,21 @@ import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.FunctionSet;
 import org.apache.doris.catalog.PrimitiveType;
 import org.apache.doris.catalog.Table;
-import org.apache.doris.catalog.TableIf;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.UserException;
+import org.apache.doris.datasource.FederationBackendPolicy;
+import org.apache.doris.datasource.FileGroupInfo;
+import org.apache.doris.datasource.FileScanNode;
+import org.apache.doris.datasource.LoadScanProvider;
 import org.apache.doris.load.BrokerFileGroup;
-import org.apache.doris.planner.external.FileGroupInfo;
-import org.apache.doris.planner.external.FileScanNode;
-import org.apache.doris.planner.external.LoadScanProvider;
 import org.apache.doris.rewrite.ExprRewriter;
 import org.apache.doris.statistics.StatisticalType;
+import org.apache.doris.system.BeSelectionPolicy;
 import org.apache.doris.thrift.TBrokerFileStatus;
 import org.apache.doris.thrift.TFileScanRangeParams;
 import org.apache.doris.thrift.TFileType;
 import org.apache.doris.thrift.TUniqueId;
+import org.apache.doris.thrift.TUniqueKeyUpdateMode;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
@@ -108,9 +109,10 @@ public class FileLoadScanNode extends FileScanNode {
     // Only for stream load/routine load job.
     public void setLoadInfo(TUniqueId loadId, long txnId, Table targetTable, BrokerDesc brokerDesc,
                             BrokerFileGroup fileGroup, TBrokerFileStatus fileStatus, boolean strictMode,
-                            TFileType fileType, List<String> hiddenColumns, boolean isPartialUpdate) {
-        FileGroupInfo fileGroupInfo = new FileGroupInfo(loadId, txnId, targetTable, brokerDesc,
-                fileGroup, fileStatus, strictMode, fileType, hiddenColumns, isPartialUpdate);
+                            TFileType fileType, List<String> hiddenColumns, TUniqueKeyUpdateMode uniquekeyUpdateMode,
+                            String sequenceMapCol) {
+        FileGroupInfo fileGroupInfo = new FileGroupInfo(loadId, txnId, targetTable, brokerDesc, fileGroup,
+                fileStatus, strictMode, fileType, hiddenColumns, uniquekeyUpdateMode, sequenceMapCol);
         fileGroupInfos.add(fileGroupInfo);
     }
 
@@ -120,8 +122,6 @@ public class FileLoadScanNode extends FileScanNode {
         for (FileGroupInfo fileGroupInfo : fileGroupInfos) {
             this.scanProviders.add(new LoadScanProvider(fileGroupInfo, desc));
         }
-        backendPolicy.init();
-        numNodes = backendPolicy.numBackends();
         initParamCreateContexts(analyzer);
     }
 
@@ -133,7 +133,8 @@ public class FileLoadScanNode extends FileScanNode {
             // FIXME(cmy): we should support set different expr for different file group.
             initAndSetPrecedingFilter(context.fileGroup.getPrecedingFilterExpr(), context.srcTupleDescriptor, analyzer);
             initAndSetWhereExpr(context.fileGroup.getWhereExpr(), context.destTupleDescriptor, analyzer);
-            setDefaultValueExprs(scanProvider.getTargetTable(), context.srcSlotDescByName, context.params, true);
+            setDefaultValueExprs(scanProvider.getTargetTable(), context.srcSlotDescByName,
+                    context.exprMap, context.params, true);
             this.contexts.add(context);
         }
     }
@@ -193,18 +194,39 @@ public class FileLoadScanNode extends FileScanNode {
     public void finalize(Analyzer analyzer) throws UserException {
         Preconditions.checkState(contexts.size() == scanProviders.size(),
                 contexts.size() + " vs. " + scanProviders.size());
+        // ATTN: for load scan node, do not use backend policy in ExternalScanNode.
+        // Because backend policy in ExternalScanNode may only contain compute backend.
+        // But for load job, we should select backends from all backends, both compute and mix.
+        BeSelectionPolicy policy = new BeSelectionPolicy.Builder()
+                .needQueryAvailable()
+                .needLoadAvailable()
+                .build();
+        FederationBackendPolicy localBackendPolicy = new FederationBackendPolicy();
+        localBackendPolicy.init(policy);
         for (int i = 0; i < contexts.size(); ++i) {
             FileLoadScanNode.ParamCreateContext context = contexts.get(i);
             LoadScanProvider scanProvider = scanProviders.get(i);
             finalizeParamsForLoad(context, analyzer);
-            createScanRangeLocations(context, scanProvider);
-            this.inputSplitsNum += scanProvider.getInputSplitNum();
+            createScanRangeLocations(context, scanProvider, localBackendPolicy);
+            this.selectedSplitNum += scanProvider.getInputSplitNum();
             this.totalFileSize += scanProvider.getInputFileSize();
         }
     }
 
+    // TODO: This api is for load job only. Will remove it later.
+    private void createScanRangeLocations(FileLoadScanNode.ParamCreateContext context,
+            LoadScanProvider scanProvider, FederationBackendPolicy backendPolicy)
+            throws UserException {
+        scanProvider.createScanRangeLocations(context, backendPolicy, scanRangeLocations);
+    }
+
+    @Override
+    protected void createScanRangeLocations() throws UserException {
+        // do nothing, we have already created scan range locations in finalize
+    }
+
     protected void finalizeParamsForLoad(ParamCreateContext context,
-                                         Analyzer analyzer) throws UserException {
+            Analyzer analyzer) throws UserException {
         Map<String, SlotDescriptor> slotDescByName = context.srcSlotDescByName;
         Map<String, Expr> exprMap = context.exprMap;
         TupleDescriptor srcTupleDesc = context.srcTupleDescriptor;
@@ -234,11 +256,17 @@ public class FileLoadScanNode extends FileScanNode {
                     if (column.getDefaultValue() != null) {
                         if (column.getDefaultValueExprDef() != null) {
                             expr = column.getDefaultValueExpr();
+                            expr.analyze(analyzer);
                         } else {
                             expr = new StringLiteral(destSlotDesc.getColumn().getDefaultValue());
                         }
                     } else {
                         if (column.isAllowNull()) {
+                            expr = NullLiteral.create(column.getType());
+                        } else if (column.isAutoInc()) {
+                            // auto-increment column should be non-nullable
+                            // however, here we use `NullLiteral` to indicate that a cell should
+                            // be filled with generated value in `VOlapTableSink::_fill_auto_inc_cols()`
                             expr = NullLiteral.create(column.getType());
                         } else {
                             throw new AnalysisException("column has no source field, column=" + column.getName());
@@ -255,9 +283,11 @@ public class FileLoadScanNode extends FileScanNode {
                 }
                 FunctionCallExpr fn = (FunctionCallExpr) expr;
                 if (!fn.getFnName().getFunction().equalsIgnoreCase(FunctionSet.HLL_HASH) && !fn.getFnName()
-                        .getFunction().equalsIgnoreCase("hll_empty")) {
+                        .getFunction().equalsIgnoreCase("hll_empty")
+                        && !fn.getFnName().getFunction().equalsIgnoreCase(FunctionSet.HLL_FROM_BASE64)) {
                     throw new AnalysisException("HLL column must use " + FunctionSet.HLL_HASH + " function, like "
                         + destSlotDesc.getColumn().getName() + "=" + FunctionSet.HLL_HASH + "(xxx) or "
+                        + destSlotDesc.getColumn().getName() + "=" + FunctionSet.HLL_FROM_BASE64 + "(xxx) or "
                         + destSlotDesc.getColumn().getName() + "=hll_empty()");
                 }
                 expr.setType(org.apache.doris.catalog.Type.HLL);
@@ -286,10 +316,6 @@ public class FileLoadScanNode extends FileScanNode {
                 String name = "jsonb_parse_" + nullable + "_error_to_null";
                 expr = new FunctionCallExpr(name, args);
                 expr.analyze(analyzer);
-            } else if (dstType == PrimitiveType.VARIANT) {
-                // Generate SchemaChange expr for dynamicly generating columns
-                TableIf targetTbl = desc.getTable();
-                expr = new SchemaChangeExpr((SlotRef) expr, (int) targetTbl.getId());
             } else {
                 expr = castToSlot(destSlotDesc, expr);
             }
@@ -330,4 +356,3 @@ public class FileLoadScanNode extends FileScanNode {
         }
     }
 }
-

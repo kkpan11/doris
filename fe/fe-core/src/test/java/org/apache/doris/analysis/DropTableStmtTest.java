@@ -46,6 +46,9 @@ public class DropTableStmtTest {
 
     @Before
     public void setUp() {
+        MockedAuth.mockedAccess(accessManager);
+        MockedAuth.mockedConnectContext(ctx, "root", "192.168.1.1");
+
         tbl = new TableName(internalCtl, "db1", "table1");
         noDbTbl = new TableName(internalCtl, "", "table1");
         analyzer = AccessTestUtil.fetchAdminAnalyzer(true);
@@ -59,33 +62,27 @@ public class DropTableStmtTest {
                 noDbAnalyzer.getDefaultDb();
                 minTimes = 0;
                 result = "";
-
-                noDbAnalyzer.getClusterName();
-                minTimes = 0;
-                result = "testCluster";
             }
         };
-
-        MockedAuth.mockedAccess(accessManager);
-        MockedAuth.mockedConnectContext(ctx, "root", "192.168.1.1");
     }
 
     @Test
     public void testNormal() throws UserException, AnalysisException {
         DropTableStmt stmt = new DropTableStmt(false, tbl, true);
         stmt.analyze(analyzer);
-        Assert.assertEquals("testCluster:db1", stmt.getDbName());
+        Assert.assertEquals("db1", stmt.getDbName());
         Assert.assertEquals("table1", stmt.getTableName());
-        Assert.assertEquals("DROP TABLE `testCluster:db1`.`table1`", stmt.toString());
+        // one with force.
+        Assert.assertEquals("DROP TABLE `db1`.`table1` FORCE", stmt.toString());
     }
 
     @Test
     public void testDefaultNormal() throws UserException, AnalysisException {
-        DropTableStmt stmt = new DropTableStmt(false, noDbTbl, true);
+        DropTableStmt stmt = new DropTableStmt(false, noDbTbl, false);
         stmt.analyze(analyzer);
-        Assert.assertEquals("testCluster:testDb", stmt.getDbName());
+        Assert.assertEquals("testDb", stmt.getDbName());
         Assert.assertEquals("table1", stmt.getTableName());
-        Assert.assertEquals("DROP TABLE `testCluster:testDb`.`table1`", stmt.toSql());
+        Assert.assertEquals("DROP TABLE `testDb`.`table1`", stmt.toSql());
     }
 
     @Test(expected = AnalysisException.class)

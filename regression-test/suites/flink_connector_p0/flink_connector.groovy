@@ -19,7 +19,8 @@
 // /testing/trino-product-tests/src/main/resources/sql-tests/testcases/tpcds
 // and modified by Doris.
 
-
+import static java.util.concurrent.TimeUnit.SECONDS
+import org.awaitility.Awaitility
 
 suite("flink_connector") {
 
@@ -30,12 +31,27 @@ suite("flink_connector") {
     def delete_local_spark_jar = "rm -rf flink-doris-demo.jar".execute()
     logger.info("start download flink doris demo ...")
     logger.info("getS3Url ==== ${getS3Url()}")
-    def download_spark_jar = "curl ${getS3Url()}/regression/flink-doris-demo.jar --output flink-doris-demo.jar".execute().getText()
-    logger.info("finish download spark doris demo ...")
+    def download_spark_jar = "wget --quiet --continue --tries=3 ${getS3Url()}/regression/flink-doris-demo.jar".execute().getText()
+    def file = new File('flink-doris-demo.jar')
+    if (file.exists()) {
+        def fileSize = file.length()
+        assertEquals(fileSize, 167461032)
+        logger.info("finish download spark doris demo ...")
+    } else {
+        logger.info("flink-doris-demo.jar 文件不存在, 忽略")
+        return
+    }
+
     def run_cmd = "java -cp flink-doris-demo.jar com.doris.DorisFlinkDfSinkDemo $context.config.feHttpAddress regression_test_flink_connector_p0.$tableName $context.config.feHttpUser"
     logger.info("run_cmd : $run_cmd")
     def run_flink_jar = run_cmd.execute().getText()
     logger.info("result: $run_flink_jar")
+    // The publish in the commit phase is asynchronous
+    Awaitility.await().atMost(30, SECONDS).pollInterval(1, SECONDS).await().until(
+            {
+                def result = sql """ select count(1) from $tableName"""
+                logger.info("retry count: $result")
+                result.size() >= 1
+            })
     qt_select """ select * from $tableName order by order_id"""
-
 }

@@ -20,6 +20,7 @@ package org.apache.doris.nereids.stats;
 import org.apache.doris.common.IdGenerator;
 import org.apache.doris.nereids.memo.Group;
 import org.apache.doris.nereids.memo.GroupId;
+import org.apache.doris.nereids.properties.DataTrait;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.trees.expressions.EqualTo;
 import org.apache.doris.nereids.trees.expressions.Slot;
@@ -54,15 +55,13 @@ public class JoinEstimateTest {
         EqualTo eq = new EqualTo(a, b);
         Statistics leftStats = new StatisticsBuilder().setRowCount(100).build();
         leftStats.addColumnStats(a,
-                new ColumnStatisticBuilder()
-                        .setCount(100)
+                new ColumnStatisticBuilder(100)
                         .setNdv(10)
                         .build()
         );
         Statistics rightStats = new StatisticsBuilder().setRowCount(80).build();
         rightStats.addColumnStats(b,
-                new ColumnStatisticBuilder()
-                        .setCount(80)
+                new ColumnStatisticBuilder(80)
                         .setNdv(5)
                         .build()
         );
@@ -73,16 +72,16 @@ public class JoinEstimateTest {
                     public List<Slot> get() {
                         return Lists.newArrayList(a);
                     }
-                })));
+                }, () -> DataTrait.EMPTY_TRAIT)));
         GroupPlan right = new GroupPlan(new Group(idGenerator.getNextId(), new LogicalProperties(
                 new Supplier<List<Slot>>() {
                     @Override
                     public List<Slot> get() {
                         return Lists.newArrayList(b);
                     }
-                })));
+                }, () -> DataTrait.EMPTY_TRAIT)));
         LogicalJoin join = new LogicalJoin(JoinType.INNER_JOIN, Lists.newArrayList(eq),
-                left, right);
+                left, right, null);
         Statistics outputStats = JoinEstimation.estimate(leftStats, rightStats, join);
         ColumnStatistic outAStats = outputStats.findColumnStatistics(a);
         Assertions.assertNotNull(outAStats);
@@ -90,5 +89,56 @@ public class JoinEstimateTest {
         ColumnStatistic outBStats = outputStats.findColumnStatistics(b);
         Assertions.assertNotNull(outAStats);
         Assertions.assertEquals(5, outBStats.ndv);
+    }
+
+    @Test
+    public void testOuterJoinStats() {
+        SlotReference a = new SlotReference("a", IntegerType.INSTANCE);
+        SlotReference b = new SlotReference("b", IntegerType.INSTANCE);
+        SlotReference c = new SlotReference("c", IntegerType.INSTANCE);
+        EqualTo eq = new EqualTo(a, b);
+        Statistics leftStats = new StatisticsBuilder().setRowCount(100).build();
+        leftStats.addColumnStats(a,
+                new ColumnStatisticBuilder(100)
+                        .setNdv(10)
+                        .build()
+        );
+        Statistics rightStats = new StatisticsBuilder().setRowCount(80).build();
+        rightStats.addColumnStats(b,
+                new ColumnStatisticBuilder(80)
+                        .setNdv(0)
+                        .build()
+        ).addColumnStats(c,
+                new ColumnStatisticBuilder(80)
+                        .setNdv(20)
+                        .build()
+        );
+        IdGenerator<GroupId> idGenerator = GroupId.createGenerator();
+        GroupPlan left = new GroupPlan(new Group(idGenerator.getNextId(), new LogicalProperties(
+                new Supplier<List<Slot>>() {
+                    @Override
+                    public List<Slot> get() {
+                        return Lists.newArrayList(a);
+                    }
+                }, () -> DataTrait.EMPTY_TRAIT)));
+        GroupPlan right = new GroupPlan(new Group(idGenerator.getNextId(), new LogicalProperties(
+                new Supplier<List<Slot>>() {
+                    @Override
+                    public List<Slot> get() {
+                        return Lists.newArrayList(b, c);
+                    }
+                }, () -> DataTrait.EMPTY_TRAIT)));
+        LogicalJoin join = new LogicalJoin(JoinType.LEFT_OUTER_JOIN, Lists.newArrayList(eq),
+                left, right, null);
+        Statistics outputStats = JoinEstimation.estimate(leftStats, rightStats, join);
+        ColumnStatistic outAStats = outputStats.findColumnStatistics(a);
+        Assertions.assertNotNull(outAStats);
+        Assertions.assertEquals(10, outAStats.ndv);
+        ColumnStatistic outBStats = outputStats.findColumnStatistics(b);
+        Assertions.assertNotNull(outAStats);
+        Assertions.assertEquals(0, outBStats.ndv);
+        ColumnStatistic outCStats = outputStats.findColumnStatistics(c);
+        Assertions.assertNotNull(outAStats);
+        Assertions.assertEquals(20.0, outCStats.ndv);
     }
 }

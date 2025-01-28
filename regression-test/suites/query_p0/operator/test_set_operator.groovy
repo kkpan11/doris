@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_set_operators", "query,p0") {
+suite("test_set_operators", "query,p0,arrow_flight_sql") {
 
     sql """
         DROP TABLE IF EXISTS t1;
@@ -74,6 +74,7 @@ suite("test_set_operators", "query,p0") {
     sql """insert into t2 values('6',5,3,4);"""
     sql """insert into t2 values('9',8,0,7);"""
 
+    sql 'sync'
     order_qt_select """
         select
             col1
@@ -87,5 +88,13 @@ suite("test_set_operators", "query,p0") {
         full join
             t3 
             on t2.col1=t3.col1;
+    """
+
+    order_qt_select_minus """
+        select col1, col1 from t1 minus select col1, col1 from t2;
+    """
+
+    order_qt_select_except """
+        select col1, col1 from t1 except select col1, col1 from t2;
     """
 }

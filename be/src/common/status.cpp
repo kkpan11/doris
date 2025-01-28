@@ -17,40 +17,11 @@
 #include "service/backend_options.h"
 
 namespace doris {
+namespace ErrorCode {
 
-Status::Status(const TStatus& s) {
-    _code = static_cast<int>(s.status_code);
-    if (_code != ErrorCode::OK) {
-        if (!s.error_msgs.empty()) {
-            if (_err_msg == nullptr) {
-                _err_msg = std::make_unique<ErrMsg>();
-            }
-            _err_msg->_msg = s.error_msgs[0];
-#ifdef ENABLE_STACKTRACE
-            _err_msg->_stack = "";
-#endif
-        }
-    } else {
-        _err_msg.reset();
-    }
-}
-
-Status::Status(const PStatus& s) {
-    _code = s.status_code();
-    if (_code != ErrorCode::OK) {
-        if (s.error_msgs_size() > 0) {
-            if (_err_msg == nullptr) {
-                _err_msg = std::make_unique<ErrMsg>();
-            }
-            _err_msg->_msg = s.error_msgs(0);
-#ifdef ENABLE_STACKTRACE
-            _err_msg->_stack = "";
-#endif
-        }
-    } else {
-        _err_msg.reset();
-    }
-}
+ErrorCodeState error_states[MAX_ERROR_CODE_DEFINE_NUM];
+ErrorCodeInitializer error_code_init(10);
+} // namespace ErrorCode
 
 void Status::to_thrift(TStatus* s) const {
     s->error_msgs.clear();
@@ -58,7 +29,18 @@ void Status::to_thrift(TStatus* s) const {
         s->status_code = TStatusCode::OK;
         return;
     }
+    // Currently, there are many error codes, not defined in thrift and need pass to FE.
+    // DCHECK(_code > 0)
+    //        << "The error code has to > 0 because TStatusCode need it > 0, it's actual value is "
+    //        << _code;
     s->status_code = (int16_t)_code > 0 ? (TStatusCode::type)_code : TStatusCode::INTERNAL_ERROR;
+
+    if (_code == ErrorCode::VERSION_ALREADY_MERGED) {
+        s->status_code = TStatusCode::OLAP_ERR_VERSION_ALREADY_MERGED;
+    } else if (_code == ErrorCode::TABLE_NOT_FOUND) {
+        s->status_code = TStatusCode::TABLET_MISSING;
+    }
+
     s->error_msgs.push_back(fmt::format("({})[{}]{}", BackendOptions::get_localhost(),
                                         code_as_string(), _err_msg ? _err_msg->_msg : ""));
     s->__isset.error_msgs = true;
@@ -73,7 +55,7 @@ TStatus Status::to_thrift() const {
 void Status::to_protobuf(PStatus* s) const {
     s->clear_error_msgs();
     s->set_status_code((int)_code);
-    if (!ok() && _err_msg) {
+    if (!ok()) {
         s->add_error_msgs(fmt::format("({})[{}]{}", BackendOptions::get_localhost(),
                                       code_as_string(), _err_msg ? _err_msg->_msg : ""));
     }

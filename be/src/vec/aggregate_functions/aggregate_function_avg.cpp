@@ -25,6 +25,7 @@
 #include "vec/core/field.h"
 
 namespace doris::vectorized {
+#include "common/compile_check_begin.h"
 
 template <typename T>
 struct Avg {
@@ -35,7 +36,27 @@ struct Avg {
 template <typename T>
 using AggregateFuncAvg = typename Avg<T>::Function;
 
+template <typename T>
+struct AvgDecimal256 {
+    using FieldType = typename AvgNearestFieldTypeTrait256<T>::Type;
+    using Function = AggregateFunctionAvg<T, AggregateFunctionAvgData<FieldType>>;
+};
+
+template <typename T>
+using AggregateFuncAvgDecimal256 = typename AvgDecimal256<T>::Function;
+
 void register_aggregate_function_avg(AggregateFunctionSimpleFactory& factory) {
-    factory.register_function_both("avg", creator_with_type::creator<AggregateFuncAvg>);
+    AggregateFunctionCreator creator = [&](const std::string& name, const DataTypes& types,
+                                           const bool result_is_nullable,
+                                           const AggregateFunctionAttr& attr) {
+        if (attr.enable_decimal256) {
+            return creator_with_type::creator<AggregateFuncAvgDecimal256>(name, types,
+                                                                          result_is_nullable, attr);
+        } else {
+            return creator_with_type::creator<AggregateFuncAvg>(name, types, result_is_nullable,
+                                                                attr);
+        }
+    };
+    factory.register_function_both("avg", creator);
 }
 } // namespace doris::vectorized

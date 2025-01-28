@@ -22,24 +22,26 @@ suite("test_nereids_row_policy") {
     def tokens = context.config.jdbcUrl.split('/')
     def url=tokens[0] + "//" + tokens[2] + "/" + dbName + "?"
 
+    def cloudMode = isCloudMode()
+    //cloud-mode
+    if (cloudMode) {
+        def clusters = sql " SHOW CLUSTERS; "
+        assertTrue(!clusters.isEmpty())
+        def validCluster = clusters[0][0]
+        sql """GRANT USAGE_PRIV ON CLUSTER `${validCluster}` TO ${user}""";
+    }
+
     def assertQueryResult = { size ->
-        def result1 = connect(user=user, password='123abc!@#', url=url) {
-            sql "set enable_nereids_planner = false"
+        def result = connect(user, '123abc!@#', url) {
             sql "SELECT * FROM ${tableName}"
         }
-        def result2 = connect(user=user, password='123abc!@#', url=url) {
-            sql "set enable_nereids_planner = true"
-            sql "set enable_fallback_to_original_planner = false"
-            sql "SELECT * FROM ${tableName}"
+        connect(user, '123abc!@#', url) {
+            test {
+                sql "SELECT * FROM ${viewName}"
+                exception "does not have privilege for"
+            }
         }
-        def result3 = connect(user=user, password='123abc!@#', url=url) {
-            sql "set enable_nereids_planner = true"
-            sql "set enable_fallback_to_original_planner = false"
-            sql "SELECT * FROM ${viewName}"
-        }
-        assertEquals(size, result1.size())
-        assertEquals(size, result2.size())
-        assertEquals(size, result3.size())
+        assertEquals(size, result.size())
     }
 
     def createPolicy = { name, predicate, type ->
@@ -79,6 +81,20 @@ suite("test_nereids_row_policy") {
     sql "CREATE USER ${user} IDENTIFIED BY '123abc!@#'"
     sql "GRANT SELECT_PRIV ON internal.${dbName}.${tableName} TO ${user}"
 
+    sql 'sync'
+
+    //cloud-mode
+    if (cloudMode) {
+        def clusters = sql " SHOW CLUSTERS; "
+        assertTrue(!clusters.isEmpty())
+        def validCluster = clusters[0][0]
+        sql """GRANT USAGE_PRIV ON CLUSTER `${validCluster}` TO ${user}""";
+    }
+
+    dropPolciy "policy0"
+    dropPolciy "policy1"
+    dropPolciy "policy2"
+    dropPolciy "policy3"
 
     // no policy
     assertQueryResult 3
@@ -103,4 +119,8 @@ suite("test_nereids_row_policy") {
     createPolicy"policy3", "k = 2", "PERMISSIVE"
     assertQueryResult 2
 
+    dropPolciy "policy0"
+    dropPolciy "policy1"
+    dropPolciy "policy2"
+    dropPolciy "policy3"
 }

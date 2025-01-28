@@ -27,6 +27,7 @@
 
 #include "common/status.h"
 #include "io/fs/file_reader_writer_fwd.h"
+#include "olap/olap_common.h"
 #include "olap/rowset/segment_v2/common.h"
 #include "olap/rowset/segment_v2/index_page.h"
 #include "olap/rowset/segment_v2/page_handle.h"
@@ -46,16 +47,23 @@ namespace segment_v2 {
 class EncodingInfo;
 
 // thread-safe reader for IndexedColumn (see comments of `IndexedColumnWriter` to understand what IndexedColumn is)
-class IndexedColumnReader {
+class IndexedColumnReader : public MetadataAdder<IndexedColumnReader> {
 public:
     explicit IndexedColumnReader(io::FileReaderSPtr file_reader, const IndexedColumnMetaPB& meta)
-            : _file_reader(std::move(file_reader)), _meta(meta) {}
+            : _file_reader(std::move(file_reader)), _meta(meta) {
+        _ordinal_index_reader = std::make_unique<IndexPageReader>();
+        _value_index_reader = std::make_unique<IndexPageReader>();
+    }
 
-    Status load(bool use_page_cache, bool kept_in_memory);
+    ~IndexedColumnReader() override;
+
+    Status load(bool use_page_cache, bool kept_in_memory,
+                OlapReaderStatistics* index_load_stats = nullptr);
 
     // read a page specified by `pp' from `file' into `handle'
     Status read_page(const PagePointer& pp, PageHandle* handle, Slice* body, PageFooterPB* footer,
-                     PageTypePB type, BlockCompressionCodec* codec, bool pre_decode) const;
+                     PageTypePB type, BlockCompressionCodec* codec, bool pre_decode,
+                     OlapReaderStatistics* stats = nullptr) const;
 
     int64_t num_values() const { return _num_values; }
     const EncodingInfo* encoding_info() const { return _encoding_info; }
@@ -68,7 +76,10 @@ public:
     void set_is_pk_index(bool is_pk) { _is_pk_index = is_pk; }
 
 private:
-    Status load_index_page(const PagePointerPB& pp, PageHandle* handle, IndexPageReader* reader);
+    Status load_index_page(const PagePointerPB& pp, PageHandle* handle, IndexPageReader* reader,
+                           OlapReaderStatistics* index_load_stats);
+
+    int64_t get_metadata_size() const override;
 
     friend class IndexedColumnIterator;
 
@@ -83,8 +94,8 @@ private:
     bool _has_index_page = false;
     // valid only when the column contains only one data page
     PagePointer _sole_data_page;
-    IndexPageReader _ordinal_index_reader;
-    IndexPageReader _value_index_reader;
+    std::unique_ptr<IndexPageReader> _ordinal_index_reader;
+    std::unique_ptr<IndexPageReader> _value_index_reader;
     PageHandle _ordinal_index_page_handle;
     PageHandle _value_index_page_handle;
 
@@ -97,13 +108,15 @@ private:
 
 class IndexedColumnIterator {
 public:
-    explicit IndexedColumnIterator(const IndexedColumnReader* reader)
+    explicit IndexedColumnIterator(const IndexedColumnReader* reader,
+                                   OlapReaderStatistics* stats = nullptr)
             : _reader(reader),
-              _ordinal_iter(&reader->_ordinal_index_reader),
-              _value_iter(&reader->_value_index_reader) {}
+              _ordinal_iter(reader->_ordinal_index_reader.get()),
+              _value_iter(reader->_value_index_reader.get()),
+              _stats(stats) {}
 
     // Seek to the given ordinal entry. Entry 0 is the first entry.
-    // Return NotFound if provided seek point is past the end.
+    // Return Status::Error<ENTRY_NOT_FOUND> if provided seek point is past the end.
     // Return NotSupported for column without ordinal index.
     Status seek_to_ordinal(ordinal_t idx);
 
@@ -114,7 +127,7 @@ public:
     // Sets *exact_match to indicate whether the seek found the exact
     // key requested.
     //
-    // Return NotFound if the given key is greater than all keys in this column.
+    // Return Status::Error<ENTRY_NOT_FOUND> if the given key is greater than all keys in this column.
     // Return NotSupported for column without value index.
     Status seek_at_or_after(const void* key, bool* exact_match);
     Status seek_at_or_after(const std::string* key, bool* exact_match) {
@@ -134,7 +147,7 @@ public:
 private:
     Status _read_data_page(const PagePointer& pp);
 
-    const IndexedColumnReader* _reader;
+    const IndexedColumnReader* _reader = nullptr;
     // iterator for ordinal index page
     IndexPageIterator _ordinal_iter;
     // iterator for value index page
@@ -149,6 +162,7 @@ private:
     ordinal_t _current_ordinal = 0;
     // iterator owned compress codec, should NOT be shared by threads, initialized before used
     BlockCompressionCodec* _compress_codec = nullptr;
+    OlapReaderStatistics* _stats = nullptr;
 };
 
 } // namespace segment_v2

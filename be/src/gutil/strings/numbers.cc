@@ -19,16 +19,19 @@
 #include <limits>
 #include <ostream>
 
+#include "common/exception.h"
+
 using std::numeric_limits;
 #include <string>
 
 using std::string;
 
-#include "common/logging.h"
+#include <fmt/compile.h>
 #include <fmt/format.h>
 
+#include "common/logging.h"
+
 #include "gutil/gscoped_ptr.h"
-#include "gutil/int128.h"
 #include "gutil/integral_types.h"
 #include "gutil/stringprintf.h"
 #include "gutil/strings/ascii_ctype.h"
@@ -466,15 +469,6 @@ string Uint64ToString(uint64 fp) {
     snprintf(buf, sizeof(buf), "%016" PRIx64, fp);
     return string(buf);
 }
-
-// Default arguments
-string Uint128ToHexString(uint128 ui128) {
-    char buf[33];
-    snprintf(buf, sizeof(buf), "%016" PRIx64, Uint128High64(ui128));
-    snprintf(buf + 16, sizeof(buf) - 16, "%016" PRIx64, Uint128Low64(ui128));
-    return string(buf);
-}
-
 namespace {
 
 // Represents integer values of digits.
@@ -780,8 +774,8 @@ uint64 atoi_kmgt(const char* s) {
             scale = GG_ULONGLONG(1) << 40;
             break;
         default:
-            LOG(FATAL) << "Invalid mnemonic: `" << c << "';"
-                       << " should be one of `K', `M', `G', and `T'.";
+            throw doris::Exception(doris::Status::FatalError(
+                    "Invalid mnemonic: `{}'; should be one of `K', `M', `G', and `T'.", c));
         }
     }
     return n * scale;
@@ -1275,24 +1269,14 @@ int FloatToBuffer(float value, int width, char* buffer) {
 }
 
 int FastDoubleToBuffer(double value, char* buffer) {
-    auto end = fmt::format_to(buffer, "{:.15g}", value);
+    auto end = fmt::format_to(buffer, FMT_COMPILE("{}"), value);
     *end = '\0';
-    if (strtod(buffer, nullptr) != value) {
-        end = fmt::format_to(buffer, "{:.17g}", value);
-    }
     return end - buffer;
 }
 
 int FastFloatToBuffer(float value, char* buffer) {
-    auto end = fmt::format_to(buffer, "{:.6g}", value);
+    auto* end = fmt::format_to(buffer, FMT_COMPILE("{}"), value);
     *end = '\0';
-#ifdef _MSC_VER // has no strtof()
-    if (strtod(buffer, nullptr) != value) {
-#else
-    if (strtof(buffer, nullptr) != value) {
-#endif
-        end = fmt::format_to(buffer, "{:.8g}", value);
-    }
     return end - buffer;
 }
 

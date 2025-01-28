@@ -20,15 +20,32 @@
 #include <gen_cpp/olap_file.pb.h>
 
 #include "olap/olap_define.h"
+#include "olap/segment_loader.h"
 #include "olap/tablet_schema.h"
 #include "util/time.h"
+#include "util/trace.h"
 
 namespace doris {
 
-Rowset::Rowset(const TabletSchemaSPtr& schema, const std::string& tablet_path,
-               const RowsetMetaSharedPtr& rowset_meta)
-        : _tablet_path(tablet_path), _rowset_meta(rowset_meta), _refs_by_reader(0) {
-    _is_pending = !_rowset_meta->has_version();
+Rowset::Rowset(const TabletSchemaSPtr& schema, RowsetMetaSharedPtr rowset_meta,
+               std::string tablet_path)
+        : _rowset_meta(std::move(rowset_meta)),
+          _tablet_path(std::move(tablet_path)),
+          _refs_by_reader(0) {
+#ifndef BE_TEST
+    DCHECK(!is_local() || !_tablet_path.empty()); // local rowset MUST has tablet path
+#endif
+
+    _is_pending = true;
+
+    // Generally speaking, as long as a rowset has a version, it can be considered not to be in a pending state.
+    // However, if the rowset was created through ingesting binlogs, it will have a version but should still be
+    // considered in a pending state because the ingesting txn has not yet been committed.
+    if (_rowset_meta->has_version() && _rowset_meta->start_version() > 0 &&
+        _rowset_meta->rowset_state() != COMMITTED) {
+        _is_pending = false;
+    }
+
     if (_is_pending) {
         _is_cumulative = false;
     } else {
@@ -50,8 +67,6 @@ Status Rowset::load(bool use_cache) {
         std::lock_guard load_lock(_lock);
         // after lock, if rowset state is ROWSET_UNLOADING, it is ok to return
         if (_rowset_state_machine.rowset_state() == ROWSET_UNLOADED) {
-            // first do load, then change the state
-            RETURN_IF_ERROR(do_load(use_cache));
             RETURN_IF_ERROR(_rowset_state_machine.on_load());
         }
     }
@@ -76,21 +91,67 @@ void Rowset::make_visible(Version version) {
     }
 }
 
+void Rowset::set_version(Version version) {
+    _rowset_meta->set_version(version);
+}
+
 bool Rowset::check_rowset_segment() {
     std::lock_guard load_lock(_lock);
     return check_current_rowset_segment();
 }
 
-void Rowset::merge_rowset_meta(const RowsetMetaSharedPtr& other) {
-    _rowset_meta->set_num_segments(num_segments() + other->num_segments());
-    _rowset_meta->set_num_rows(num_rows() + other->num_rows());
-    _rowset_meta->set_data_disk_size(data_disk_size() + other->data_disk_size());
-    _rowset_meta->set_index_disk_size(index_disk_size() + other->index_disk_size());
-    std::vector<KeyBoundsPB> key_bounds;
-    other->get_segments_key_bounds(&key_bounds);
-    for (auto key_bound : key_bounds) {
-        _rowset_meta->add_segment_key_bounds(key_bound);
+std::string Rowset::get_rowset_info_str() {
+    std::string disk_size = PrettyPrinter::print(
+            static_cast<uint64_t>(_rowset_meta->total_disk_size()), TUnit::BYTES);
+    return fmt::format("[{}-{}] {} {} {} {} {}", start_version(), end_version(), num_segments(),
+                       _rowset_meta->has_delete_predicate() ? "DELETE" : "DATA",
+                       SegmentsOverlapPB_Name(_rowset_meta->segments_overlap()),
+                       rowset_id().to_string(), disk_size);
+}
+
+void Rowset::clear_cache() {
+    {
+        SCOPED_SIMPLE_TRACE_IF_TIMEOUT(std::chrono::seconds(1));
+        SegmentLoader::instance()->erase_segments(rowset_id(), num_segments());
     }
+    {
+        SCOPED_SIMPLE_TRACE_IF_TIMEOUT(std::chrono::seconds(1));
+        clear_inverted_index_cache();
+    }
+}
+
+Result<std::string> Rowset::segment_path(int64_t seg_id) {
+    if (is_local()) {
+        return local_segment_path(_tablet_path, _rowset_meta->rowset_id().to_string(), seg_id);
+    }
+
+    return _rowset_meta->remote_storage_resource().transform([=, this](auto&& storage_resource) {
+        return storage_resource->remote_segment_path(_rowset_meta->tablet_id(),
+                                                     _rowset_meta->rowset_id().to_string(), seg_id);
+    });
+}
+
+Status check_version_continuity(const std::vector<RowsetSharedPtr>& rowsets) {
+    if (rowsets.size() < 2) {
+        return Status::OK();
+    }
+    auto prev = rowsets.begin();
+    for (auto it = rowsets.begin() + 1; it != rowsets.end(); ++it) {
+        if ((*prev)->end_version() + 1 != (*it)->start_version()) {
+            return Status::InternalError("versions are not continuity: prev={} cur={}",
+                                         (*prev)->version().to_string(),
+                                         (*it)->version().to_string());
+        }
+        prev = it;
+    }
+    return Status::OK();
+}
+
+void Rowset::merge_rowset_meta(const RowsetMeta& other) {
+    _rowset_meta->merge_rowset_meta(other);
+    // rowset->meta_meta()->tablet_schema() maybe updated so make sure _schema is
+    // consistent with rowset meta
+    _schema = _rowset_meta->tablet_schema();
 }
 
 } // namespace doris

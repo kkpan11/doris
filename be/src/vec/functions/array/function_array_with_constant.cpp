@@ -23,7 +23,6 @@
 #include <utility>
 #include <vector>
 
-// IWYU pragma: no_include <opentelemetry/common/threadlocal.h>
 #include "common/compiler_util.h" // IWYU pragma: keep
 #include "common/status.h"
 #include "runtime/thread_context.h"
@@ -49,6 +48,7 @@ class Block;
 } // namespace doris
 
 namespace doris::vectorized {
+#include "common/compile_check_begin.h"
 
 /* array_with_constant(num, T) / array_repeat(T, num)  - return array of constants with length num.
  * array_with_constant(2, 'xxx') = ['xxx', 'xxx']
@@ -76,7 +76,7 @@ public:
     }
 
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t input_rows_count) override {
+                        uint32_t result, size_t input_rows_count) const override {
         auto num = block.get_by_position(arguments[FunctionType::param_num_idx])
                            .column->convert_to_full_column_if_const();
         num = num->is_nullable()
@@ -90,20 +90,21 @@ public:
         ColumnArray::Offset64 offset = 0;
         std::vector<uint32_t> array_sizes;
         array_sizes.reserve(input_rows_count);
-        for (size_t i = 0; i < input_rows_count; ++i) {
+        // The array size will never gt int max value.
+        for (int i = 0; i < input_rows_count; ++i) {
             auto array_size = num->get_int(i);
-            if (UNLIKELY(array_size < 0)) {
-                return Status::RuntimeError("Array size can not be negative in function:" +
-                                            get_name());
+            if (UNLIKELY(array_size < 0) || UNLIKELY(array_size > max_array_size_as_field)) {
+                return Status::InvalidArgument("Array size should in range(0, {}) in function: {}",
+                                               max_array_size_as_field, get_name());
             }
             offset += array_size;
             offsets.push_back(offset);
-            array_sizes.push_back(array_size);
+            array_sizes.resize(array_sizes.size() + array_size, i);
         }
         auto clone = value->clone_empty();
         clone->reserve(input_rows_count);
-        RETURN_IF_CATCH_EXCEPTION(
-                value->replicate(array_sizes.data(), offset, *clone->assume_mutable().get()));
+        clone->assume_mutable()->insert_indices_from(*value, array_sizes.data(),
+                                                     array_sizes.data() + offset);
         if (!clone->is_nullable()) {
             clone = ColumnNullable::create(std::move(clone), ColumnUInt8::create(clone->size(), 0));
         }
@@ -133,5 +134,5 @@ void register_function_array_with_constant(SimpleFunctionFactory& factory) {
     factory.register_function<FunctionArrayWithConstant<NameArrayWithConstant>>();
     factory.register_function<FunctionArrayWithConstant<NameArrayRepeat>>();
 }
-
+#include "common/compile_check_end.h"
 } // namespace doris::vectorized

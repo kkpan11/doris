@@ -16,6 +16,7 @@
 // under the License.
 
 import org.codehaus.groovy.runtime.IOGroovyMethods
+import org.awaitility.Awaitility
 
 suite("test_compaction_uniq_keys") {
     def tableName = "compaction_uniq_keys_regression_test"
@@ -27,17 +28,8 @@ suite("test_compaction_uniq_keys") {
         getBackendIpHttpPort(backendId_to_backendIP, backendId_to_backendHttpPort);
 
         backend_id = backendId_to_backendIP.keySet()[0]
-        StringBuilder showConfigCommand = new StringBuilder();
-        showConfigCommand.append("curl -X GET http://")
-        showConfigCommand.append(backendId_to_backendIP.get(backend_id))
-        showConfigCommand.append(":")
-        showConfigCommand.append(backendId_to_backendHttpPort.get(backend_id))
-        showConfigCommand.append("/api/show_config")
-        logger.info(showConfigCommand.toString())
-        def process = showConfigCommand.toString().execute()
-        int code = process.waitFor()
-        String err = IOGroovyMethods.getText(new BufferedReader(new InputStreamReader(process.getErrorStream())));
-        String out = process.getText()
+        def (code, out, err) = show_be_config(backendId_to_backendIP.get(backend_id), backendId_to_backendHttpPort.get(backend_id))
+
         logger.info("Show config: code=" + code + ", out=" + out + ", err=" + err)
         assertEquals(code, 0)
         def configList = parseJson(out.trim())
@@ -109,80 +101,18 @@ suite("test_compaction_uniq_keys") {
         qt_select_default """ SELECT * FROM ${tableName} t ORDER BY user_id; """
 
         //TabletId,ReplicaId,BackendId,SchemaHash,Version,LstSuccessVersion,LstFailedVersion,LstFailedTime,LocalDataSize,RemoteDataSize,RowCount,State,LstConsistencyCheckTime,CheckVersion,VersionCount,QueryHits,PathHash,MetaUrl,CompactionStatus
-        String[][] tablets = sql """ show tablets from ${tableName}; """
+        def tablets = sql_return_maparray """ show tablets from ${tableName}; """
 
         // trigger compactions for all tablets in ${tableName}
-        for (String[] tablet in tablets) {
-            String tablet_id = tablet[0]
-            backend_id = tablet[2]
-            StringBuilder sb = new StringBuilder();
-            sb.append("curl -X POST http://")
-            sb.append(backendId_to_backendIP.get(backend_id))
-            sb.append(":")
-            sb.append(backendId_to_backendHttpPort.get(backend_id))
-            sb.append("/api/compaction/run?tablet_id=")
-            sb.append(tablet_id)
-            sb.append("&compact_type=cumulative")
+        trigger_and_wait_compaction(tableName, "cumulative")
 
-            String command = sb.toString()
-            process = command.execute()
-            code = process.waitFor()
-            err = IOGroovyMethods.getText(new BufferedReader(new InputStreamReader(process.getErrorStream())));
-            out = process.getText()
-            logger.info("Run compaction: code=" + code + ", out=" + out + ", err=" + err)
-            assertEquals(code, 0)
-            def compactJson = parseJson(out.trim())
-            if (compactJson.status.toLowerCase() == "fail") {
-                assertEquals(disableAutoCompaction, false)
-                logger.info("Compaction was done automatically!")
-            }
-            if (disableAutoCompaction) {
-                assertEquals("success", compactJson.status.toLowerCase())
-            }
-        }
-
-        // wait for all compactions done
-        for (String[] tablet in tablets) {
-            boolean running = true
-            do {
-                Thread.sleep(1000)
-                String tablet_id = tablet[0]
-                backend_id = tablet[2]
-                StringBuilder sb = new StringBuilder();
-                sb.append("curl -X GET http://")
-                sb.append(backendId_to_backendIP.get(backend_id))
-                sb.append(":")
-                sb.append(backendId_to_backendHttpPort.get(backend_id))
-                sb.append("/api/compaction/run_status?tablet_id=")
-                sb.append(tablet_id)
-
-                String command = sb.toString()
-                logger.info(command)
-                process = command.execute()
-                code = process.waitFor()
-                err = IOGroovyMethods.getText(new BufferedReader(new InputStreamReader(process.getErrorStream())));
-                out = process.getText()
-                logger.info("Get compaction status: code=" + code + ", out=" + out + ", err=" + err)
-                assertEquals(code, 0)
-                def compactionStatus = parseJson(out.trim())
-                assertEquals("success", compactionStatus.status.toLowerCase())
-                running = compactionStatus.run_status
-            } while (running)
-        }
+        def replicaNum = get_table_replica_num(tableName)
+        logger.info("get table replica num: " + replicaNum)
 
         int rowCount = 0
-        for (String[] tablet in tablets) {
-            String tablet_id = tablet[0]
-            StringBuilder sb = new StringBuilder();
-            def compactionStatusUrlIndex = 18
-            sb.append("curl -X GET ")
-            sb.append(tablet[compactionStatusUrlIndex])
-            String command = sb.toString()
-            // wait for cleaning stale_rowsets
-            process = command.execute()
-            code = process.waitFor()
-            err = IOGroovyMethods.getText(new BufferedReader(new InputStreamReader(process.getErrorStream())));
-            out = process.getText()
+        for (def tablet in tablets) {
+            String tablet_id = tablet.TabletId
+            (code, out, err) = curl("GET", tablet.CompactionStatus)
             logger.info("Show tablets status: code=" + code + ", out=" + out + ", err=" + err)
             assertEquals(code, 0)
             def tabletJson = parseJson(out.trim())
@@ -191,7 +121,7 @@ suite("test_compaction_uniq_keys") {
                 rowCount += Integer.parseInt(rowset.split(" ")[1])
             }
         }
-        assert (rowCount < 8)
+        assert (rowCount < 8 * replicaNum)
         qt_select_default2 """ SELECT * FROM ${tableName} t ORDER BY user_id; """
     } finally {
         try_sql("DROP TABLE IF EXISTS ${tableName}")

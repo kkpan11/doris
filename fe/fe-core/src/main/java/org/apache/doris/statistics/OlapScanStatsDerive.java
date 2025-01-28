@@ -59,14 +59,14 @@ public class OlapScanStatsDerive extends BaseStatsDerive {
 
         Map<Id, ColumnStatistic> columnStatisticMap = new HashMap<>();
         Table table = scanNode.getOlapTable();
-        double rowCount = table.estimatedRowCount();
+        double rowCount = table.getRowCountForNereids();
         for (Map.Entry<Id, String> entry : slotIdToTableIdAndColumnName.entrySet()) {
             String colName = entry.getValue();
+            // TODO. Get index id for materialized view.
             ColumnStatistic statistic =
-                    Env.getCurrentEnv().getStatisticsCache().getColumnStatistics(table.getId(), colName);
-            if (!statistic.isUnKnown) {
-                rowCount = statistic.count;
-            }
+                    Env.getCurrentEnv().getStatisticsCache().getColumnStatistics(
+                        table.getDatabase().getCatalog().getId(),
+                        table.getDatabase().getId(), table.getId(), -1, colName);
             columnStatisticMap.put(entry.getKey(), statistic);
         }
         return new StatsDeriveResult(rowCount, columnStatisticMap);

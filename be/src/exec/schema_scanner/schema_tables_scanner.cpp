@@ -75,26 +75,26 @@ Status SchemaTablesScanner::start(RuntimeState* state) {
     }
     SCOPED_TIMER(_get_db_timer);
     TGetDbsParams db_params;
-    if (nullptr != _param->db) {
-        db_params.__set_pattern(*(_param->db));
+    if (nullptr != _param->common_param->db) {
+        db_params.__set_pattern(*(_param->common_param->db));
     }
-    if (nullptr != _param->catalog) {
-        db_params.__set_catalog(*(_param->catalog));
+    if (nullptr != _param->common_param->catalog) {
+        db_params.__set_catalog(*(_param->common_param->catalog));
     }
-    if (nullptr != _param->current_user_ident) {
-        db_params.__set_current_user_ident(*(_param->current_user_ident));
+    if (nullptr != _param->common_param->current_user_ident) {
+        db_params.__set_current_user_ident(*(_param->common_param->current_user_ident));
     } else {
-        if (nullptr != _param->user) {
-            db_params.__set_user(*(_param->user));
+        if (nullptr != _param->common_param->user) {
+            db_params.__set_user(*(_param->common_param->user));
         }
-        if (nullptr != _param->user_ip) {
-            db_params.__set_user_ip(*(_param->user_ip));
+        if (nullptr != _param->common_param->user_ip) {
+            db_params.__set_user_ip(*(_param->common_param->user_ip));
         }
     }
 
-    if (nullptr != _param->ip && 0 != _param->port) {
-        RETURN_IF_ERROR(
-                SchemaHelper::get_db_names(*(_param->ip), _param->port, db_params, &_db_result));
+    if (nullptr != _param->common_param->ip && 0 != _param->common_param->port) {
+        RETURN_IF_ERROR(SchemaHelper::get_db_names(
+                *(_param->common_param->ip), _param->common_param->port, db_params, &_db_result));
     } else {
         return Status::InternalError("IP or port doesn't exists");
     }
@@ -109,22 +109,23 @@ Status SchemaTablesScanner::_get_new_table() {
         table_params.__set_catalog(_db_result.catalogs[_db_index]);
     }
     _db_index++;
-    if (nullptr != _param->wild) {
-        table_params.__set_pattern(*(_param->wild));
+    if (nullptr != _param->common_param->wild) {
+        table_params.__set_pattern(*(_param->common_param->wild));
     }
-    if (nullptr != _param->current_user_ident) {
-        table_params.__set_current_user_ident(*(_param->current_user_ident));
+    if (nullptr != _param->common_param->current_user_ident) {
+        table_params.__set_current_user_ident(*(_param->common_param->current_user_ident));
     } else {
-        if (nullptr != _param->user) {
-            table_params.__set_user(*(_param->user));
+        if (nullptr != _param->common_param->user) {
+            table_params.__set_user(*(_param->common_param->user));
         }
-        if (nullptr != _param->user_ip) {
-            table_params.__set_user_ip(*(_param->user_ip));
+        if (nullptr != _param->common_param->user_ip) {
+            table_params.__set_user_ip(*(_param->common_param->user_ip));
         }
     }
 
-    if (nullptr != _param->ip && 0 != _param->port) {
-        RETURN_IF_ERROR(SchemaHelper::list_table_status(*(_param->ip), _param->port, table_params,
+    if (nullptr != _param->common_param->ip && 0 != _param->common_param->port) {
+        RETURN_IF_ERROR(SchemaHelper::list_table_status(*(_param->common_param->ip),
+                                                        _param->common_param->port, table_params,
                                                         &_table_result));
     } else {
         return Status::InternalError("IP or port doesn't exists");
@@ -149,9 +150,9 @@ Status SchemaTablesScanner::_fill_block_impl(vectorized::Block* block) {
             for (int i = 0; i < table_num; ++i) {
                 datas[i] = &str_slot;
             }
-            fill_dest_column_for_range(block, 0, datas);
+            RETURN_IF_ERROR(fill_dest_column_for_range(block, 0, datas));
         } else {
-            fill_dest_column_for_range(block, 0, null_datas);
+            RETURN_IF_ERROR(fill_dest_column_for_range(block, 0, null_datas));
         }
     }
     // schema
@@ -161,100 +162,112 @@ Status SchemaTablesScanner::_fill_block_impl(vectorized::Block* block) {
         for (int i = 0; i < table_num; ++i) {
             datas[i] = &str_slot;
         }
-        fill_dest_column_for_range(block, 1, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 1, datas));
     }
     // name
     {
-        StringRef strs[table_num];
+        std::vector<StringRef> strs(table_num);
         for (int i = 0; i < table_num; ++i) {
             const std::string* src = &_table_result.tables[i].name;
             strs[i] = StringRef(src->c_str(), src->size());
-            datas[i] = strs + i;
+            datas[i] = strs.data() + i;
         }
-        fill_dest_column_for_range(block, 2, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 2, datas));
     }
     // type
     {
-        StringRef strs[table_num];
+        std::vector<StringRef> strs(table_num);
         for (int i = 0; i < table_num; ++i) {
             const std::string* src = &_table_result.tables[i].type;
             strs[i] = StringRef(src->c_str(), src->size());
-            datas[i] = strs + i;
+            datas[i] = strs.data() + i;
         }
-        fill_dest_column_for_range(block, 3, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 3, datas));
     }
     // engine
     {
-        StringRef strs[table_num];
+        std::vector<StringRef> strs(table_num);
         for (int i = 0; i < table_num; ++i) {
             const TTableStatus& tbl_status = _table_result.tables[i];
             if (tbl_status.__isset.engine) {
                 const std::string* src = &tbl_status.engine;
                 strs[i] = StringRef(src->c_str(), src->size());
-                datas[i] = strs + i;
+                datas[i] = strs.data() + i;
             } else {
                 datas[i] = nullptr;
             }
         }
-        fill_dest_column_for_range(block, 4, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 4, datas));
     }
     // version
-    { fill_dest_column_for_range(block, 5, null_datas); }
+    { RETURN_IF_ERROR(fill_dest_column_for_range(block, 5, null_datas)); }
     // row_format
-    { fill_dest_column_for_range(block, 6, null_datas); }
+    { RETURN_IF_ERROR(fill_dest_column_for_range(block, 6, null_datas)); }
     // rows
     {
-        int64_t srcs[table_num];
+        std::vector<int64_t> srcs(table_num);
         for (int i = 0; i < table_num; ++i) {
             const TTableStatus& tbl_status = _table_result.tables[i];
             if (tbl_status.__isset.rows) {
                 srcs[i] = tbl_status.rows;
-                datas[i] = srcs + i;
+                datas[i] = srcs.data() + i;
             } else {
                 datas[i] = nullptr;
             }
         }
-        fill_dest_column_for_range(block, 7, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 7, datas));
     }
     // avg_row_length
     {
-        int64_t srcs[table_num];
+        std::vector<int64_t> srcs(table_num);
         for (int i = 0; i < table_num; ++i) {
             const TTableStatus& tbl_status = _table_result.tables[i];
             if (tbl_status.__isset.avg_row_length) {
                 srcs[i] = tbl_status.avg_row_length;
-                datas[i] = srcs + i;
+                datas[i] = srcs.data() + i;
             } else {
                 datas[i] = nullptr;
             }
         }
-        fill_dest_column_for_range(block, 8, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 8, datas));
     }
     // data_length
     {
-        int64_t srcs[table_num];
+        std::vector<int64_t> srcs(table_num);
         for (int i = 0; i < table_num; ++i) {
             const TTableStatus& tbl_status = _table_result.tables[i];
-            if (tbl_status.__isset.avg_row_length) {
+            if (tbl_status.__isset.data_length) {
                 srcs[i] = tbl_status.data_length;
-                datas[i] = srcs + i;
+                datas[i] = srcs.data() + i;
             } else {
                 datas[i] = nullptr;
             }
         }
-        fill_dest_column_for_range(block, 9, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 9, datas));
     }
     // max_data_length
-    { fill_dest_column_for_range(block, 10, null_datas); }
+    { RETURN_IF_ERROR(fill_dest_column_for_range(block, 10, null_datas)); }
     // index_length
-    { fill_dest_column_for_range(block, 11, null_datas); }
+    {
+        std::vector<int64_t> srcs(table_num);
+        for (int i = 0; i < table_num; ++i) {
+            const TTableStatus& tbl_status = _table_result.tables[i];
+            if (tbl_status.__isset.index_length) {
+                srcs[i] = tbl_status.index_length;
+                datas[i] = srcs.data() + i;
+            } else {
+                datas[i] = nullptr;
+            }
+        }
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 11, datas));
+    }
     // data_free
-    { fill_dest_column_for_range(block, 12, null_datas); }
+    { RETURN_IF_ERROR(fill_dest_column_for_range(block, 12, null_datas)); }
     // auto_increment
-    { fill_dest_column_for_range(block, 13, null_datas); }
+    { RETURN_IF_ERROR(fill_dest_column_for_range(block, 13, null_datas)); }
     // creation_time
     {
-        vectorized::VecDateTimeValue srcs[table_num];
+        std::vector<VecDateTimeValue> srcs(table_num);
         for (int i = 0; i < table_num; ++i) {
             const TTableStatus& tbl_status = _table_result.tables[i];
             if (tbl_status.__isset.create_time) {
@@ -263,17 +276,17 @@ Status SchemaTablesScanner::_fill_block_impl(vectorized::Block* block) {
                     datas[i] = nullptr;
                 } else {
                     srcs[i].from_unixtime(create_time, TimezoneUtils::default_time_zone);
-                    datas[i] = srcs + i;
+                    datas[i] = srcs.data() + i;
                 }
             } else {
                 datas[i] = nullptr;
             }
         }
-        fill_dest_column_for_range(block, 14, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 14, datas));
     }
     // update_time
     {
-        vectorized::VecDateTimeValue srcs[table_num];
+        std::vector<VecDateTimeValue> srcs(table_num);
         for (int i = 0; i < table_num; ++i) {
             const TTableStatus& tbl_status = _table_result.tables[i];
             if (tbl_status.__isset.update_time) {
@@ -282,17 +295,17 @@ Status SchemaTablesScanner::_fill_block_impl(vectorized::Block* block) {
                     datas[i] = nullptr;
                 } else {
                     srcs[i].from_unixtime(update_time, TimezoneUtils::default_time_zone);
-                    datas[i] = srcs + i;
+                    datas[i] = srcs.data() + i;
                 }
             } else {
                 datas[i] = nullptr;
             }
         }
-        fill_dest_column_for_range(block, 15, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 15, datas));
     }
     // check_time
     {
-        vectorized::VecDateTimeValue srcs[table_num];
+        std::vector<VecDateTimeValue> srcs(table_num);
         for (int i = 0; i < table_num; ++i) {
             const TTableStatus& tbl_status = _table_result.tables[i];
             if (tbl_status.__isset.last_check_time) {
@@ -301,47 +314,47 @@ Status SchemaTablesScanner::_fill_block_impl(vectorized::Block* block) {
                     datas[i] = nullptr;
                 } else {
                     srcs[i].from_unixtime(check_time, TimezoneUtils::default_time_zone);
-                    datas[i] = srcs + i;
+                    datas[i] = srcs.data() + i;
                 }
             } else {
                 datas[i] = nullptr;
             }
         }
-        fill_dest_column_for_range(block, 16, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 16, datas));
     }
     // collation
     {
-        StringRef strs[table_num];
+        std::vector<StringRef> strs(table_num);
         for (int i = 0; i < table_num; ++i) {
             const TTableStatus& tbl_status = _table_result.tables[i];
             if (tbl_status.__isset.collation) {
                 const std::string* src = &tbl_status.collation;
                 strs[i] = StringRef(src->c_str(), src->size());
-                datas[i] = strs + i;
+                datas[i] = strs.data() + i;
             } else {
                 datas[i] = nullptr;
             }
         }
-        fill_dest_column_for_range(block, 17, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 17, datas));
     }
     // checksum
-    { fill_dest_column_for_range(block, 18, null_datas); }
+    { RETURN_IF_ERROR(fill_dest_column_for_range(block, 18, null_datas)); }
     // create_options
-    { fill_dest_column_for_range(block, 19, null_datas); }
+    { RETURN_IF_ERROR(fill_dest_column_for_range(block, 19, null_datas)); }
     // create_comment
     {
-        StringRef strs[table_num];
+        std::vector<StringRef> strs(table_num);
         for (int i = 0; i < table_num; ++i) {
             const std::string* src = &_table_result.tables[i].comment;
             strs[i] = StringRef(src->c_str(), src->size());
-            datas[i] = strs + i;
+            datas[i] = strs.data() + i;
         }
-        fill_dest_column_for_range(block, 20, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 20, datas));
     }
     return Status::OK();
 }
 
-Status SchemaTablesScanner::get_next_block(vectorized::Block* block, bool* eos) {
+Status SchemaTablesScanner::get_next_block_internal(vectorized::Block* block, bool* eos) {
     if (!_is_init) {
         return Status::InternalError("Used before initialized.");
     }

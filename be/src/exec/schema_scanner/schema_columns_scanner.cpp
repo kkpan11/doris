@@ -30,6 +30,8 @@
 #include "vec/common/string_ref.h"
 
 namespace doris {
+#include "common/compile_check_begin.h"
+
 class RuntimeState;
 
 namespace vectorized {
@@ -78,26 +80,26 @@ Status SchemaColumnsScanner::start(RuntimeState* state) {
     }
     // get all database
     TGetDbsParams db_params;
-    if (nullptr != _param->db) {
-        db_params.__set_pattern(*(_param->db));
+    if (nullptr != _param->common_param->db) {
+        db_params.__set_pattern(*(_param->common_param->db));
     }
-    if (nullptr != _param->catalog) {
-        db_params.__set_catalog(*(_param->catalog));
+    if (nullptr != _param->common_param->catalog) {
+        db_params.__set_catalog(*(_param->common_param->catalog));
     }
-    if (nullptr != _param->current_user_ident) {
-        db_params.__set_current_user_ident(*_param->current_user_ident);
+    if (nullptr != _param->common_param->current_user_ident) {
+        db_params.__set_current_user_ident(*_param->common_param->current_user_ident);
     } else {
-        if (nullptr != _param->user) {
-            db_params.__set_user(*(_param->user));
+        if (nullptr != _param->common_param->user) {
+            db_params.__set_user(*(_param->common_param->user));
         }
-        if (nullptr != _param->user_ip) {
-            db_params.__set_user_ip(*(_param->user_ip));
+        if (nullptr != _param->common_param->user_ip) {
+            db_params.__set_user_ip(*(_param->common_param->user_ip));
         }
     }
 
-    if (nullptr != _param->ip && 0 != _param->port) {
-        RETURN_IF_ERROR(
-                SchemaHelper::get_db_names(*(_param->ip), _param->port, db_params, &_db_result));
+    if (nullptr != _param->common_param->ip && 0 != _param->common_param->port) {
+        RETURN_IF_ERROR(SchemaHelper::get_db_names(
+                *(_param->common_param->ip), _param->common_param->port, db_params, &_db_result));
     } else {
         return Status::InternalError("IP or port doesn't exists");
     }
@@ -138,6 +140,7 @@ std::string SchemaColumnsScanner::_to_mysql_data_type_string(TColumnDesc& desc) 
     case TPrimitiveType::DECIMAL32:
     case TPrimitiveType::DECIMAL64:
     case TPrimitiveType::DECIMAL128I:
+    case TPrimitiveType::DECIMAL256:
     case TPrimitiveType::DECIMALV2: {
         return "decimal";
     }
@@ -159,6 +162,12 @@ std::string SchemaColumnsScanner::_to_mysql_data_type_string(TColumnDesc& desc) 
     case TPrimitiveType::STRUCT: {
         return "struct";
     }
+    case TPrimitiveType::IPV4:
+        return "ipv4";
+    case TPrimitiveType::IPV6:
+        return "ipv6";
+    case TPrimitiveType::VARIANT:
+        return "variant";
     default:
         return "unknown";
     }
@@ -208,7 +217,8 @@ std::string SchemaColumnsScanner::_type_to_string(TColumnDesc& desc) {
     }
     case TPrimitiveType::DECIMAL32:
     case TPrimitiveType::DECIMAL64:
-    case TPrimitiveType::DECIMAL128I: {
+    case TPrimitiveType::DECIMAL128I:
+    case TPrimitiveType::DECIMAL256: {
         fmt::memory_buffer debug_string_buffer;
         fmt::format_to(
                 debug_string_buffer, "decimalv3({}, {})",
@@ -237,6 +247,45 @@ std::string SchemaColumnsScanner::_type_to_string(TColumnDesc& desc) {
     case TPrimitiveType::JSONB: {
         return "json";
     }
+    case TPrimitiveType::MAP: {
+        // for old be service we should compatible
+        std::string ret = "map<";
+        if (!desc.children.empty()) {
+            for (int i = 0; i < desc.children.size() - 1; ++i) {
+                ret += _type_to_string(desc.children[i]) + ",";
+            }
+            ret += _type_to_string(desc.children[desc.children.size() - 1]);
+        }
+        ret += ">";
+        return ret;
+    }
+    case TPrimitiveType::ARRAY: {
+        // for old be service we should compitable
+        std::string ret = "array<";
+        if (!desc.children.empty()) {
+            ret += _type_to_string(desc.children[0]);
+        }
+        ret += ">";
+        return ret;
+    }
+    case TPrimitiveType::STRUCT: {
+        // for old be service we should compitable
+        std::string ret = "struct<";
+        if (!desc.children.empty()) {
+            for (int i = 0; i < desc.children.size() - 1; ++i) {
+                ret += _type_to_string(desc.children[i]) + ",";
+            }
+            ret += _type_to_string(desc.children[desc.children.size() - 1]);
+        }
+        ret += ">";
+        return ret;
+    }
+    case TPrimitiveType::IPV4:
+        return "ipv4";
+    case TPrimitiveType::IPV6:
+        return "ipv6";
+    case TPrimitiveType::VARIANT:
+        return "variant";
     default:
         return "unknown";
     }
@@ -256,19 +305,20 @@ Status SchemaColumnsScanner::_get_new_desc() {
         desc_params.tables_name.push_back(_table_result.tables[_table_index++]);
     }
 
-    if (nullptr != _param->current_user_ident) {
-        desc_params.__set_current_user_ident(*(_param->current_user_ident));
+    if (nullptr != _param->common_param->current_user_ident) {
+        desc_params.__set_current_user_ident(*(_param->common_param->current_user_ident));
     } else {
-        if (nullptr != _param->user) {
-            desc_params.__set_user(*(_param->user));
+        if (nullptr != _param->common_param->user) {
+            desc_params.__set_user(*(_param->common_param->user));
         }
-        if (nullptr != _param->user_ip) {
-            desc_params.__set_user_ip(*(_param->user_ip));
+        if (nullptr != _param->common_param->user_ip) {
+            desc_params.__set_user_ip(*(_param->common_param->user_ip));
         }
     }
 
-    if (nullptr != _param->ip && 0 != _param->port) {
-        RETURN_IF_ERROR(SchemaHelper::describe_tables(*(_param->ip), _param->port, desc_params,
+    if (nullptr != _param->common_param->ip && 0 != _param->common_param->port) {
+        RETURN_IF_ERROR(SchemaHelper::describe_tables(*(_param->common_param->ip),
+                                                      _param->common_param->port, desc_params,
                                                       &_desc_result));
     } else {
         return Status::InternalError("IP or port doesn't exists");
@@ -285,22 +335,23 @@ Status SchemaColumnsScanner::_get_new_table() {
         table_params.__set_catalog(_db_result.catalogs[_db_index]);
     }
     _db_index++;
-    if (nullptr != _param->table) {
-        table_params.__set_pattern(*(_param->table));
+    if (nullptr != _param->common_param->table) {
+        table_params.__set_pattern(*(_param->common_param->table));
     }
-    if (nullptr != _param->current_user_ident) {
-        table_params.__set_current_user_ident(*(_param->current_user_ident));
+    if (nullptr != _param->common_param->current_user_ident) {
+        table_params.__set_current_user_ident(*(_param->common_param->current_user_ident));
     } else {
-        if (nullptr != _param->user) {
-            table_params.__set_user(*(_param->user));
+        if (nullptr != _param->common_param->user) {
+            table_params.__set_user(*(_param->common_param->user));
         }
-        if (nullptr != _param->user_ip) {
-            table_params.__set_user_ip(*(_param->user_ip));
+        if (nullptr != _param->common_param->user_ip) {
+            table_params.__set_user_ip(*(_param->common_param->user_ip));
         }
     }
 
-    if (nullptr != _param->ip && 0 != _param->port) {
-        RETURN_IF_ERROR(SchemaHelper::get_table_names(*(_param->ip), _param->port, table_params,
+    if (nullptr != _param->common_param->ip && 0 != _param->common_param->port) {
+        RETURN_IF_ERROR(SchemaHelper::get_table_names(*(_param->common_param->ip),
+                                                      _param->common_param->port, table_params,
                                                       &_table_result));
     } else {
         return Status::InternalError("IP or port doesn't exists");
@@ -309,7 +360,7 @@ Status SchemaColumnsScanner::_get_new_table() {
     return Status::OK();
 }
 
-Status SchemaColumnsScanner::get_next_block(vectorized::Block* block, bool* eos) {
+Status SchemaColumnsScanner::get_next_block_internal(vectorized::Block* block, bool* eos) {
     if (!_is_init) {
         return Status::InternalError("use this class before inited.");
     }
@@ -339,14 +390,14 @@ Status SchemaColumnsScanner::_fill_block_impl(vectorized::Block* block) {
     // TABLE_CATALOG
     {
         if (!_db_result.__isset.catalogs) {
-            fill_dest_column_for_range(block, 0, null_datas);
+            RETURN_IF_ERROR(fill_dest_column_for_range(block, 0, null_datas));
         } else {
             std::string catalog_name = _db_result.catalogs[_db_index - 1];
             StringRef str = StringRef(catalog_name.c_str(), catalog_name.size());
             for (int i = 0; i < columns_num; ++i) {
                 datas[i] = &str;
             }
-            fill_dest_column_for_range(block, 0, datas);
+            RETURN_IF_ERROR(fill_dest_column_for_range(block, 0, datas));
         }
     }
     // TABLE_SCHEMA
@@ -356,13 +407,13 @@ Status SchemaColumnsScanner::_fill_block_impl(vectorized::Block* block) {
         for (int i = 0; i < columns_num; ++i) {
             datas[i] = &str;
         }
-        fill_dest_column_for_range(block, 1, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 1, datas));
     }
     // TABLE_NAME
     {
-        StringRef strs[columns_num];
+        std::vector<StringRef> strs(columns_num);
         int offset_index = 0;
-        int cur_table_index = _table_index - _desc_result.tables_offset.size();
+        int cur_table_index = int(_table_index - _desc_result.tables_offset.size());
 
         for (int i = 0; i < columns_num; ++i) {
             while (_desc_result.tables_offset[offset_index] <= i) {
@@ -371,23 +422,23 @@ Status SchemaColumnsScanner::_fill_block_impl(vectorized::Block* block) {
             }
             strs[i] = StringRef(_table_result.tables[cur_table_index].c_str(),
                                 _table_result.tables[cur_table_index].length());
-            datas[i] = strs + i;
+            datas[i] = strs.data() + i;
         }
-        fill_dest_column_for_range(block, 2, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 2, datas));
     }
     // COLUMN_NAME
     {
-        StringRef strs[columns_num];
+        std::vector<StringRef> strs(columns_num);
         for (int i = 0; i < columns_num; ++i) {
             strs[i] = StringRef(_desc_result.columns[i].columnDesc.columnName.c_str(),
                                 _desc_result.columns[i].columnDesc.columnName.length());
-            datas[i] = strs + i;
+            datas[i] = strs.data() + i;
         }
-        fill_dest_column_for_range(block, 3, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 3, datas));
     }
     // ORDINAL_POSITION
     {
-        int64_t srcs[columns_num];
+        std::vector<int64_t> srcs(columns_num);
         int offset_index = 0;
         int columns_index = 1;
         for (int i = 0; i < columns_num; ++i) {
@@ -396,12 +447,24 @@ Status SchemaColumnsScanner::_fill_block_impl(vectorized::Block* block) {
                 columns_index = 1;
             }
             srcs[i] = columns_index++;
-            datas[i] = srcs + i;
+            datas[i] = srcs.data() + i;
         }
-        fill_dest_column_for_range(block, 4, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 4, datas));
     }
     // COLUMN_DEFAULT
-    { fill_dest_column_for_range(block, 5, null_datas); }
+    {
+        std::vector<StringRef> strs(columns_num);
+        for (int i = 0; i < columns_num; ++i) {
+            if (_desc_result.columns[i].columnDesc.__isset.defaultValue) {
+                strs[i] = StringRef(_desc_result.columns[i].columnDesc.defaultValue.c_str(),
+                                    _desc_result.columns[i].columnDesc.defaultValue.length());
+                datas[i] = strs.data() + i;
+            } else {
+                datas[i] = nullptr;
+            }
+        }
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 5, datas));
+    }
     // IS_NULLABLE
     {
         StringRef str_yes = StringRef("YES", 3);
@@ -417,30 +480,30 @@ Status SchemaColumnsScanner::_fill_block_impl(vectorized::Block* block) {
                 datas[i] = &str_no;
             }
         }
-        fill_dest_column_for_range(block, 6, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 6, datas));
     }
     // DATA_TYPE
     {
-        std::string buffers[columns_num];
-        StringRef strs[columns_num];
+        std::vector<std::string> buffers(columns_num);
+        std::vector<StringRef> strs(columns_num);
         for (int i = 0; i < columns_num; ++i) {
             buffers[i] = _to_mysql_data_type_string(_desc_result.columns[i].columnDesc);
             strs[i] = StringRef(buffers[i].c_str(), buffers[i].length());
-            datas[i] = strs + i;
+            datas[i] = strs.data() + i;
         }
-        fill_dest_column_for_range(block, 7, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 7, datas));
     }
     // CHARACTER_MAXIMUM_LENGTH
     // For string columns, the maximum length in characters.
     {
-        int64_t srcs[columns_num];
+        std::vector<int64_t> srcs(columns_num);
         for (int i = 0; i < columns_num; ++i) {
             int data_type = _desc_result.columns[i].columnDesc.columnType;
             if (data_type == TPrimitiveType::VARCHAR || data_type == TPrimitiveType::CHAR ||
                 data_type == TPrimitiveType::STRING) {
                 if (_desc_result.columns[i].columnDesc.__isset.columnLength) {
                     srcs[i] = _desc_result.columns[i].columnDesc.columnLength;
-                    datas[i] = srcs + i;
+                    datas[i] = srcs.data() + i;
                 } else {
                     datas[i] = nullptr;
                 }
@@ -448,19 +511,19 @@ Status SchemaColumnsScanner::_fill_block_impl(vectorized::Block* block) {
                 datas[i] = nullptr;
             }
         }
-        fill_dest_column_for_range(block, 8, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 8, datas));
     }
     // CHARACTER_OCTET_LENGTH
     // For string columns, the maximum length in bytes.
     {
-        int64_t srcs[columns_num];
+        std::vector<int64_t> srcs(columns_num);
         for (int i = 0; i < columns_num; ++i) {
             int data_type = _desc_result.columns[i].columnDesc.columnType;
             if (data_type == TPrimitiveType::VARCHAR || data_type == TPrimitiveType::CHAR ||
                 data_type == TPrimitiveType::STRING) {
                 if (_desc_result.columns[i].columnDesc.__isset.columnLength) {
                     srcs[i] = _desc_result.columns[i].columnDesc.columnLength * 4L;
-                    datas[i] = srcs + i;
+                    datas[i] = srcs.data() + i;
                 } else {
                     datas[i] = nullptr;
                 }
@@ -468,118 +531,137 @@ Status SchemaColumnsScanner::_fill_block_impl(vectorized::Block* block) {
                 datas[i] = nullptr;
             }
         }
-        fill_dest_column_for_range(block, 9, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 9, datas));
     }
     // NUMERIC_PRECISION
     {
-        int64_t srcs[columns_num];
+        std::vector<int64_t> srcs(columns_num);
         for (int i = 0; i < columns_num; ++i) {
-            if (_desc_result.columns[i].columnDesc.__isset.columnPrecision) {
+            int data_type = _desc_result.columns[i].columnDesc.columnType;
+            if (_desc_result.columns[i].columnDesc.__isset.columnPrecision &&
+                data_type != TPrimitiveType::DATETIMEV2) {
                 srcs[i] = _desc_result.columns[i].columnDesc.columnPrecision;
-                datas[i] = srcs + i;
+                datas[i] = srcs.data() + i;
             } else {
                 datas[i] = nullptr;
             }
         }
-        fill_dest_column_for_range(block, 10, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 10, datas));
     }
     // NUMERIC_SCALE
     {
-        int64_t srcs[columns_num];
+        std::vector<int64_t> srcs(columns_num);
         for (int i = 0; i < columns_num; ++i) {
-            if (_desc_result.columns[i].columnDesc.__isset.columnScale) {
+            int data_type = _desc_result.columns[i].columnDesc.columnType;
+            if (_desc_result.columns[i].columnDesc.__isset.columnScale &&
+                data_type != TPrimitiveType::DATETIMEV2) {
                 srcs[i] = _desc_result.columns[i].columnDesc.columnScale;
-                datas[i] = srcs + i;
+                datas[i] = srcs.data() + i;
             } else {
                 datas[i] = nullptr;
             }
         }
-        fill_dest_column_for_range(block, 11, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 11, datas));
     }
     // DATETIME_PRECISION
-    { fill_dest_column_for_range(block, 12, null_datas); }
+    {
+        std::vector<int64_t> srcs(columns_num);
+        for (int i = 0; i < columns_num; ++i) {
+            int data_type = _desc_result.columns[i].columnDesc.columnType;
+            if (_desc_result.columns[i].columnDesc.__isset.columnScale &&
+                data_type == TPrimitiveType::DATETIMEV2) {
+                srcs[i] = _desc_result.columns[i].columnDesc.columnScale;
+                datas[i] = srcs.data() + i;
+            } else {
+                datas[i] = nullptr;
+            }
+        }
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 12, datas));
+    }
     // CHARACTER_SET_NAME
-    { fill_dest_column_for_range(block, 13, null_datas); }
+    { RETURN_IF_ERROR(fill_dest_column_for_range(block, 13, null_datas)); }
     // COLLATION_NAME
-    { fill_dest_column_for_range(block, 14, null_datas); }
+    { RETURN_IF_ERROR(fill_dest_column_for_range(block, 14, null_datas)); }
     // COLUMN_TYPE
     {
-        std::string buffers[columns_num];
-        StringRef strs[columns_num];
+        std::vector<std::string> buffers(columns_num);
+        std::vector<StringRef> strs(columns_num);
         for (int i = 0; i < columns_num; ++i) {
             buffers[i] = _type_to_string(_desc_result.columns[i].columnDesc);
             strs[i] = StringRef(buffers[i].c_str(), buffers[i].length());
-            datas[i] = strs + i;
+            datas[i] = strs.data() + i;
         }
-        fill_dest_column_for_range(block, 15, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 15, datas));
     }
     // COLUMN_KEY
     {
         StringRef str = StringRef("", 0);
-        StringRef strs[columns_num];
+        std::vector<StringRef> strs(columns_num);
         for (int i = 0; i < columns_num; ++i) {
             if (_desc_result.columns[i].columnDesc.__isset.columnKey) {
                 strs[i] = StringRef(_desc_result.columns[i].columnDesc.columnKey.c_str(),
                                     _desc_result.columns[i].columnDesc.columnKey.length());
-                datas[i] = strs + i;
+                datas[i] = strs.data() + i;
             } else {
                 datas[i] = &str;
             }
         }
-        fill_dest_column_for_range(block, 16, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 16, datas));
     }
     // EXTRA
     {
         StringRef str = StringRef("", 0);
-        std::vector<void*> datas(columns_num, &str);
-        fill_dest_column_for_range(block, 17, datas);
+        std::vector<void*> filled_values(columns_num, &str);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 17, filled_values));
     }
     // PRIVILEGES
     {
         StringRef str = StringRef("", 0);
-        std::vector<void*> datas(columns_num, &str);
-        fill_dest_column_for_range(block, 18, datas);
+        std::vector<void*> filled_values(columns_num, &str);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 18, filled_values));
     }
     // COLUMN_COMMENT
     {
-        StringRef strs[columns_num];
+        std::vector<StringRef> strs(columns_num);
         for (int i = 0; i < columns_num; ++i) {
             strs[i] = StringRef(_desc_result.columns[i].comment.c_str(),
                                 _desc_result.columns[i].comment.length());
-            datas[i] = strs + i;
+            datas[i] = strs.data() + i;
         }
-        fill_dest_column_for_range(block, 19, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 19, datas));
     }
     // COLUMN_SIZE
     {
-        int64_t srcs[columns_num];
+        std::vector<int64_t> srcs(columns_num);
         for (int i = 0; i < columns_num; ++i) {
             if (_desc_result.columns[i].columnDesc.__isset.columnLength) {
                 srcs[i] = _desc_result.columns[i].columnDesc.columnLength;
-                datas[i] = srcs + i;
+                datas[i] = srcs.data() + i;
             } else {
                 datas[i] = nullptr;
             }
         }
-        fill_dest_column_for_range(block, 20, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 20, datas));
     }
     // DECIMAL_DIGITS
     {
-        int64_t srcs[columns_num];
+        std::vector<int64_t> srcs(columns_num);
         for (int i = 0; i < columns_num; ++i) {
-            if (_desc_result.columns[i].columnDesc.__isset.columnScale) {
+            int data_type = _desc_result.columns[i].columnDesc.columnType;
+            if (_desc_result.columns[i].columnDesc.__isset.columnScale &&
+                data_type != TPrimitiveType::DATETIMEV2) {
                 srcs[i] = _desc_result.columns[i].columnDesc.columnScale;
-                datas[i] = srcs + i;
+                datas[i] = srcs.data() + i;
             } else {
                 datas[i] = nullptr;
             }
         }
-        fill_dest_column_for_range(block, 21, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 21, datas));
     }
     // GENERATION_EXPRESSION
-    { fill_dest_column_for_range(block, 22, null_datas); }
+    { RETURN_IF_ERROR(fill_dest_column_for_range(block, 22, null_datas)); }
     // SRS_ID
-    { fill_dest_column_for_range(block, 23, null_datas); }
+    { RETURN_IF_ERROR(fill_dest_column_for_range(block, 23, null_datas)); }
     return Status::OK();
 }
 

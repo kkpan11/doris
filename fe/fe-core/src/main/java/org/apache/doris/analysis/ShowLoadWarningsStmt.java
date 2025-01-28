@@ -19,7 +19,6 @@ package org.apache.doris.analysis;
 
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.ScalarType;
-import org.apache.doris.cluster.ClusterNamespace;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
@@ -34,7 +33,7 @@ import java.net.MalformedURLException;
 import java.net.URL;
 
 // SHOW LOAD WARNINGS statement used to get error detail of src data.
-public class ShowLoadWarningsStmt extends ShowStmt {
+public class ShowLoadWarningsStmt extends ShowStmt implements NotFallbackInParser {
     private static final Logger LOG = LogManager.getLogger(ShowLoadWarningsStmt.class);
 
     private static final ShowResultSetMetaData META_DATA =
@@ -119,8 +118,6 @@ public class ShowLoadWarningsStmt extends ShowStmt {
                 if (Strings.isNullOrEmpty(dbName)) {
                     ErrorReport.reportAnalysisException(ErrorCode.ERR_NO_DB_ERROR);
                 }
-            } else {
-                dbName = ClusterNamespace.getFullName(getClusterName(), dbName);
             }
 
             // analyze where clause if not null

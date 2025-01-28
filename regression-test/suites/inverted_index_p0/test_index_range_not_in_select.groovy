@@ -54,7 +54,7 @@ suite("test_index_range_not_in_select", "inverted_index_select"){
                 INDEX ${varchar_colume1}_idx(${varchar_colume1}) USING INVERTED COMMENT '${varchar_colume1} index',
                 INDEX ${int_colume1}_idx(${int_colume1}) USING INVERTED COMMENT '${int_colume1} index',
                 INDEX ${varchar_colume2}_idx(${varchar_colume2}) USING INVERTED PROPERTIES("parser"="none") COMMENT '${varchar_colume2} index',
-                INDEX ${string_colume1}_idx(${string_colume1}) USING INVERTED PROPERTIES("parser"="english") COMMENT '${string_colume1} index',
+                INDEX ${string_colume1}_idx(${string_colume1}) using inverted properties("support_phrase" = "true", "parser" = "english", "lower_case" = "true") COMMENT '${string_colume1} index',
                 INDEX ${char_colume1}_idx(${char_colume1}) USING INVERTED PROPERTIES("parser"="standard") COMMENT '${char_colume1} index',
                 INDEX ${text_colume1}_idx(${text_colume1}) USING INVERTED PROPERTIES("parser"="standard") COMMENT '${text_colume1} index',
                 INDEX ${varchar_colume3}_idx(${varchar_colume3}) USING INVERTED PROPERTIES("parser"="standard") COMMENT ' ${varchar_colume3} index'
@@ -94,8 +94,8 @@ suite("test_index_range_not_in_select", "inverted_index_select"){
         def wait_for_build_index_on_partition_finish = { table_name, OpTimeout ->
             for(int t = delta_time; t <= OpTimeout; t += delta_time){
                 alter_res = sql """SHOW BUILD INDEX WHERE TableName = "${table_name}";"""
-                expected_finished_num = alter_res.size();
-                finished_num = 0;
+                def expected_finished_num = alter_res.size();
+                def finished_num = 0;
                 for (int i = 0; i < expected_finished_num; i++) {
                     logger.info(table_name + " build index job state: " + alter_res[i][7] + i)
                     if (alter_res[i][7] == "FINISHED") {
@@ -105,14 +105,13 @@ suite("test_index_range_not_in_select", "inverted_index_select"){
                 if (finished_num == expected_finished_num) {
                     logger.info(table_name + " all build index jobs finished, detail: " + alter_res)
                     break
-                } else {
-                    finished_num = 0;
                 }
                 useTime = t
                 sleep(delta_time)
             }
             assertTrue(useTime <= OpTimeout, "wait_for_latest_build_index_on_partition_finish timeout")
         }
+        sql """ set enable_common_expr_pushdown = true; """
 
         for (int i = 0; i < 2; i++) {
             logger.info("select table with index times " + i)
@@ -139,25 +138,27 @@ suite("test_index_range_not_in_select", "inverted_index_select"){
                         add index ${varchar_colume2}_idx(`${varchar_colume2}`) USING INVERTED PROPERTIES("parser"="none") COMMENT '${varchar_colume2} index',
                         add index ${varchar_colume3}_idx(`${varchar_colume3}`) USING INVERTED PROPERTIES("parser"="standard") COMMENT ' ${varchar_colume3} index',
                         add index ${int_colume1}_idx(`${int_colume1}`) USING INVERTED COMMENT '${int_colume1} index',
-                        add index ${string_colume1}_idx(`${string_colume1}`) USING INVERTED PROPERTIES("parser"="english") COMMENT '${string_colume1} index',
+                        add index ${string_colume1}_idx(`${string_colume1}`) using inverted properties("support_phrase" = "true", "parser" = "english", "lower_case" = "true") COMMENT '${string_colume1} index',
                         add index ${char_colume1}_idx(`${char_colume1}`) USING INVERTED PROPERTIES("parser"="standard") COMMENT '${char_colume1} index',
                         add index ${text_colume1}_idx(`${text_colume1}`) USING INVERTED PROPERTIES("parser"="standard") COMMENT '${text_colume1} index';
                 """
                 wait_for_latest_op_on_table_finish(Tb_name, timeout)
-                sql """ build index ${varchar_colume1}_idx on ${Tb_name} """
-                wait_for_build_index_on_partition_finish(Tb_name, timeout)
-                sql """ build index ${varchar_colume2}_idx on ${Tb_name} """
-                wait_for_build_index_on_partition_finish(Tb_name, timeout)
-                sql """ build index ${varchar_colume3}_idx on ${Tb_name} """
-                wait_for_build_index_on_partition_finish(Tb_name, timeout)
-                sql """ build index ${int_colume1}_idx on ${Tb_name} """
-                wait_for_build_index_on_partition_finish(Tb_name, timeout)
-                sql """ build index ${string_colume1}_idx on ${Tb_name} """
-                wait_for_build_index_on_partition_finish(Tb_name, timeout)
-                sql """ build index ${char_colume1}_idx on ${Tb_name} """
-                wait_for_build_index_on_partition_finish(Tb_name, timeout)
-                sql """ build index ${text_colume1}_idx on ${Tb_name} """
-                wait_for_build_index_on_partition_finish(Tb_name, timeout)
+                if (!isCloudMode()) {
+                    sql """ build index ${varchar_colume1}_idx on ${Tb_name} """
+                    wait_for_build_index_on_partition_finish(Tb_name, timeout)
+                    sql """ build index ${varchar_colume2}_idx on ${Tb_name} """
+                    wait_for_build_index_on_partition_finish(Tb_name, timeout)
+                    sql """ build index ${varchar_colume3}_idx on ${Tb_name} """
+                    wait_for_build_index_on_partition_finish(Tb_name, timeout)
+                    sql """ build index ${int_colume1}_idx on ${Tb_name} """
+                    wait_for_build_index_on_partition_finish(Tb_name, timeout)
+                    sql """ build index ${string_colume1}_idx on ${Tb_name} """
+                    wait_for_build_index_on_partition_finish(Tb_name, timeout)
+                    sql """ build index ${char_colume1}_idx on ${Tb_name} """
+                    wait_for_build_index_on_partition_finish(Tb_name, timeout)
+                    sql """ build index ${text_colume1}_idx on ${Tb_name} """
+                    wait_for_build_index_on_partition_finish(Tb_name, timeout)
+                }
             }
 
             // case1: select in

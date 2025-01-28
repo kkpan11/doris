@@ -16,7 +16,7 @@
 // under the License.
 
 suite("test_unique_table_like") {
-    def dbName = "test_unique_db"
+    def dbName = "test_unique_like_db"
     sql "drop database if exists ${dbName}"
     sql "CREATE DATABASE ${dbName}"
     sql "use ${dbName}"
@@ -24,7 +24,6 @@ suite("test_unique_table_like") {
     // test uniq table like 
     def tbNameA = "test_uniq"
     def tbNameB = "test_uniq_like"
-    sql "ADMIN SET FRONTEND CONFIG ('enable_batch_delete_by_default' = 'true')"
     sql "SET show_hidden_columns=true"
     sql "DROP TABLE IF EXISTS ${tbNameA}"
     sql """
@@ -39,12 +38,13 @@ suite("test_unique_table_like") {
             DISTRIBUTED BY HASH(k) BUCKETS 5 properties("replication_num" = "1",
                 "function_column.sequence_type" = "int");
         """
-    qt_desc_uniq_table "desc ${tbNameA}"    
+    def res1 = sql "desc ${tbNameA}"    
     sql """
             CREATE TABLE IF NOT EXISTS ${tbNameB} LIKE ${tbNameA};
         """
     
-    qt_desc_uniq_table "desc ${tbNameB}"
+    def res2 = sql "desc ${tbNameB}"
+    assertEquals(res1, res2)
     sql "DROP TABLE ${tbNameA}"
     sql "DROP TABLE ${tbNameB}"
 }

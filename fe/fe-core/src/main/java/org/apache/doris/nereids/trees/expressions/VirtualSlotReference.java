@@ -17,6 +17,7 @@
 
 package org.apache.doris.nereids.trees.expressions;
 
+import org.apache.doris.common.Pair;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.GroupingScalarFunction;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
 import org.apache.doris.nereids.trees.plans.algebra.Repeat.GroupingSetShapes;
@@ -81,7 +82,7 @@ public class VirtualSlotReference extends SlotReference implements SlotNotFromCh
     }
 
     @Override
-    public String toSql() {
+    public String computeToSql() {
         return getName();
     }
 
@@ -111,12 +112,52 @@ public class VirtualSlotReference extends SlotReference implements SlotNotFromCh
     }
 
     @Override
-    public int hashCode() {
+    public int computeHashCode() {
         return Objects.hash(realExpressions, originExpression, getExprId());
     }
 
     @Override
     public boolean nullable() {
         return false;
+    }
+
+    public VirtualSlotReference withNullable(boolean nullable) {
+        if (this.nullable == nullable) {
+            return this;
+        }
+        return new VirtualSlotReference(exprId, name.get(), dataType, nullable, qualifier,
+                originExpression, computeLongValueMethod);
+    }
+
+    @Override
+    public Slot withNullableAndDataType(boolean nullable, DataType dataType) {
+        if (this.nullable == nullable && this.dataType.equals(dataType)) {
+            return this;
+        }
+        return new VirtualSlotReference(exprId, name.get(), dataType, nullable, qualifier,
+                originExpression, computeLongValueMethod);
+    }
+
+    @Override
+    public VirtualSlotReference withQualifier(List<String> qualifier) {
+        return new VirtualSlotReference(exprId, name.get(), dataType, nullable, qualifier,
+                originExpression, computeLongValueMethod);
+    }
+
+    @Override
+    public VirtualSlotReference withName(String name) {
+        return new VirtualSlotReference(exprId, name, dataType, nullable, qualifier,
+                originExpression, computeLongValueMethod);
+    }
+
+    @Override
+    public VirtualSlotReference withExprId(ExprId exprId) {
+        return new VirtualSlotReference(exprId, name.get(), dataType, nullable, qualifier,
+                originExpression, computeLongValueMethod);
+    }
+
+    @Override
+    public Slot withIndexInSql(Pair<Integer, Integer> index) {
+        return this;
     }
 }

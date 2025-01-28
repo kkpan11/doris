@@ -21,26 +21,38 @@ import org.apache.doris.catalog.Env;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
+import org.apache.doris.common.util.NetUtils;
 import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.system.Backend;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-public class AdminRebalanceDiskStmt extends DdlStmt {
+public class AdminRebalanceDiskStmt extends DdlStmt implements NotFallbackInParser {
+    private static final Logger LOG = LogManager.getLogger(AdminRebalanceDiskStmt.class);
     private List<Backend> backends = Lists.newArrayList();
     private long timeoutS = 0;
 
     public AdminRebalanceDiskStmt(List<String> backends) {
-        ImmutableMap<Long, Backend> backendsInfo = Env.getCurrentSystemInfo().getIdToBackend();
+        ImmutableMap<Long, Backend> backendsInfo;
+        try {
+            backendsInfo = Env.getCurrentSystemInfo().getAllBackendsByAllCluster();
+        } catch (AnalysisException e) {
+            LOG.warn("failed to get backends,", e);
+            return;
+        }
         Map<String, Long> backendsID = new HashMap<String, Long>();
         for (Backend backend : backendsInfo.values()) {
-            backendsID.put(backend.getHost() + ":" + backend.getHeartbeatPort(), backend.getId());
+            backendsID.put(
+                    NetUtils.getHostPortInAccessibleFormat(backend.getHost(), backend.getHeartbeatPort()),
+                    backend.getId());
         }
         if (backends == null) {
             this.backends.addAll(backendsInfo.values());

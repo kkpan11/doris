@@ -17,8 +17,6 @@
 
 #include "http/action/tablets_info_action.h"
 
-#include <ctype.h>
-
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -26,7 +24,9 @@
 #include <string>
 #include <vector>
 
-#include "gutil/strings/substitute.h"
+#include "cloud/cloud_storage_engine.h"
+#include "cloud/cloud_tablet_mgr.h"
+#include "cloud/config.h"
 #include "http/http_channel.h"
 #include "http/http_headers.h"
 #include "http/http_request.h"
@@ -34,6 +34,7 @@
 #include "olap/olap_common.h"
 #include "olap/storage_engine.h"
 #include "olap/tablet_manager.h"
+#include "runtime/exec_env.h"
 #include "service/backend_options.h"
 
 namespace doris {
@@ -51,9 +52,11 @@ void TabletsInfoAction::handle(HttpRequest* req) {
 }
 
 EasyJson TabletsInfoAction::get_tablets_info(string tablet_num_to_return) {
+    EasyJson tablets_info_ej;
+
     int64_t number;
     std::string msg;
-    if (tablet_num_to_return == "") {
+    if (tablet_num_to_return.empty()) {
         number = 1000; // default
         msg = "OK";
     } else if (tablet_num_to_return == "all") {
@@ -67,10 +70,16 @@ EasyJson TabletsInfoAction::get_tablets_info(string tablet_num_to_return) {
         msg = "Parameter Error";
     }
     std::vector<TabletInfo> tablets_info;
-    TabletManager* tablet_manager = StorageEngine::instance()->tablet_manager();
-    tablet_manager->obtain_specific_quantity_tablets(tablets_info, number);
+    if (!config::is_cloud_mode()) {
+        TabletManager* tablet_manager =
+                ExecEnv::GetInstance()->storage_engine().to_local().tablet_manager();
+        tablet_manager->obtain_specific_quantity_tablets(tablets_info, number);
+    } else {
+        CloudTabletMgr& cloud_tablet_manager =
+                ExecEnv::GetInstance()->storage_engine().to_cloud().tablet_mgr();
+        cloud_tablet_manager.get_tablet_info(number, &tablets_info);
+    }
 
-    EasyJson tablets_info_ej;
     tablets_info_ej["msg"] = msg;
     tablets_info_ej["code"] = 0;
     EasyJson data = tablets_info_ej.Set("data", EasyJson::kObject);
@@ -79,7 +88,6 @@ EasyJson TabletsInfoAction::get_tablets_info(string tablet_num_to_return) {
     for (TabletInfo tablet_info : tablets_info) {
         EasyJson tablet = tablets.PushBack(EasyJson::kObject);
         tablet["tablet_id"] = tablet_info.tablet_id;
-        tablet["schema_hash"] = tablet_info.schema_hash;
     }
     tablets_info_ej["count"] = tablets_info.size();
     return tablets_info_ej;

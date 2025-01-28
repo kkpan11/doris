@@ -47,4 +47,8 @@ suite("select_with_const") {
     qt_select """
         SELECT col1 AS 'str' FROM select_with_const
     """
+
+    sql "select all 1"
+
+    sql "select `1  + 2` from (select 1  + 2) t"
 }

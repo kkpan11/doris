@@ -31,6 +31,7 @@ import org.apache.doris.common.util.DebugUtil;
 import org.apache.doris.metric.MetricRepo;
 import org.apache.doris.proto.InternalService;
 import org.apache.doris.qe.RowBatch;
+import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TUniqueId;
 
 import com.google.common.collect.Lists;
@@ -72,7 +73,7 @@ public class PartitionCache extends Cache {
     public void setCacheInfo(CacheAnalyzer.CacheTable latestTable, RangePartitionInfo partitionInfo, Column partColumn,
                              CompoundPredicate partitionPredicate, String allViewExpandStmtListStr) {
         this.latestTable = latestTable;
-        this.olapTable = latestTable.olapTable;
+        this.olapTable = (OlapTable) latestTable.table;
         this.partitionInfo = partitionInfo;
         this.partColumn = partColumn;
         this.partitionPredicate = partitionPredicate;
@@ -86,7 +87,7 @@ public class PartitionCache extends Cache {
         range = new PartitionRange(this.partitionPredicate, this.olapTable,
                 this.partitionInfo);
         if (!range.analytics()) {
-            status.setStatus("analytics range error");
+            status.updateStatus(TStatusCode.INTERNAL_ERROR, "analytics range error");
             return null;
         }
 
@@ -122,6 +123,9 @@ public class PartitionCache extends Cache {
             rowBatchBuilder = new RowBatchBuilder(CacheAnalyzer.CacheMode.Partition);
             rowBatchBuilder.buildPartitionIndex(selectStmt.getResultExprs(), selectStmt.getColLabels(),
                     partColumn, range.buildUpdatePartitionRange());
+        }
+        if (!super.checkRowLimit()) {
+            return;
         }
         rowBatchBuilder.copyRowData(rowBatch);
     }

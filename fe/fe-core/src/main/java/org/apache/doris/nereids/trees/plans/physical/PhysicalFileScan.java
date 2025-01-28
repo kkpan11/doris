@@ -17,82 +17,110 @@
 
 package org.apache.doris.nereids.trees.plans.physical;
 
-import org.apache.doris.catalog.external.ExternalTable;
+import org.apache.doris.analysis.TableSnapshot;
+import org.apache.doris.datasource.ExternalTable;
 import org.apache.doris.nereids.memo.GroupExpression;
 import org.apache.doris.nereids.properties.DistributionSpec;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.properties.PhysicalProperties;
-import org.apache.doris.nereids.trees.expressions.Expression;
-import org.apache.doris.nereids.trees.plans.ObjectId;
+import org.apache.doris.nereids.trees.TableSample;
+import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.PlanType;
+import org.apache.doris.nereids.trees.plans.RelationId;
+import org.apache.doris.nereids.trees.plans.logical.LogicalFileScan.SelectedPartitions;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.nereids.util.Utils;
 import org.apache.doris.statistics.Statistics;
 
 import java.util.List;
-import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
 
 /**
  * Physical file scan for external catalog.
  */
-public class PhysicalFileScan extends PhysicalRelation {
+public class PhysicalFileScan extends PhysicalCatalogRelation {
 
-    private final ExternalTable table;
-    private final DistributionSpec distributionSpec;
-    private final Set<Expression> conjuncts;
+    protected final DistributionSpec distributionSpec;
+    protected final SelectedPartitions selectedPartitions;
+    protected final Optional<TableSample> tableSample;
+    protected final Optional<TableSnapshot> tableSnapshot;
 
     /**
      * Constructor for PhysicalFileScan.
      */
-    public PhysicalFileScan(ObjectId id, ExternalTable table, List<String> qualifier,
-                            DistributionSpec distributionSpec, Optional<GroupExpression> groupExpression,
-                            LogicalProperties logicalProperties, Set<Expression> conjuncts) {
-        super(id, PlanType.PHYSICAL_FILE_SCAN, qualifier, groupExpression, logicalProperties);
-        this.table = table;
-        this.distributionSpec = distributionSpec;
-        this.conjuncts = conjuncts;
+    public PhysicalFileScan(RelationId id, ExternalTable table, List<String> qualifier,
+            DistributionSpec distributionSpec, Optional<GroupExpression> groupExpression,
+            LogicalProperties logicalProperties,
+            SelectedPartitions selectedPartitions, Optional<TableSample> tableSample,
+            Optional<TableSnapshot> tableSnapshot) {
+        this(id, PlanType.PHYSICAL_FILE_SCAN, table, qualifier, distributionSpec, groupExpression,
+                logicalProperties, selectedPartitions, tableSample, tableSnapshot);
     }
 
     /**
      * Constructor for PhysicalFileScan.
      */
-    public PhysicalFileScan(ObjectId id, ExternalTable table, List<String> qualifier,
-                            DistributionSpec distributionSpec, Optional<GroupExpression> groupExpression,
-                            LogicalProperties logicalProperties, PhysicalProperties physicalProperties,
-                            Statistics statistics, Set<Expression> conjuncts) {
-        super(id, PlanType.PHYSICAL_FILE_SCAN, qualifier, groupExpression, logicalProperties,
-                physicalProperties, statistics);
-        this.table = table;
+    public PhysicalFileScan(RelationId id, ExternalTable table, List<String> qualifier,
+            DistributionSpec distributionSpec, Optional<GroupExpression> groupExpression,
+            LogicalProperties logicalProperties, PhysicalProperties physicalProperties,
+            Statistics statistics, SelectedPartitions selectedPartitions,
+            Optional<TableSample> tableSample, Optional<TableSnapshot> tableSnapshot) {
+        this(id, PlanType.PHYSICAL_FILE_SCAN, table, qualifier, distributionSpec, groupExpression,
+                logicalProperties, physicalProperties, statistics, selectedPartitions, tableSample, tableSnapshot);
+    }
+
+    /**
+     * For hudi file scan to specified PlanTye
+     */
+    protected PhysicalFileScan(RelationId id, PlanType type, ExternalTable table, List<String> qualifier,
+            DistributionSpec distributionSpec, Optional<GroupExpression> groupExpression,
+            LogicalProperties logicalProperties,
+            SelectedPartitions selectedPartitions, Optional<TableSample> tableSample,
+            Optional<TableSnapshot> tableSnapshot) {
+        super(id, type, table, qualifier, groupExpression, logicalProperties);
         this.distributionSpec = distributionSpec;
-        this.conjuncts = conjuncts;
+        this.selectedPartitions = selectedPartitions;
+        this.tableSample = tableSample;
+        this.tableSnapshot = tableSnapshot;
+    }
+
+    protected PhysicalFileScan(RelationId id, PlanType type, ExternalTable table, List<String> qualifier,
+            DistributionSpec distributionSpec, Optional<GroupExpression> groupExpression,
+            LogicalProperties logicalProperties, PhysicalProperties physicalProperties,
+            Statistics statistics, SelectedPartitions selectedPartitions,
+            Optional<TableSample> tableSample, Optional<TableSnapshot> tableSnapshot) {
+        super(id, type, table, qualifier, groupExpression, logicalProperties,
+                physicalProperties, statistics);
+        this.distributionSpec = distributionSpec;
+        this.selectedPartitions = selectedPartitions;
+        this.tableSample = tableSample;
+        this.tableSnapshot = tableSnapshot;
+    }
+
+    public DistributionSpec getDistributionSpec() {
+        return distributionSpec;
+    }
+
+    public SelectedPartitions getSelectedPartitions() {
+        return selectedPartitions;
+    }
+
+    public Optional<TableSample> getTableSample() {
+        return tableSample;
+    }
+
+    public Optional<TableSnapshot> getTableSnapshot() {
+        return tableSnapshot;
     }
 
     @Override
     public String toString() {
-        return Utils.toSqlString("PhysicalFileScan",
-            "qualified", Utils.qualifiedName(qualifier, table.getName()),
-            "output", getOutput(),
-            "stats", statistics
+        return Utils.toSqlString("PhysicalFileScan[" + table.getName() + "]" + getGroupIdWithPrefix(),
+            "stats", statistics,
+                "qualified", Utils.qualifiedName(qualifier, table.getName()),
+                "selected partitions num",
+                selectedPartitions.isPruned ? selectedPartitions.selectedPartitions.size() : "unknown"
         );
-    }
-
-    @Override
-    public boolean equals(Object o) {
-        if (this == o) {
-            return true;
-        }
-        if (o == null || getClass() != o.getClass() || !super.equals(o)) {
-            return false;
-        }
-        PhysicalFileScan that = ((PhysicalFileScan) o);
-        return Objects.equals(table, that.table);
-    }
-
-    @Override
-    public int hashCode() {
-        return Objects.hash(id, table);
     }
 
     @Override
@@ -102,29 +130,27 @@ public class PhysicalFileScan extends PhysicalRelation {
 
     @Override
     public PhysicalFileScan withGroupExpression(Optional<GroupExpression> groupExpression) {
-        return new PhysicalFileScan(id, table, qualifier, distributionSpec,
-            groupExpression, getLogicalProperties(), conjuncts);
+        return new PhysicalFileScan(relationId, getTable(), qualifier, distributionSpec,
+                groupExpression, getLogicalProperties(), selectedPartitions, tableSample, tableSnapshot);
     }
 
     @Override
-    public PhysicalFileScan withLogicalProperties(Optional<LogicalProperties> logicalProperties) {
-        return new PhysicalFileScan(id, table, qualifier, distributionSpec,
-            groupExpression, logicalProperties.get(), conjuncts);
+    public Plan withGroupExprLogicalPropChildren(Optional<GroupExpression> groupExpression,
+            Optional<LogicalProperties> logicalProperties, List<Plan> children) {
+        return new PhysicalFileScan(relationId, getTable(), qualifier, distributionSpec,
+                groupExpression, logicalProperties.get(), selectedPartitions, tableSample, tableSnapshot);
     }
 
     @Override
     public ExternalTable getTable() {
-        return table;
+        return (ExternalTable) table;
     }
 
     @Override
     public PhysicalFileScan withPhysicalPropertiesAndStats(PhysicalProperties physicalProperties,
                                                        Statistics statistics) {
-        return new PhysicalFileScan(id, table, qualifier, distributionSpec, groupExpression, getLogicalProperties(),
-            physicalProperties, statistics, conjuncts);
-    }
-
-    public Set<Expression> getConjuncts() {
-        return this.conjuncts;
+        return new PhysicalFileScan(relationId, getTable(), qualifier, distributionSpec,
+                groupExpression, getLogicalProperties(), physicalProperties, statistics,
+                selectedPartitions, tableSample, tableSnapshot);
     }
 }

@@ -17,10 +17,8 @@
 
 #pragma once
 
-#include <stddef.h>
-#include <stdint.h>
-
 #include <memory>
+#include <type_traits>
 #include <vector>
 
 #include "common/status.h"
@@ -33,31 +31,36 @@ class Block;
 } // namespace vectorized
 
 // for vertical compaction
-class VerticalBetaRowsetWriter : public BetaRowsetWriter {
+template <class T>
+    requires std::is_base_of_v<BaseBetaRowsetWriter, T>
+class VerticalBetaRowsetWriter final : public T {
 public:
-    VerticalBetaRowsetWriter() : BetaRowsetWriter() {}
-    ~VerticalBetaRowsetWriter();
+    template <class... Args>
+    explicit VerticalBetaRowsetWriter(Args&&... args) : T(std::forward<Args>(args)...) {}
+
+    ~VerticalBetaRowsetWriter() override = default;
 
     Status add_columns(const vectorized::Block* block, const std::vector<uint32_t>& col_ids,
-                       bool is_key, uint32_t max_rows_per_segment);
+                       bool is_key, uint32_t max_rows_per_segment, bool has_cluster_key) override;
 
     // flush last segment's column
-    Status flush_columns(bool is_key);
+    Status flush_columns(bool is_key) override;
 
     // flush when all column finished, flush column footer
-    Status final_flush();
+    Status final_flush() override;
+
+    int64_t num_rows() const override { return _total_key_group_rows; }
+
+    Status _close_file_writers() override;
 
 private:
-    // only key group will create segment writer
+    Status _flush_columns(segment_v2::SegmentWriter* segment_writer, bool is_key = false);
     Status _create_segment_writer(const std::vector<uint32_t>& column_ids, bool is_key,
                                   std::unique_ptr<segment_v2::SegmentWriter>* writer);
 
-    Status _flush_columns(std::unique_ptr<segment_v2::SegmentWriter>* segment_writer,
-                          bool is_key = false);
-
-private:
     std::vector<std::unique_ptr<segment_v2::SegmentWriter>> _segment_writers;
     size_t _cur_writer_idx = 0;
+    size_t _total_key_group_rows = 0;
 };
 
 } // namespace doris

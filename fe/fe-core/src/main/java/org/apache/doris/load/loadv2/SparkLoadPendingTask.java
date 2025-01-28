@@ -31,6 +31,7 @@ import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.HashDistributionInfo;
 import org.apache.doris.catalog.HiveTable;
 import org.apache.doris.catalog.KeysType;
+import org.apache.doris.catalog.MaterializedIndexMeta;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.PartitionItem;
@@ -71,11 +72,13 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
 // 1. create etl job config and write it into jobconfig.json file
 // 2. submit spark etl job
+@Deprecated
 public class SparkLoadPendingTask extends LoadTask {
     private static final Logger LOG = LogManager.getLogger(SparkLoadPendingTask.class);
 
@@ -91,8 +94,8 @@ public class SparkLoadPendingTask extends LoadTask {
 
     public SparkLoadPendingTask(SparkLoadJob loadTaskCallback,
                                 Map<FileGroupAggKey, List<BrokerFileGroup>> aggKeyToBrokerFileGroups,
-                                SparkResource resource, BrokerDesc brokerDesc) {
-        super(loadTaskCallback, TaskType.PENDING);
+                                SparkResource resource, BrokerDesc brokerDesc, Priority priority) {
+        super(loadTaskCallback, TaskType.PENDING, priority);
         this.retryTime = 3;
         this.attachment = new SparkPendingTaskAttachment(signature);
         this.aggKeyToBrokerFileGroups = aggKeyToBrokerFileGroups;
@@ -104,6 +107,16 @@ public class SparkLoadPendingTask extends LoadTask {
         this.transactionId = loadTaskCallback.getTransactionId();
         this.sparkLoadAppHandle = loadTaskCallback.getHandle();
         this.failMsg = new FailMsg(FailMsg.CancelType.ETL_SUBMIT_FAIL);
+        toLowCaseForFileGroups();
+    }
+
+    void toLowCaseForFileGroups() {
+        aggKeyToBrokerFileGroups.values().forEach(fgs -> {
+            fgs.forEach(fg -> {
+                fg.getColumnExprList()
+                        .forEach(expr -> expr.setColumnName(expr.getColumnName().toLowerCase(Locale.ROOT)));
+            });
+        });
     }
 
     @Override
@@ -234,12 +247,17 @@ public class SparkLoadPendingTask extends LoadTask {
 
         for (Map.Entry<Long, List<Column>> entry : table.getIndexIdToSchema().entrySet()) {
             long indexId = entry.getKey();
-            int schemaHash = table.getSchemaHashByIndexId(indexId);
+            MaterializedIndexMeta indexMeta = table.getIndexMetaByIndexId(indexId);
+            int schemaHash = indexMeta.getSchemaHash();
+            int schemaVersion = indexMeta.getSchemaVersion();
+
+            boolean changeAggType = table.getKeysTypeByIndexId(indexId).equals(KeysType.UNIQUE_KEYS)
+                    && table.getTableProperty().getEnableUniqueKeyMergeOnWrite();
 
             // columns
             List<EtlColumn> etlColumns = Lists.newArrayList();
             for (Column column : entry.getValue()) {
-                etlColumns.add(createEtlColumn(column));
+                etlColumns.add(createEtlColumn(column, changeAggType));
             }
 
             // check distribution type
@@ -273,15 +291,15 @@ public class SparkLoadPendingTask extends LoadTask {
             // is base index
             boolean isBaseIndex = indexId == table.getBaseIndexId() ? true : false;
 
-            etlIndexes.add(new EtlIndex(indexId, etlColumns, schemaHash, indexType, isBaseIndex));
+            etlIndexes.add(new EtlIndex(indexId, etlColumns, schemaHash, indexType, isBaseIndex, schemaVersion));
         }
 
         return etlIndexes;
     }
 
-    private EtlColumn createEtlColumn(Column column) {
+    private EtlColumn createEtlColumn(Column column, boolean changeAggType) {
         // column name
-        String name = column.getName();
+        String name = column.getName().toLowerCase(Locale.ROOT);
         // column type
         PrimitiveType type = column.getDataType();
         String columnType = column.getDataType().toString();
@@ -293,7 +311,11 @@ public class SparkLoadPendingTask extends LoadTask {
         // aggregation type
         String aggregationType = null;
         if (column.getAggregationType() != null) {
-            aggregationType = column.getAggregationType().toString();
+            if (changeAggType && !column.isKey()) {
+                aggregationType = AggregateType.REPLACE.toSql();
+            } else {
+                aggregationType = column.getAggregationType().toString();
+            }
         }
 
         // default value

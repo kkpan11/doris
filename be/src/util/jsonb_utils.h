@@ -23,6 +23,7 @@
 
 #include <sstream>
 
+#include "common/exception.h"
 #include "jsonb_document.h"
 #include "jsonb_stream.h"
 #include "jsonb_writer.h"
@@ -40,8 +41,12 @@ public:
 
     // get json string
     const std::string to_json_string(const char* data, size_t size) {
-        doris::JsonbValue* pval = doris::JsonbDocument::createDocument(data, size)->getValue();
-        return to_json_string(pval);
+        JsonbDocument* pdoc = doris::JsonbDocument::createDocument(data, size);
+        if (!pdoc) {
+            throw Exception(Status::FatalError("invalid json binary value: {}",
+                                               std::string_view(data, size)));
+        }
+        return to_json_string(pdoc->getValue());
     }
 
     const std::string to_json_string(const JsonbValue* val) {
@@ -188,7 +193,12 @@ private:
             if (iter->klen()) {
                 string_to_json(iter->getKeyStr(), iter->klen());
             } else {
-                os_.write(iter->getKeyId());
+                // NOTE: we use sMaxKeyId to represent an empty key. see jsonb_writer.h
+                if (iter->getKeyId() == JsonbKeyValue::sMaxKeyId) {
+                    string_to_json(nullptr, 0);
+                } else {
+                    os_.write(iter->getKeyId());
+                }
             }
             os_.put(':');
 

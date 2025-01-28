@@ -19,7 +19,6 @@ package org.apache.doris.analysis;
 
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.ScalarType;
-import org.apache.doris.cluster.ClusterNamespace;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
@@ -27,7 +26,7 @@ import org.apache.doris.qe.ShowResultSetMetaData;
 
 import com.google.common.base.Strings;
 
-public class ShowDynamicPartitionStmt extends ShowStmt {
+public class ShowDynamicPartitionStmt extends ShowStmt implements NotFallbackInParser {
     private String db;
     private static final ShowResultSetMetaData SHOW_DYNAMIC_PARTITION_META_DATA =
             ShowResultSetMetaData.builder()
@@ -64,8 +63,6 @@ public class ShowDynamicPartitionStmt extends ShowStmt {
             if (Strings.isNullOrEmpty(db)) {
                 ErrorReport.reportAnalysisException(ErrorCode.ERR_NO_DB_ERROR);
             }
-        } else {
-            db = ClusterNamespace.getFullName(analyzer.getClusterName(), db);
         }
 
         // we do not check db privs here. because user may not have any db privs,

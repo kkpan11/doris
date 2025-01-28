@@ -18,13 +18,17 @@
 package org.apache.doris.catalog;
 
 import org.apache.doris.analysis.AllPartitionDesc;
+import org.apache.doris.analysis.Expr;
 import org.apache.doris.analysis.PartitionDesc;
 import org.apache.doris.analysis.PartitionKeyDesc;
 import org.apache.doris.analysis.RangePartitionDesc;
 import org.apache.doris.analysis.SinglePartitionDesc;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.DdlException;
+import org.apache.doris.common.FeMetaVersion;
+import org.apache.doris.common.io.Text;
 import org.apache.doris.common.util.RangeUtils;
+import org.apache.doris.persist.gson.GsonUtils;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
@@ -32,9 +36,9 @@ import com.google.common.collect.Maps;
 import com.google.common.collect.Range;
 
 import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -54,11 +58,37 @@ public class RangePartitionInfo extends PartitionInfo {
         this.isMultiColumnPartition = partitionColumns.size() > 1;
     }
 
+    public RangePartitionInfo(boolean isAutoCreatePartitions, ArrayList<Expr> exprs, List<Column> partitionColumns) {
+        super(PartitionType.RANGE, partitionColumns);
+        this.isAutoCreatePartitions = isAutoCreatePartitions;
+        if (exprs != null) {
+            this.partitionExprs.addAll(exprs);
+        }
+    }
+
+    public Map<Long, PartitionItem> getPartitionItems(Collection<Long> partitionIds) {
+        Map<Long, PartitionItem> columnRanges = Maps.newLinkedHashMapWithExpectedSize(partitionIds.size());
+        for (Long partitionId : partitionIds) {
+            PartitionItem partitionItem = idToItem.get(partitionId);
+            if (partitionItem == null) {
+                partitionItem = idToTempItem.get(partitionId);
+            }
+            if (partitionItem == null) {
+                throw new IllegalStateException("Can not found partition item: " + partitionId);
+            }
+            columnRanges.put(partitionId, partitionItem);
+        }
+        return columnRanges;
+    }
+
     @Override
     public PartitionItem createAndCheckPartitionItem(SinglePartitionDesc desc, boolean isTemp) throws DdlException {
         Range<PartitionKey> newRange = null;
         PartitionKeyDesc partitionKeyDesc = desc.getPartitionKeyDesc();
         // check range
+        if (partitionKeyDesc.hasInValues()) {
+            throw new DdlException("Range partition expected 'VALUES [LESS THAN or [(\"xxx\" ,...), (\"xxx\", ...))]'");
+        }
         try {
             newRange = createAndCheckNewRange(partitionKeyDesc, isTemp);
         } catch (AnalysisException e) {
@@ -194,35 +224,18 @@ public class RangePartitionInfo extends PartitionInfo {
         RangeUtils.checkRangeConflict(list1, list2);
     }
 
+    @Deprecated
     public static PartitionInfo read(DataInput in) throws IOException {
+        if (Env.getCurrentEnvJournalVersion() >= FeMetaVersion.VERSION_136) {
+            return GsonUtils.GSON.fromJson(Text.readString(in), RangePartitionInfo.class);
+        }
+
         PartitionInfo partitionInfo = new RangePartitionInfo();
         partitionInfo.readFields(in);
         return partitionInfo;
     }
 
-    @Override
-    public void write(DataOutput out) throws IOException {
-        super.write(out);
-
-        // partition columns
-        out.writeInt(partitionColumns.size());
-        for (Column column : partitionColumns) {
-            column.write(out);
-        }
-
-        out.writeInt(idToItem.size());
-        for (Map.Entry<Long, PartitionItem> entry : idToItem.entrySet()) {
-            out.writeLong(entry.getKey());
-            entry.getValue().write(out);
-        }
-
-        out.writeInt(idToTempItem.size());
-        for (Map.Entry<Long, PartitionItem> entry : idToTempItem.entrySet()) {
-            out.writeLong(entry.getKey());
-            entry.getValue().write(out);
-        }
-    }
-
+    @Deprecated
     public void readFields(DataInput in) throws IOException {
         super.readFields(in);
 
@@ -252,16 +265,26 @@ public class RangePartitionInfo extends PartitionInfo {
     @Override
     public String toSql(OlapTable table, List<Long> partitionId) {
         StringBuilder sb = new StringBuilder();
-        sb.append("PARTITION BY RANGE(");
         int idx = 0;
-        for (Column column : partitionColumns) {
-            if (idx != 0) {
-                sb.append(", ");
+        if (enableAutomaticPartition()) {
+            sb.append("AUTO PARTITION BY RANGE ");
+            for (Expr e : partitionExprs) {
+                sb.append("(");
+                sb.append(e.toSql());
+                sb.append(")");
             }
-            sb.append("`").append(column.getName()).append("`");
-            idx++;
+            sb.append("\n(");
+        } else {
+            sb.append("PARTITION BY RANGE(");
+            for (Column column : partitionColumns) {
+                if (idx != 0) {
+                    sb.append(", ");
+                }
+                sb.append("`").append(column.getName()).append("`");
+                idx++;
+            }
+            sb.append(")\n(");
         }
-        sb.append(")\n(");
 
         // sort range
         List<Map.Entry<Long, PartitionItem>> entries = new ArrayList<>(this.idToItem.entrySet());
@@ -277,13 +300,9 @@ public class RangePartitionInfo extends PartitionInfo {
             sb.append("PARTITION ").append(partitionName).append(" VALUES [");
             sb.append(range.lowerEndpoint().toSql());
             sb.append(", ").append(range.upperEndpoint().toSql()).append(")");
-
-            Optional.ofNullable(this.idToStoragePolicy.get(entry.getKey())).ifPresent(p -> {
-                if (!p.equals("")) {
-                    sb.append("PROPERTIES (\"STORAGE POLICY\" = \"");
-                    sb.append(p).append("\")");
-                }
-            });
+            if (!"".equals(getStoragePolicy(entry.getKey()))) {
+                sb.append("(\"storage_policy\" = \"").append(getStoragePolicy(entry.getKey())).append("\")");
+            }
 
             if (partitionId != null) {
                 partitionId.add(entry.getKey());
@@ -325,6 +344,6 @@ public class RangePartitionInfo extends PartitionInfo {
 
             allPartitionDescs.add(new SinglePartitionDesc(false, partitionName, partitionKeyDesc, properties));
         }
-        return new RangePartitionDesc(partitionColumnNames, allPartitionDescs);
+        return new RangePartitionDesc(this.partitionExprs, partitionColumnNames, allPartitionDescs);
     }
 }

@@ -38,6 +38,7 @@ import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+@Deprecated
 public class SparkLauncherMonitor {
     private static final Logger LOG = LogManager.getLogger(SparkLauncherMonitor.class);
 
@@ -154,8 +155,10 @@ public class SparkLauncherMonitor {
                             }
                         }
 
-                        LOG.debug("spark appId that handle get is {}, state: {}",
-                                handle.getAppId(), handle.getState().toString());
+                        if (LOG.isDebugEnabled()) {
+                            LOG.debug("spark appId that handle get is {}, state: {}",
+                                    handle.getAppId(), handle.getState().toString());
+                        }
                         switch (newState) {
                             case UNKNOWN:
                             case CONNECTED:

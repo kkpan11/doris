@@ -18,58 +18,89 @@
 #pragma once
 
 #include <gen_cpp/parquet_types.h>
-#include <stddef.h>
 
 #include "common/status.h"
 #include "vec/data_types/data_type.h"
 #include "vec/exec/format/parquet/decoder.h"
+#include "vec/exec/format/parquet/parquet_common.h"
 
-namespace doris {
-namespace vectorized {
+namespace doris::vectorized {
 class ColumnSelectVector;
-} // namespace vectorized
-} // namespace doris
+} // namespace doris::vectorized
 
 namespace doris::vectorized {
 
 class FixLengthPlainDecoder final : public Decoder {
 public:
-    FixLengthPlainDecoder(tparquet::Type::type physical_type) : _physical_type(physical_type) {};
+    FixLengthPlainDecoder() = default;
     ~FixLengthPlainDecoder() override = default;
 
     Status decode_values(MutableColumnPtr& doris_column, DataTypePtr& data_type,
                          ColumnSelectVector& select_vector, bool is_dict_filter) override;
 
-    template <bool hasFilter>
+    template <bool has_filter>
     Status _decode_values(MutableColumnPtr& doris_column, DataTypePtr& data_type,
                           ColumnSelectVector& select_vector, bool is_dict_filter);
 
     Status skip_values(size_t num_values) override;
-
-protected:
-    template <typename Numeric, bool has_filter>
-    Status _decode_numeric(MutableColumnPtr& doris_column, ColumnSelectVector& select_vector);
-
-    template <typename CppType, typename ColumnType, bool has_filter>
-    Status _decode_date(MutableColumnPtr& doris_column, ColumnSelectVector& select_vector);
-
-    template <typename CppType, typename ColumnType, bool has_filter>
-    Status _decode_datetime64(MutableColumnPtr& doris_column, ColumnSelectVector& select_vector);
-
-    template <typename CppType, typename ColumnType, bool has_filter>
-    Status _decode_datetime96(MutableColumnPtr& doris_column, ColumnSelectVector& select_vector);
-
-    template <typename DecimalPrimitiveType, bool has_filter>
-    Status _decode_binary_decimal(MutableColumnPtr& doris_column, DataTypePtr& data_type,
-                                  ColumnSelectVector& select_vector);
-
-    template <typename DecimalPrimitiveType, typename DecimalPhysicalType, bool has_filter>
-    Status _decode_primitive_decimal(MutableColumnPtr& doris_column, DataTypePtr& data_type,
-                                     ColumnSelectVector& select_vector);
-
-    template <bool has_filter>
-    Status _decode_string(MutableColumnPtr& doris_column, ColumnSelectVector& select_vector);
-
-    tparquet::Type::type _physical_type;
 };
+
+Status FixLengthPlainDecoder::skip_values(size_t num_values) {
+    _offset += _type_length * num_values;
+    if (UNLIKELY(_offset > _data->size)) {
+        return Status::IOError("Out-of-bounds access in parquet data decoder");
+    }
+    return Status::OK();
+}
+
+Status FixLengthPlainDecoder::decode_values(MutableColumnPtr& doris_column, DataTypePtr& data_type,
+                                            ColumnSelectVector& select_vector,
+                                            bool is_dict_filter) {
+    if (select_vector.has_filter()) {
+        return _decode_values<true>(doris_column, data_type, select_vector, is_dict_filter);
+    } else {
+        return _decode_values<false>(doris_column, data_type, select_vector, is_dict_filter);
+    }
+}
+
+template <bool has_filter>
+Status FixLengthPlainDecoder::_decode_values(MutableColumnPtr& doris_column, DataTypePtr& data_type,
+                                             ColumnSelectVector& select_vector,
+                                             bool is_dict_filter) {
+    size_t non_null_size = select_vector.num_values() - select_vector.num_nulls();
+    if (UNLIKELY(_offset + _type_length * non_null_size > _data->size)) {
+        return Status::IOError("Out-of-bounds access in parquet data decoder");
+    }
+
+    size_t primitive_length = remove_nullable(data_type)->get_size_of_value_in_memory();
+    size_t data_index = doris_column->size() * primitive_length;
+    size_t scale_size = (select_vector.num_values() - select_vector.num_filtered()) *
+                        (_type_length / primitive_length);
+    doris_column->resize(doris_column->size() + scale_size);
+    char* raw_data = const_cast<char*>(doris_column->get_raw_data().data);
+    ColumnSelectVector::DataReadType read_type;
+    while (size_t run_length = select_vector.get_next_run<has_filter>(&read_type)) {
+        switch (read_type) {
+        case ColumnSelectVector::CONTENT: {
+            memcpy(raw_data + data_index, _data->data + _offset, run_length * _type_length);
+            _offset += run_length * _type_length;
+            data_index += run_length * _type_length;
+            break;
+        }
+        case ColumnSelectVector::NULL_DATA: {
+            data_index += run_length * _type_length;
+            break;
+        }
+        case ColumnSelectVector::FILTERED_CONTENT: {
+            _offset += _type_length * run_length;
+            break;
+        }
+        case ColumnSelectVector::FILTERED_NULL: {
+            // do nothing
+            break;
+        }
+        }
+    }
+    return Status::OK();
+}
 } // namespace doris::vectorized

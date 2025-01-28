@@ -18,6 +18,7 @@
 package org.apache.doris.persist.meta;
 
 import org.apache.doris.catalog.Env;
+import org.apache.doris.cloud.catalog.CloudEnv;
 import org.apache.doris.common.io.CountingDataOutputStream;
 
 import java.io.DataInputStream;
@@ -76,6 +77,12 @@ public class MetaPersistMethod {
                         Env.class.getDeclaredMethod("loadAlterJob", DataInputStream.class, long.class);
                 metaPersistMethod.writeMethod =
                         Env.class.getDeclaredMethod("saveAlterJob", CountingDataOutputStream.class, long.class);
+                break;
+            case "cloudWarmUpJob":
+                metaPersistMethod.readMethod = CloudEnv.class.getDeclaredMethod(
+                        "loadCloudWarmUpJob", DataInputStream.class, long.class);
+                metaPersistMethod.writeMethod = CloudEnv.class.getDeclaredMethod(
+                        "saveCloudWarmUpJob", CountingDataOutputStream.class, long.class);
                 break;
             case "recycleBin":
                 metaPersistMethod.readMethod =
@@ -197,12 +204,6 @@ public class MetaPersistMethod {
                 metaPersistMethod.writeMethod = Env.class.getDeclaredMethod("saveCatalog",
                         CountingDataOutputStream.class, long.class);
                 break;
-            case "mtmvJobManager":
-                metaPersistMethod.readMethod = Env.class.getDeclaredMethod("loadMTMVJobManager", DataInputStream.class,
-                        long.class);
-                metaPersistMethod.writeMethod = Env.class.getDeclaredMethod("saveMTMVJobManager",
-                        CountingDataOutputStream.class, long.class);
-                break;
             case "globalFunction":
                 metaPersistMethod.readMethod = Env.class.getDeclaredMethod("loadGlobalFunction", DataInputStream.class,
                         long.class);
@@ -210,16 +211,54 @@ public class MetaPersistMethod {
                         CountingDataOutputStream.class, long.class);
                 break;
             case "workloadGroups":
+            case "resourceGroups":
+                // In 2.0 alpha, there are many people using resource groups, maybe not upgrade from 2.0 alpha.
+                // So that add a compatible code here.
                 metaPersistMethod.readMethod =
                         Env.class.getDeclaredMethod("loadWorkloadGroups", DataInputStream.class, long.class);
                 metaPersistMethod.writeMethod =
                         Env.class.getDeclaredMethod("saveWorkloadGroups", CountingDataOutputStream.class, long.class);
+                break;
+            case "workloadSchedPolicy":
+                metaPersistMethod.readMethod =
+                        Env.class.getDeclaredMethod("loadWorkloadSchedPolicy", DataInputStream.class, long.class);
+                metaPersistMethod.writeMethod =
+                        Env.class.getDeclaredMethod("saveWorkloadSchedPolicy", CountingDataOutputStream.class,
+                                long.class);
                 break;
             case "binlogs":
                 metaPersistMethod.readMethod =
                         Env.class.getDeclaredMethod("loadBinlogs", DataInputStream.class, long.class);
                 metaPersistMethod.writeMethod =
                         Env.class.getDeclaredMethod("saveBinlogs", CountingDataOutputStream.class, long.class);
+                break;
+            case "AnalysisMgr":
+            case "AnalysisMgrV2":
+                metaPersistMethod.readMethod =
+                        Env.class.getDeclaredMethod("loadAnalysisManager", DataInputStream.class, long.class);
+                metaPersistMethod.writeMethod =
+                        Env.class.getDeclaredMethod("saveAnalysisMgr", CountingDataOutputStream.class, long.class);
+                break;
+            case "AsyncJobManager":
+                metaPersistMethod.readMethod =
+                        Env.class.getDeclaredMethod("loadAsyncJobManager", DataInputStream.class, long.class);
+                metaPersistMethod.writeMethod =
+                        Env.class.getDeclaredMethod("saveAsyncJobManager", CountingDataOutputStream.class, long.class);
+                break;
+            case "JobTaskManager":
+                break;
+            case "insertOverwrite":
+                metaPersistMethod.readMethod =
+                        Env.class.getDeclaredMethod("loadInsertOverwrite", DataInputStream.class, long.class);
+                metaPersistMethod.writeMethod =
+                        Env.class.getDeclaredMethod("saveInsertOverwrite", CountingDataOutputStream.class, long.class);
+                break;
+            case "plsql":
+                // package and stored procedure use the same method in PlsqlManager.
+                metaPersistMethod.readMethod = Env.class.getDeclaredMethod("loadPlsqlProcedure", DataInputStream.class,
+                        long.class);
+                metaPersistMethod.writeMethod = Env.class.getDeclaredMethod("savePlsqlProcedure",
+                        CountingDataOutputStream.class, long.class);
                 break;
             default:
                 break;

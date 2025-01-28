@@ -21,7 +21,6 @@ import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.KeysType;
 import org.apache.doris.catalog.OlapTable;
-import org.apache.doris.cluster.ClusterNamespace;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
@@ -50,7 +49,7 @@ import java.util.Map;
 //      binlog_desc:
 //          FROM BINLOG
 //          (key1=value1, ...)
-public class CreateDataSyncJobStmt extends DdlStmt {
+public class CreateDataSyncJobStmt extends DdlStmt implements NotFallbackInParser {
     private String jobName;
     private String dbName;
     private DataSyncJobType dataSyncJobType;
@@ -76,7 +75,6 @@ public class CreateDataSyncJobStmt extends DdlStmt {
             }
             dbName = analyzer.getDefaultDb();
         }
-        dbName = ClusterNamespace.getFullName(analyzer.getClusterName(), dbName);
 
         if (binlogDesc != null) {
             binlogDesc.analyze();
@@ -128,5 +126,10 @@ public class CreateDataSyncJobStmt extends DdlStmt {
 
     public DataSyncJobType getDataSyncJobType() {
         return dataSyncJobType;
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.CREATE;
     }
 }

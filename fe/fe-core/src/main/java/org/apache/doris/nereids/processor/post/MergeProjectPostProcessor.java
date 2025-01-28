@@ -22,8 +22,6 @@ import org.apache.doris.nereids.trees.expressions.NamedExpression;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalProject;
 
-import com.google.common.collect.Lists;
-
 import java.util.List;
 
 /**
@@ -33,12 +31,14 @@ public class MergeProjectPostProcessor extends PlanPostProcessor {
 
     @Override
     public PhysicalProject visitPhysicalProject(PhysicalProject<? extends Plan> project, CascadesContext ctx) {
+        project = (PhysicalProject<? extends Plan>) super.visit(project, ctx);
         Plan child = project.child();
-        Plan newChild = child.accept(this, ctx);
-        if (newChild instanceof PhysicalProject) {
-            List<NamedExpression> projections = project.mergeProjections((PhysicalProject) newChild);
-            return project.withProjectionsAndChild(projections, newChild.child(0));
+        if (child instanceof PhysicalProject) {
+            List<NamedExpression> projections = project.mergeProjections((PhysicalProject) child);
+            return (PhysicalProject) project
+                    .withProjectionsAndChild(projections, child.child(0))
+                    .copyStatsAndGroupIdFrom(project);
         }
-        return child != newChild ? project.withChildren(Lists.newArrayList(newChild)) : project;
+        return project;
     }
 }

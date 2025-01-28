@@ -52,11 +52,11 @@ private:
     /// Contiguous chunk of memory and pointer to free space inside it. Member of single-linked list.
     struct alignas(16) Chunk : private Allocator<false> /// empty base optimization
     {
-        char* begin;
-        char* pos;
-        char* end; /// does not include padding.
+        char* begin = nullptr;
+        char* pos = nullptr;
+        char* end = nullptr; /// does not include padding.
 
-        Chunk* prev;
+        Chunk* prev = nullptr;
 
         Chunk(size_t size_, Chunk* prev_) {
             begin = reinterpret_cast<char*>(Allocator<false>::alloc(size_));
@@ -84,20 +84,22 @@ private:
         size_t used() const { return pos - begin; }
     };
 
-    size_t growth_factor;
-    size_t linear_growth_threshold;
+    size_t growth_factor = 2;
+    size_t linear_growth_threshold = 128 * 1024 * 1024;
 
     /// Last contiguous chunk of memory.
-    Chunk* head;
-    size_t size_in_bytes;
+    Chunk* head = nullptr;
+    size_t size_in_bytes = 0;
+    size_t _initial_size = 4096;
     // The memory used by all chunks, excluding head.
-    size_t _used_size_no_head;
+    size_t _used_size_no_head = 0;
 
     static size_t round_up_to_page_size(size_t s) { return (s + 4096 - 1) / 4096 * 4096; }
 
     /// If chunks size is less than 'linear_growth_threshold', then use exponential growth, otherwise - linear growth
     ///  (to not allocate too much excessive memory).
-    size_t next_size(size_t min_next_size) const {
+    size_t next_size(size_t min_next_size) {
+        DCHECK(head != nullptr);
         size_t size_after_grow = 0;
 
         if (head->size() < linear_growth_threshold) {
@@ -120,10 +122,18 @@ private:
     }
 
     /// Add next contiguous chunk of memory with size not less than specified.
-    void NO_INLINE add_chunk(size_t min_size) {
+    void NO_INLINE _add_chunk(size_t min_size) {
+        DCHECK(head != nullptr);
         _used_size_no_head += head->used();
         head = new Chunk(next_size(min_size + pad_right), head);
         size_in_bytes += head->size();
+    }
+
+    void _init_head_if_needed() {
+        if (UNLIKELY(head == nullptr)) {
+            head = new Chunk(_initial_size, nullptr);
+            size_in_bytes += head->size();
+        }
     }
 
     friend class ArenaAllocator;
@@ -135,15 +145,18 @@ public:
           size_t linear_growth_threshold_ = 128 * 1024 * 1024)
             : growth_factor(growth_factor_),
               linear_growth_threshold(linear_growth_threshold_),
-              head(new Chunk(initial_size_, nullptr)),
-              size_in_bytes(head->size()),
+              _initial_size(initial_size_),
               _used_size_no_head(0) {}
 
     ~Arena() { delete head; }
 
     /// Get piece of memory, without alignment.
     char* alloc(size_t size) {
-        if (UNLIKELY(head->pos + size > head->end)) add_chunk(size);
+        _init_head_if_needed();
+
+        if (UNLIKELY(head->pos + size > head->end)) {
+            _add_chunk(size);
+        }
 
         char* res = head->pos;
         head->pos += size;
@@ -153,6 +166,8 @@ public:
 
     /// Get piece of memory with alignment
     char* aligned_alloc(size_t size, size_t alignment) {
+        _init_head_if_needed();
+
         do {
             void* head_pos = head->pos;
             size_t space = head->end - head->pos;
@@ -165,7 +180,7 @@ public:
                 return res;
             }
 
-            add_chunk(size + alignment);
+            _add_chunk(size + alignment);
         } while (true);
     }
 
@@ -180,6 +195,8 @@ public:
 	  * the allocation it intended to roll back was indeed the last one.
       */
     void* rollback(size_t size) {
+        DCHECK(head != nullptr);
+
         head->pos -= size;
         ASAN_POISON_MEMORY_REGION(head->pos, size + pad_right);
         return head->pos;
@@ -197,8 +214,8 @@ public:
       * NOTE This method is usable only for the last allocation made on this
       * Arena. For earlier allocations, see 'realloc' method.
       */
-    char* alloc_continue(size_t additional_bytes, char const*& range_start,
-                         size_t start_alignment = 0) {
+    [[nodiscard]] char* alloc_continue(size_t additional_bytes, char const*& range_start,
+                                       size_t start_alignment = 0) {
         if (!range_start) {
             // Start a new memory range.
             char* result = start_alignment ? aligned_alloc(additional_bytes, start_alignment)
@@ -207,6 +224,8 @@ public:
             range_start = result;
             return result;
         }
+
+        DCHECK(head != nullptr);
 
         // Extend an existing memory range with 'additional_bytes'.
 
@@ -245,7 +264,7 @@ public:
     }
 
     /// NOTE Old memory region is wasted.
-    char* realloc(const char* old_data, size_t old_size, size_t new_size) {
+    [[nodiscard]] char* realloc(const char* old_data, size_t old_size, size_t new_size) {
         char* res = alloc(new_size);
         if (old_data) {
             memcpy(res, old_data, old_size);
@@ -254,8 +273,8 @@ public:
         return res;
     }
 
-    char* aligned_realloc(const char* old_data, size_t old_size, size_t new_size,
-                          size_t alignment) {
+    [[nodiscard]] char* aligned_realloc(const char* old_data, size_t old_size, size_t new_size,
+                                        size_t alignment) {
         char* res = aligned_alloc(new_size, alignment);
         if (old_data) {
             memcpy(res, old_data, old_size);
@@ -265,24 +284,63 @@ public:
     }
 
     /// Insert string without alignment.
-    const char* insert(const char* data, size_t size) {
+    [[nodiscard]] const char* insert(const char* data, size_t size) {
         char* res = alloc(size);
         memcpy(res, data, size);
         return res;
     }
 
-    const char* aligned_insert(const char* data, size_t size, size_t alignment) {
+    [[nodiscard]] const char* aligned_insert(const char* data, size_t size, size_t alignment) {
         char* res = aligned_alloc(size, alignment);
         memcpy(res, data, size);
         return res;
     }
 
+    /**
+    * Delete all the chunks before the head, usually the head is the largest chunk in the arena.
+    * considering the scenario of memory reuse:
+    * 1. first time, use arena alloc 64K memory, 4K each time, at this time, there are 4 chunks of 4k 8k 16k 32k in arena.
+    * 2. then, clear arena, only one 32k chunk left in the arena.
+    * 3. second time, same alloc 64K memory, there are 4 chunks of 4k 8k 16k 32k in arena.
+    * 4. then, clear arena, only one 64k chunk left in the arena.
+    * 5. third time, same alloc 64K memory, there is still only one 64K chunk in the arena, and the memory is fully reused.
+    *
+    * special case: if the chunk is larger than 128M, it will no longer be expanded by a multiple of 2.
+    * If alloc 4G memory, 128M each time, then only one 128M chunk will be reserved after clearing,
+    * and only 128M can be reused when you apply for 4G memory again.
+    */
+    void clear() {
+        if (head == nullptr) {
+            return;
+        }
+
+        if (head->prev) {
+            delete head->prev;
+            head->prev = nullptr;
+        }
+        head->pos = head->begin;
+        size_in_bytes = head->size();
+        _used_size_no_head = 0;
+    }
+
     /// Size of chunks in bytes.
     size_t size() const { return size_in_bytes; }
 
-    size_t used_size() const { return _used_size_no_head + head->used(); }
+    size_t used_size() const {
+        if (head == nullptr) {
+            return _used_size_no_head;
+        }
 
-    size_t remaining_space_in_current_chunk() const { return head->remaining(); }
+        return _used_size_no_head + head->used();
+    }
+
+    size_t remaining_space_in_current_chunk() const {
+        if (head == nullptr) {
+            return 0;
+        }
+
+        return head->remaining();
+    }
 };
 
 using ArenaPtr = std::shared_ptr<Arena>;

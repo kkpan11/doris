@@ -18,16 +18,20 @@
 package org.apache.doris.nereids.analyzer;
 
 import org.apache.doris.nereids.trees.expressions.Slot;
-import org.apache.doris.nereids.trees.expressions.SubqueryExpr;
+import org.apache.doris.nereids.util.Utils;
 
-import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableList.Builder;
+import com.google.common.base.Suppliers;
+import com.google.common.collect.LinkedListMultimap;
+import com.google.common.collect.ListMultimap;
 import com.google.common.collect.Sets;
 
+import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Supplier;
 
 /**
  * The slot range required for expression analyze.
@@ -48,27 +52,30 @@ import java.util.Set;
  * outerScope:
  *      slots: k1, v1;
  *      outerScope: Optional.empty();
- *      ownerSubquery: Optionsl.empty();
+ *      ownerSubquery: Optional.empty();
  *      subqueryToOuterCorrelatedSlots: empty();
  * ownerSubquery: subquery((select sum(k2) from t2 where t1.v1 = t2.v2));
  * subqueryToOuterCorrelatedSlots: (subquery, v1);
  */
 public class Scope {
+
     private final Optional<Scope> outerScope;
     private final List<Slot> slots;
+    private final Set<Slot> correlatedSlots;
+    private final boolean buildNameToSlot;
+    private final Supplier<ListMultimap<String, Slot>> nameToSlot;
 
-    private final Optional<SubqueryExpr> ownerSubquery;
-    private Set<Slot> correlatedSlots;
-
-    public Scope(Optional<Scope> outerScope, List<Slot> slots, Optional<SubqueryExpr> subqueryExpr) {
-        this.outerScope = outerScope;
-        this.slots = ImmutableList.copyOf(Objects.requireNonNull(slots, "slots can not be null"));
-        this.ownerSubquery = subqueryExpr;
-        this.correlatedSlots = Sets.newLinkedHashSet();
+    public Scope(List<? extends Slot> slots) {
+        this(Optional.empty(), slots);
     }
 
-    public Scope(List<Slot> slots) {
-        this(Optional.empty(), slots, Optional.empty());
+    /** Scope */
+    public Scope(Optional<Scope> outerScope, List<? extends Slot> slots) {
+        this.outerScope = Objects.requireNonNull(outerScope, "outerScope can not be null");
+        this.slots = Utils.fastToImmutableList(Objects.requireNonNull(slots, "slots can not be null"));
+        this.correlatedSlots = Sets.newLinkedHashSet();
+        this.buildNameToSlot = slots.size() > 500;
+        this.nameToSlot = buildNameToSlot ? Suppliers.memoize(this::buildNameToSlot) : null;
     }
 
     public List<Slot> getSlots() {
@@ -79,25 +86,32 @@ public class Scope {
         return outerScope;
     }
 
-    public Optional<SubqueryExpr> getSubquery() {
-        return ownerSubquery;
-    }
-
     public Set<Slot> getCorrelatedSlots() {
         return correlatedSlots;
     }
 
-    /**
-     * generate scope link from inner to outer.
-     * Used for multi-level subquery parsing.
-     */
-    public List<Scope> toScopeLink() {
-        Scope scope = this;
-        Builder<Scope> builder = ImmutableList.<Scope>builder().add(scope);
-        while (scope.getOuterScope().isPresent()) {
-            scope = scope.getOuterScope().get();
-            builder.add(scope);
+    /** findSlotIgnoreCase */
+    public List<Slot> findSlotIgnoreCase(String slotName) {
+        if (!buildNameToSlot) {
+            Object[] array = new Object[slots.size()];
+            int filterIndex = 0;
+            for (int i = 0; i < slots.size(); i++) {
+                Slot slot = slots.get(i);
+                if (slot.getName().equalsIgnoreCase(slotName)) {
+                    array[filterIndex++] = slot;
+                }
+            }
+            return (List) Arrays.asList(array).subList(0, filterIndex);
+        } else {
+            return nameToSlot.get().get(slotName.toUpperCase(Locale.ROOT));
         }
-        return builder.build();
+    }
+
+    private ListMultimap<String, Slot> buildNameToSlot() {
+        ListMultimap<String, Slot> map = LinkedListMultimap.create(slots.size());
+        for (Slot slot : slots) {
+            map.put(slot.getName().toUpperCase(Locale.ROOT), slot);
+        }
+        return map;
     }
 }

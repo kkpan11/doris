@@ -141,6 +141,23 @@ suite("aggregate") {
     qt_aggregate32" select topn_weighted(c_string,c_bigint,3) from ${tableName}"
     qt_aggregate33" select avg_weighted(c_double,c_bigint) from ${tableName};"
     qt_aggregate34" select percentile_array(c_bigint,[0.2,0.5,0.9]) from ${tableName};"
+    
+    try {
+        sql "select percentile_array(c_bigint,[-1,0.5,0.9]) from ${tableName};"
+    } catch (Exception ex) {
+        assert("${ex}".contains("-1"))
+    }
+    try {
+        sql "select percentile_array(c_bigint,[0.5,0.9,3000]) from ${tableName};"
+    } catch (Exception ex) {
+        assert("${ex}".contains("3000"))
+    }
+    try {
+        sql "select percentile_array(c_bigint,[0.5,0.9,null]) from ${tableName};"
+    } catch (Exception ex) {
+        assert("${ex}".contains("null"))
+    }
+
     qt_aggregate """
                 SELECT c_bigint,  
                     CASE
@@ -304,4 +321,8 @@ suite("aggregate") {
     qt_subquery_without_inner_predicate """
         select count(*) from (select t2.c_bigint, t2.c_double, t2.c_string from (select c_bigint, c_double, c_string, c_date,c_timestamp, c_short_decimal from regression_test_query_p0_aggregate.${tableName} where c_bigint > 5000) t2)t1
     """
+
+    qt_aggregate_limit_contain_null """
+    select count(), cast(k12 as int) as t from baseall group by t limit 1;
+	"""
 }

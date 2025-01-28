@@ -17,18 +17,23 @@
 
 package org.apache.doris.statistics;
 
-import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.Column;
+import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.InternalSchemaInitializer;
+import org.apache.doris.catalog.OlapTable;
+import org.apache.doris.catalog.PrimitiveType;
+import org.apache.doris.common.Pair;
 import org.apache.doris.common.jmockit.Deencapsulation;
-import org.apache.doris.statistics.AnalysisTaskInfo.AnalysisMethod;
-import org.apache.doris.statistics.AnalysisTaskInfo.AnalysisMode;
-import org.apache.doris.statistics.AnalysisTaskInfo.AnalysisType;
-import org.apache.doris.statistics.AnalysisTaskInfo.JobType;
-import org.apache.doris.statistics.util.BlockingCounter;
+import org.apache.doris.datasource.InternalCatalog;
+import org.apache.doris.qe.StmtExecutor;
+import org.apache.doris.statistics.AnalysisInfo.AnalysisMethod;
+import org.apache.doris.statistics.AnalysisInfo.AnalysisType;
+import org.apache.doris.statistics.AnalysisInfo.JobType;
+import org.apache.doris.statistics.util.DBObjects;
+import org.apache.doris.statistics.util.StatisticsUtil;
 import org.apache.doris.utframe.TestWithFeService;
 
-import com.google.common.collect.Maps;
-import mockit.Expectations;
+import com.google.common.collect.Sets;
 import mockit.Mock;
 import mockit.MockUp;
 import mockit.Mocked;
@@ -36,95 +41,135 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
 import java.util.Collections;
-import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class AnalysisTaskExecutorTest extends TestWithFeService {
 
-    @Mocked
-    AnalysisTaskScheduler analysisTaskScheduler;
 
     @Override
     protected void runBeforeAll() throws Exception {
         try {
-            InternalSchemaInitializer.createDB();
+            InternalSchemaInitializer.createDb();
             createDatabase("analysis_job_test");
-            connectContext.setDatabase("default_cluster:analysis_job_test");
+            connectContext.setDatabase("analysis_job_test");
             createTable("CREATE TABLE t1 (col1 int not null, col2 int not null, col3 int not null)\n"
 
                     + "DISTRIBUTED BY HASH(col3)\n" + "BUCKETS 1\n"
                     + "PROPERTIES(\n" + "    \"replication_num\"=\"1\"\n"
                     + ");");
-            InternalSchemaInitializer storageInitializer = new InternalSchemaInitializer();
-            Env.getCurrentEnv().createTable(storageInitializer.buildAnalysisJobTblStmt());
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
     }
 
     @Test
-    public void testExpiredJobCancellation() throws Exception {
-        AnalysisTaskInfo analysisJobInfo = new AnalysisTaskInfoBuilder().setJobId(0).setTaskId(0)
-                .setCatalogName("internal").setDbName("default_cluster:analysis_job_test").setTblName("t1")
+    public void testExpiredJobCancellation(@Mocked InternalCatalog catalog, @Mocked Database database,
+            @Mocked OlapTable olapTable) throws Exception {
+        new MockUp<StatisticsUtil>() {
+
+            @Mock
+            public DBObjects convertIdToObjects(long catalogId, long dbId, long tblId) {
+                return new DBObjects(catalog, database, olapTable);
+            }
+        };
+        new MockUp<OlapTable>() {
+
+            @Mock
+            public Column getColumn(String name) {
+                return new Column("col1", PrimitiveType.INT);
+            }
+        };
+        final AtomicBoolean cancelled = new AtomicBoolean();
+        new MockUp<AnalysisTaskWrapper>() {
+
+            @Mock
+            public boolean cancel(String msg) {
+                cancelled.set(true);
+                return true;
+            }
+        };
+        AnalysisInfo analysisJobInfo = new AnalysisInfoBuilder().setJobId(0).setTaskId(0)
+                .setCatalogId(0)
+                .setDBId(0)
+                .setTblId(0)
                 .setColName("col1").setJobType(JobType.MANUAL)
-                .setAnalysisMode(AnalysisMode.FULL)
                 .setAnalysisMethod(AnalysisMethod.FULL)
-                .setAnalysisType(AnalysisType.COLUMN)
+                .setAnalysisType(AnalysisType.FUNDAMENTALS)
                 .build();
         OlapAnalysisTask analysisJob = new OlapAnalysisTask(analysisJobInfo);
 
-        new MockUp<AnalysisTaskScheduler>() {
-            public synchronized BaseAnalysisTask getPendingTasks() {
-                return analysisJob;
-            }
-        };
-
-        AnalysisTaskExecutor analysisTaskExecutor = new AnalysisTaskExecutor(analysisTaskScheduler);
-        BlockingQueue<AnalysisTaskWrapper> b = Deencapsulation.getField(analysisTaskExecutor, "taskQueue");
+        AnalysisTaskExecutor analysisTaskExecutor = new AnalysisTaskExecutor(1);
         AnalysisTaskWrapper analysisTaskWrapper = new AnalysisTaskWrapper(analysisTaskExecutor, analysisJob);
         Deencapsulation.setField(analysisTaskWrapper, "startTime", 5);
-        b.put(analysisTaskWrapper);
-        analysisTaskExecutor.start();
-        BlockingCounter counter = Deencapsulation.getField(analysisTaskExecutor, "blockingCounter");
-        int sleepTime = 500;
-        while (counter.getVal() != 0 && sleepTime > 0) {
-            sleepTime -= 100;
-            Thread.sleep(100);
-        }
-        Assertions.assertEquals(0, counter.getVal());
+        analysisTaskExecutor.putJob(analysisTaskWrapper);
+        analysisTaskExecutor.tryToCancel();
+        Assertions.assertTrue(cancelled.get());
+        Assertions.assertEquals(0, analysisTaskExecutor.getTaskQueue().size());
     }
 
     @Test
-    public void testTaskExecution() throws Exception {
-        AnalysisTaskExecutor analysisTaskExecutor = new AnalysisTaskExecutor(analysisTaskScheduler);
-        HashMap<String, Set<String>> colToPartitions = Maps.newHashMap();
-        colToPartitions.put("col1", Collections.singleton("t1"));
-        AnalysisTaskInfo analysisTaskInfo = new AnalysisTaskInfoBuilder().setJobId(0).setTaskId(0)
-                .setCatalogName("internal").setDbName("default_cluster:analysis_job_test").setTblName("t1")
-                .setColName("col1").setJobType(JobType.MANUAL)
-                .setAnalysisMode(AnalysisMode.FULL)
-                .setAnalysisMethod(AnalysisMethod.FULL)
-                .setAnalysisType(AnalysisType.COLUMN)
-                .setColToPartitions(colToPartitions)
-                .build();
-        OlapAnalysisTask task = new OlapAnalysisTask(analysisTaskInfo);
-        new MockUp<AnalysisTaskScheduler>() {
+    public void testTaskExecution(@Mocked InternalCatalog catalog, @Mocked Database database,
+            @Mocked OlapTable olapTable) throws Exception {
+        new MockUp<StatisticsUtil>() {
+
             @Mock
-            public synchronized BaseAnalysisTask getPendingTasks() {
-                return task;
+            public DBObjects convertIdToObjects(long catalogId, long dbId, long tblId) {
+                return new DBObjects(catalog, database, olapTable);
             }
         };
+        new MockUp<OlapTable>() {
+
+            @Mock
+            public Column getColumn(String name) {
+                return new Column("col1", PrimitiveType.INT);
+            }
+        };
+        new MockUp<StmtExecutor>() {
+            @Mock
+            public List<ResultRow> executeInternalQuery() {
+                return Collections.emptyList();
+            }
+        };
+
+        new MockUp<OlapAnalysisTask>() {
+            @Mock
+            public void execSQLs(List<String> partitionAnalysisSQLs, Map<String, String> params) throws Exception {
+            }
+
+            @Mock
+            protected void executeWithExceptionOnFail(StmtExecutor stmtExecutor) throws Exception {
+                // DO NOTHING
+            }
+        };
+
+        new MockUp<StatisticsCache>() {
+
+            @Mock
+            public void syncLoadColStats(long tableId, long idxId, String colName) {
+            }
+        };
+
+        AnalysisTaskExecutor analysisTaskExecutor = new AnalysisTaskExecutor(1);
+        Set<Pair<String, String>> columns = Sets.newHashSet();
+        columns.add(Pair.of("col1", "t1"));
+        AnalysisInfo analysisInfo = new AnalysisInfoBuilder().setJobId(0).setTaskId(0)
+                .setCatalogId(0).setDBId(0).setTblId(0)
+                .setColName("col1").setJobType(JobType.MANUAL)
+                .setAnalysisMethod(AnalysisMethod.FULL)
+                .setAnalysisType(AnalysisType.FUNDAMENTALS)
+                .setState(AnalysisState.RUNNING)
+                .setJobColumns(columns)
+                .build();
+        OlapAnalysisTask task = new OlapAnalysisTask(analysisInfo);
+
         new MockUp<AnalysisManager>() {
             @Mock
-            public void updateTaskStatus(AnalysisTaskInfo info, AnalysisState jobState, String message, long time) {}
+            public void updateTaskStatus(AnalysisInfo info, AnalysisState jobState, String message, long time) {}
         };
-        new Expectations() {
-            {
-                task.execute();
-                times = 1;
-            }
-        };
-        Deencapsulation.invoke(analysisTaskExecutor, "doFetchAndExecute");
+
+        Deencapsulation.invoke(analysisTaskExecutor, "submitTask", task);
     }
 }

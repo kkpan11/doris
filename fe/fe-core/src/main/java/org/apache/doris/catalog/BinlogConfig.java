@@ -44,7 +44,7 @@ public class BinlogConfig implements Writable {
     @SerializedName("maxHistoryNums")
     private long maxHistoryNums;
 
-    public static final long TTL_SECONDS = 0x7fffffffffffffffL;
+    public static final long TTL_SECONDS = 86400L; // 1 day
     public static final long MAX_BYTES = 0x7fffffffffffffffL;
     public static final long MAX_HISTORY_NUMS = 0x7fffffffffffffffL;
 
@@ -64,6 +64,10 @@ public class BinlogConfig implements Writable {
     }
 
     public void mergeFromProperties(Map<String, String> properties) {
+        if (properties == null) {
+            return;
+        }
+
         if (properties.containsKey(PropertyAnalyzer.PROPERTIES_BINLOG_ENABLE)) {
             enable = Boolean.parseBoolean(properties.get(
                     PropertyAnalyzer.PROPERTIES_BINLOG_ENABLE));
@@ -178,5 +182,11 @@ public class BinlogConfig implements Writable {
                 .append("\"");
         sb.append(",\n\"").append(PropertyAnalyzer.PROPERTIES_BINLOG_MAX_HISTORY_NUMS).append("\" = \"")
                 .append(maxHistoryNums).append("\"");
+    }
+
+    public static BinlogConfig fromProperties(Map<String, String> properties) {
+        BinlogConfig binlogConfig = new BinlogConfig();
+        binlogConfig.mergeFromProperties(properties);
+        return binlogConfig;
     }
 }

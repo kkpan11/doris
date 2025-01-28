@@ -22,39 +22,44 @@ import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.UserException;
-import org.apache.doris.common.util.Util;
+import org.apache.doris.common.util.InternalDatabaseUtil;
 import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.qe.ConnectContext;
 
 // TRUNCATE TABLE tbl [PARTITION(p1, p2, ...)]
-public class TruncateTableStmt extends DdlStmt {
+public class TruncateTableStmt extends DdlStmt implements NotFallbackInParser {
 
     private TableRef tblRef;
+    private boolean forceDrop;
 
-    public TruncateTableStmt(TableRef tblRef) {
+    public TruncateTableStmt(TableRef tblRef, boolean forceDrop) {
         this.tblRef = tblRef;
+        this.forceDrop = forceDrop;
     }
 
     public TableRef getTblRef() {
         return tblRef;
     }
 
+    public boolean isForceDrop() {
+        return forceDrop;
+    }
+
     @Override
     public void analyze(Analyzer analyzer) throws AnalysisException, UserException {
         super.analyze(analyzer);
         tblRef.getName().analyze(analyzer);
-        // disallow external catalog
-        Util.prohibitExternalCatalog(tblRef.getName().getCtl(), this.getClass().getSimpleName());
 
         if (tblRef.hasExplicitAlias()) {
             throw new AnalysisException("Not support truncate table with alias");
         }
-
+        InternalDatabaseUtil.checkDatabase(tblRef.getName().getDb(), ConnectContext.get());
         // check access
         // it requires LOAD privilege, because we consider this operation as 'delete data', which is also a
         // 'load' operation.
-        if (!Env.getCurrentEnv().getAccessManager().checkTblPriv(ConnectContext.get(), tblRef.getName().getDb(),
-                tblRef.getName().getTbl(), PrivPredicate.LOAD)) {
+        if (!Env.getCurrentEnv().getAccessManager()
+                .checkTblPriv(ConnectContext.get(), tblRef.getName().getCtl(), tblRef.getName().getDb(),
+                        tblRef.getName().getTbl(), PrivPredicate.LOAD)) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR, "LOAD");
         }
 
@@ -76,7 +81,25 @@ public class TruncateTableStmt extends DdlStmt {
         if (tblRef.getPartitionNames() != null) {
             sb.append(tblRef.getPartitionNames().toSql());
         }
+        if (isForceDrop()) {
+            sb.append(" FORCE");
+        }
         return sb.toString();
     }
 
+    public String toSqlWithoutTable() {
+        StringBuilder sb = new StringBuilder();
+        if (tblRef.getPartitionNames() != null) {
+            sb.append(tblRef.getPartitionNames().toSql());
+        }
+        if (isForceDrop()) {
+            sb.append(" FORCE");
+        }
+        return sb.toString();
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.TRUNCATE;
+    }
 }

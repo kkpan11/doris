@@ -71,6 +71,8 @@
 
 namespace doris {
 
+using int128_t = __int128;
+
 /*
  * Template JsonbParserTSIMD
  */
@@ -83,22 +85,22 @@ public:
 
     // parse a UTF-8 JSON string
     bool parse(const std::string& str, hDictInsert handler = nullptr) {
-        return parse(str.c_str(), (unsigned int)str.size(), handler);
+        return parse(str.c_str(), str.size(), handler);
     }
 
     // parse a UTF-8 JSON c-style string (NULL terminated)
     bool parse(const char* c_str, hDictInsert handler = nullptr) {
-        return parse(c_str, (unsigned int)strlen(c_str), handler);
+        return parse(c_str, strlen(c_str), handler);
     }
 
     // parse a UTF-8 JSON string with length
-    bool parse(const char* pch, unsigned int len, hDictInsert handler = nullptr) {
+    bool parse(const char* pch, size_t len, hDictInsert handler = nullptr) {
         // reset state before parse
         reset();
 
         if (!pch || len == 0) {
             err_ = JsonbErrType::E_EMPTY_DOCUMENT;
-            LOG(WARNING) << "empty json string";
+            VLOG_DEBUG << "empty json string";
             return false;
         }
 
@@ -134,7 +136,7 @@ public:
                 break;
             }
             case simdjson::ondemand::json_type::number: {
-                write_number(doc.get_number());
+                write_number(doc.get_number(), doc.raw_json_token());
                 break;
             }
             }
@@ -142,7 +144,7 @@ public:
             return err_ == JsonbErrType::E_NONE;
         } catch (simdjson::simdjson_error& e) {
             err_ = JsonbErrType::E_EXCEPTION;
-            LOG(WARNING) << "simdjson parse exception: " << e.what();
+            VLOG_DEBUG << "simdjson parse exception: " << e.what();
             return false;
         }
     }
@@ -170,7 +172,7 @@ public:
             break;
         }
         case simdjson::ondemand::json_type::number: {
-            write_number(value.get_number());
+            write_number(value.get_number(), value.raw_json_token());
             break;
         }
         case simdjson::ondemand::json_type::object: {
@@ -288,29 +290,44 @@ public:
         }
     }
 
-    void write_number(simdjson::ondemand::number num) {
+    void write_number(simdjson::ondemand::number num, std::string_view raw_string) {
         if (num.is_double()) {
-            if (writer_.writeDouble(num.get_double()) == 0) {
+            double number = num.get_double();
+            // When a double exceeds the precision that can be represented by a double type in simdjson, it gets converted to 0.
+            // The correct approach, should be to truncate the double value instead.
+            if (number == 0) {
+                StringParser::ParseResult result;
+                number = StringParser::string_to_float<double>(raw_string.data(), raw_string.size(),
+                                                               &result);
+                if (result != StringParser::PARSE_SUCCESS) {
+                    err_ = JsonbErrType::E_INVALID_NUMBER;
+                    LOG(WARNING) << "invalid number, raw string is: " << raw_string;
+                    return;
+                }
+            }
+
+            if (writer_.writeDouble(number) == 0) {
                 err_ = JsonbErrType::E_OUTPUT_FAIL;
                 LOG(WARNING) << "writeDouble failed";
                 return;
             }
         } else if (num.is_int64() || num.is_uint64()) {
-            if (num.is_uint64() && num.get_uint64() > std::numeric_limits<int64_t>::max()) {
-                err_ = JsonbErrType::E_OCTAL_OVERFLOW;
-                LOG(WARNING) << "overflow number: " << num.get_uint64();
-                return;
-            }
-            int64_t val = num.is_int64() ? num.get_int64() : num.get_uint64();
+            int128_t val = num.is_int64() ? (int128_t)num.get_int64() : (int128_t)num.get_uint64();
             int size = 0;
-            if (val <= std::numeric_limits<int8_t>::max()) {
+            if (val >= std::numeric_limits<int8_t>::min() &&
+                val <= std::numeric_limits<int8_t>::max()) {
                 size = writer_.writeInt8((int8_t)val);
-            } else if (val <= std::numeric_limits<int16_t>::max()) {
+            } else if (val >= std::numeric_limits<int16_t>::min() &&
+                       val <= std::numeric_limits<int16_t>::max()) {
                 size = writer_.writeInt16((int16_t)val);
-            } else if (val <= std::numeric_limits<int32_t>::max()) {
+            } else if (val >= std::numeric_limits<int32_t>::min() &&
+                       val <= std::numeric_limits<int32_t>::max()) {
                 size = writer_.writeInt32((int32_t)val);
-            } else { // val <= INT64_MAX
-                size = writer_.writeInt64(val);
+            } else if (val >= std::numeric_limits<int64_t>::min() &&
+                       val <= std::numeric_limits<int64_t>::max()) {
+                size = writer_.writeInt64((int64_t)val);
+            } else { // INT128
+                size = writer_.writeInt128(val);
             }
 
             if (size == 0) {

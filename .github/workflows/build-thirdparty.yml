@@ -19,6 +19,9 @@ name: Build Third Party Libraries
 
 on:
   pull_request:
+  workflow_dispatch:
+  issue_comment:
+    types: [ created ]  
 
 concurrency:
   group: ${{ github.ref }} (Build Third Party Libraries)
@@ -28,11 +31,17 @@ jobs:
   changes:
     name: Detect Changes
     runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'pull_request') ||
+      (github.event_name == 'issue_comment' &&
+       github.event.comment.body == 'run buildall' &&
+       github.actor == 'doris-robot' &&
+       github.event.issue.user.login == 'github-actions[bot]') 
     outputs:
       thirdparty_changes: ${{ steps.filter.outputs.thirdparty_changes }}
     steps:
       - name: Checkout ${{ github.ref }}
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           persist-credentials: false
           submodules: recursive
@@ -51,8 +60,23 @@ jobs:
     if: ${{ needs.changes.outputs.thirdparty_changes == 'true' }}
     runs-on: ubuntu-22.04
     steps:
+      - name: Checkout easimon/maximize-build-space
+        run: |
+          git clone -b v7 https://github.com/easimon/maximize-build-space
+
+      - name: Maximize build space
+        uses: ./maximize-build-space
+        with:
+            root-reserve-mb: 4096
+            swap-size-mb: 8192
+            remove-dotnet: 'true'
+            remove-android: 'true'
+            remove-haskell: 'true'
+            remove-codeql: 'true'
+            remove-docker-images: 'true'
+
       - name: Checkout ${{ github.ref }}
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Download
         run: |
@@ -95,7 +119,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt install --yes "${packages[@]}"
 
           mkdir -p "${DEFAULT_DIR}"
-          wget https://github.com/amosbird/ldb_toolchain_gen/releases/download/v0.17/ldb_toolchain_gen.sh \
+          wget https://github.com/amosbird/ldb_toolchain_gen/releases/download/v0.18/ldb_toolchain_gen.sh \
             -q -O /tmp/ldb_toolchain_gen.sh
           bash /tmp/ldb_toolchain_gen.sh "${DEFAULT_DIR}/ldb-toolchain"
 
@@ -114,10 +138,10 @@ jobs:
     name: Build Third Party Libraries (macOS)
     needs: changes
     if: ${{ needs.changes.outputs.thirdparty_changes == 'true' }}
-    runs-on: macos-12
+    runs-on: macos-13
     steps:
       - name: Checkout ${{ github.ref }}
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Download
         run: |
@@ -129,6 +153,7 @@ jobs:
       - name: Prepare
         run: |
           packages=(
+            'm4'
             'automake'
             'autoconf'
             'libtool'
@@ -151,10 +176,63 @@ jobs:
             'llvm@16'
           )
 
-          brew install "${packages[@]}"
+          brew install "${packages[@]}" || true
 
       - name: Build
         run: |
+          export MACOSX_DEPLOYMENT_TARGET=12.0
+
+          cd thirdparty
+          ./build-thirdparty.sh -j "$(nproc)"
+
+  build_macos_arm64:
+    name: Build Third Party Libraries (macOS-arm64)
+    needs: changes
+    if: ${{ needs.changes.outputs.thirdparty_changes == 'true' }}
+    runs-on: macos-14
+    steps:
+      - name: Checkout ${{ github.ref }}
+        uses: actions/checkout@v4
+
+      - name: Download
+        run: |
+          cd thirdparty
+          curl -L https://github.com/apache/doris-thirdparty/releases/download/automation/doris-thirdparty-source.tgz \
+            -o doris-thirdparty-source.tgz
+          tar -zxvf doris-thirdparty-source.tgz
+
+      - name: Prepare
+        run: |
+          packages=(
+            'm4'
+            'automake'
+            'autoconf'
+            'libtool'
+            'pkg-config'
+            'texinfo'
+            'coreutils'
+            'gnu-getopt'
+            'python@3'
+            'cmake'
+            'ninja'
+            'ccache'
+            'bison'
+            'byacc'
+            'gettext'
+            'wget'
+            'pcre'
+            'openjdk@11'
+            'maven'
+            'node'
+            'llvm@16'
+          )
+
+          brew install "${packages[@]}" || true
+
+      - name: Build
+        run: |
+          export MACOSX_DEPLOYMENT_TARGET=12.0
+
           cd thirdparty
           ./build-thirdparty.sh -j "$(nproc)"
 

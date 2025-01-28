@@ -16,3 +16,4 @@ value2	BIGINT	Yes	false	\N	NONE
 -- !select_tb --
 1	Beijing	21474836478	\N
 2	Beijing	21474836478	21474836478
+

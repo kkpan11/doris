@@ -19,7 +19,7 @@ package org.apache.doris.nereids.trees.expressions;
 
 import org.apache.doris.nereids.trees.expressions.shape.UnaryExpression;
 import org.apache.doris.nereids.trees.expressions.typecoercion.ExpectsInputTypes;
-import org.apache.doris.nereids.types.coercion.AbstractDataType;
+import org.apache.doris.nereids.types.DataType;
 
 import com.google.common.collect.ImmutableList;
 
@@ -33,20 +33,20 @@ public abstract class UnaryOperator extends Expression implements UnaryExpressio
 
     protected final String symbol;
 
-    public UnaryOperator(Expression child, String symbol) {
+    protected UnaryOperator(List<Expression> child, String symbol) {
         super(child);
         this.symbol = symbol;
     }
 
-    public abstract AbstractDataType inputType();
+    public abstract DataType inputType();
 
     @Override
-    public List<AbstractDataType> expectedInputTypes() {
+    public List<DataType> expectedInputTypes() {
         return ImmutableList.of(inputType());
     }
 
     @Override
-    public String toSql() {
+    public String computeToSql() {
         return "(" + symbol + " " + child().toSql() + ")";
     }
 
@@ -56,7 +56,7 @@ public abstract class UnaryOperator extends Expression implements UnaryExpressio
     }
 
     @Override
-    public int hashCode() {
+    public int computeHashCode() {
         return Objects.hash(symbol, child());
     }
 

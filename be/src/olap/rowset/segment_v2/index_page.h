@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "common/status.h"
+#include "olap/metadata_adder.h"
 #include "olap/rowset/segment_v2/page_pointer.h"
 #include "util/faststring.h"
 #include "util/slice.h"
@@ -79,7 +80,7 @@ private:
     uint32_t _count = 0;
 };
 
-class IndexPageReader {
+class IndexPageReader : public MetadataAdder<IndexPageReader> {
 public:
     IndexPageReader() : _parsed(false) {}
 
@@ -110,11 +111,14 @@ public:
     void reset();
 
 private:
+    int64_t get_metadata_size() const override;
+
     bool _parsed;
 
     IndexPageFooterPB _footer;
     std::vector<Slice> _keys;
     std::vector<PagePointer> _values;
+    int64_t _vl_field_mem_size {0};
 };
 
 class IndexPageIterator {
@@ -123,7 +127,7 @@ public:
 
     // Find the largest index entry whose key is <= search_key.
     // Return OK status when such entry exists.
-    // Return NotFound when no such entry is found (all keys > search_key).
+    // Return ENTRY_NOT_FOUND when no such entry is found (all keys > search_key).
     // Return other error status otherwise.
     Status seek_at_or_before(const Slice& search_key);
 
@@ -147,7 +151,7 @@ public:
     const PagePointer& current_page_pointer() const { return _reader->get_value(_pos); }
 
 private:
-    const IndexPageReader* _reader;
+    const IndexPageReader* _reader = nullptr;
 
     size_t _pos;
 };

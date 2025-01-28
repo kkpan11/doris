@@ -21,47 +21,66 @@
 
 #include <ostream>
 
+#include "runtime/exec_env.h"
+
 namespace doris {
+template <typename TAllocator>
+PageBase<TAllocator>::PageBase(size_t b, bool use_cache, segment_v2::PageTypePB page_type)
+        : LRUCacheValueBase(), _size(b), _capacity(b) {
+    if (use_cache) {
+        _mem_tracker_by_allocator = StoragePageCache::instance()->mem_tracker(page_type);
+    } else {
+        _mem_tracker_by_allocator = thread_context()->thread_mem_tracker_mgr->limiter_mem_tracker();
+    }
+    {
+        SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_mem_tracker_by_allocator);
+        _data = reinterpret_cast<char*>(TAllocator::alloc(_capacity, ALLOCATOR_ALIGNMENT_16));
+    }
+}
 
-StoragePageCache* StoragePageCache::_s_instance = nullptr;
+template <typename TAllocator>
+PageBase<TAllocator>::~PageBase() {
+    if (_data != nullptr) {
+        DCHECK(_capacity != 0 && _size != 0);
+        SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_mem_tracker_by_allocator);
+        TAllocator::free(_data, _capacity);
+    }
+}
 
-void StoragePageCache::create_global_cache(size_t capacity, int32_t index_cache_percentage,
-                                           int64_t pk_index_cache_capacity, uint32_t num_shards) {
-    DCHECK(_s_instance == nullptr);
-    static StoragePageCache instance(capacity, index_cache_percentage, pk_index_cache_capacity,
-                                     num_shards);
-    _s_instance = &instance;
+template class PageBase<Allocator<true>>;
+template class PageBase<Allocator<false>>;
+
+StoragePageCache* StoragePageCache::create_global_cache(size_t capacity,
+                                                        int32_t index_cache_percentage,
+                                                        int64_t pk_index_cache_capacity,
+                                                        uint32_t num_shards) {
+    return new StoragePageCache(capacity, index_cache_percentage, pk_index_cache_capacity,
+                                num_shards);
 }
 
 StoragePageCache::StoragePageCache(size_t capacity, int32_t index_cache_percentage,
                                    int64_t pk_index_cache_capacity, uint32_t num_shards)
         : _index_cache_percentage(index_cache_percentage) {
     if (index_cache_percentage == 0) {
-        _data_page_cache = std::unique_ptr<Cache>(
-                new_lru_cache("DataPageCache", capacity, LRUCacheType::SIZE, num_shards));
+        _data_page_cache = std::make_unique<DataPageCache>(capacity, num_shards);
     } else if (index_cache_percentage == 100) {
-        _index_page_cache = std::unique_ptr<Cache>(
-                new_lru_cache("IndexPageCache", capacity, LRUCacheType::SIZE, num_shards));
+        _index_page_cache = std::make_unique<IndexPageCache>(capacity, num_shards);
     } else if (index_cache_percentage > 0 && index_cache_percentage < 100) {
-        _data_page_cache = std::unique_ptr<Cache>(
-                new_lru_cache("DataPageCache", capacity * (100 - index_cache_percentage) / 100,
-                              LRUCacheType::SIZE, num_shards));
-        _index_page_cache = std::unique_ptr<Cache>(
-                new_lru_cache("IndexPageCache", capacity * index_cache_percentage / 100,
-                              LRUCacheType::SIZE, num_shards));
+        _data_page_cache = std::make_unique<DataPageCache>(
+                capacity * (100 - index_cache_percentage) / 100, num_shards);
+        _index_page_cache = std::make_unique<IndexPageCache>(
+                capacity * index_cache_percentage / 100, num_shards);
     } else {
         CHECK(false) << "invalid index page cache percentage";
     }
-    if (pk_index_cache_capacity > 0) {
-        _pk_index_page_cache = std::unique_ptr<Cache>(new_lru_cache(
-                "PkIndexPageCache", pk_index_cache_capacity, LRUCacheType::SIZE, num_shards));
-    }
+
+    _pk_index_page_cache = std::make_unique<PKIndexPageCache>(pk_index_cache_capacity, num_shards);
 }
 
 bool StoragePageCache::lookup(const CacheKey& key, PageCacheHandle* handle,
                               segment_v2::PageTypePB page_type) {
-    auto cache = _get_page_cache(page_type);
-    auto lru_handle = cache->lookup(key.encode());
+    auto* cache = _get_page_cache(page_type);
+    auto* lru_handle = cache->lookup(key.encode());
     if (lru_handle == nullptr) {
         return false;
     }
@@ -71,24 +90,14 @@ bool StoragePageCache::lookup(const CacheKey& key, PageCacheHandle* handle,
 
 void StoragePageCache::insert(const CacheKey& key, DataPage* data, PageCacheHandle* handle,
                               segment_v2::PageTypePB page_type, bool in_memory) {
-    auto deleter = [](const doris::CacheKey& key, void* value) {
-        DataPage* cache_value = (DataPage*)value;
-        delete cache_value;
-    };
-
     CachePriority priority = CachePriority::NORMAL;
     if (in_memory) {
         priority = CachePriority::DURABLE;
     }
 
-    auto cache = _get_page_cache(page_type);
-    auto lru_handle = cache->insert(key.encode(), data, data->capacity(), deleter, priority);
+    auto* cache = _get_page_cache(page_type);
+    auto* lru_handle = cache->insert(key.encode(), data, data->capacity(), 0, priority);
     *handle = PageCacheHandle(cache, lru_handle);
-}
-
-void StoragePageCache::prune(segment_v2::PageTypePB page_type) {
-    auto cache = _get_page_cache(page_type);
-    cache->prune();
 }
 
 } // namespace doris

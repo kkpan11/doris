@@ -18,7 +18,6 @@
 package org.apache.doris.nereids.types;
 
 import org.apache.doris.catalog.Type;
-import org.apache.doris.nereids.types.coercion.AbstractDataType;
 import org.apache.doris.nereids.types.coercion.CharacterType;
 
 /**
@@ -33,23 +32,13 @@ public class StringType extends CharacterType {
     }
 
     @Override
-    public int width() {
-        return len;
-    }
-
-    @Override
     public Type toCatalogDataType() {
         return Type.STRING;
     }
 
     @Override
-    public boolean acceptsType(AbstractDataType other) {
-        return other instanceof StringType || other instanceof VarcharType;
-    }
-
-    @Override
     public String simpleString() {
-        return "string";
+        return "text";
     }
 
     @Override

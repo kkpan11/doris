@@ -19,7 +19,6 @@ package org.apache.doris.httpv2.rest;
 
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
-import org.apache.doris.common.MetaNotFoundException;
 import org.apache.doris.httpv2.entity.ResponseEntityBuilder;
 
 import com.google.common.base.Strings;
@@ -39,9 +38,12 @@ public class GetStreamLoadState extends RestBaseController {
                           HttpServletRequest request, HttpServletResponse response) {
         executeCheckPassword(request, response);
 
-        Object redirectView = redirectToMaster(request, response);
-        if (redirectView != null) {
-            return redirectView;
+        if (needRedirect(request.getScheme())) {
+            return redirectToHttps(request);
+        }
+
+        if (checkForwardToMaster(request)) {
+            return forwardToMaster(request);
         }
 
         String label = request.getParameter(LABEL_KEY);
@@ -54,11 +56,10 @@ public class GetStreamLoadState extends RestBaseController {
         Database db;
         try {
             db = Env.getCurrentInternalCatalog().getDbOrMetaException(fullDbName);
-        } catch (MetaNotFoundException e) {
+            String state = Env.getCurrentGlobalTransactionMgr().getLabelState(db.getId(), label).toString();
+            return ResponseEntityBuilder.ok(state);
+        } catch (Exception e) {
             return ResponseEntityBuilder.okWithCommonError(e.getMessage());
         }
-
-        String state = Env.getCurrentGlobalTransactionMgr().getLabelState(db.getId(), label).toString();
-        return ResponseEntityBuilder.ok(state);
     }
 }

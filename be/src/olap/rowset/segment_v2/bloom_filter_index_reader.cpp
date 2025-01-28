@@ -22,6 +22,7 @@
 
 #include "olap/rowset/segment_v2/bloom_filter.h"
 #include "olap/types.h"
+#include "util/debug_points.h"
 #include "vec/columns/column.h"
 #include "vec/common/string_ref.h"
 #include "vec/data_types/data_type.h"
@@ -30,16 +31,35 @@
 namespace doris {
 namespace segment_v2 {
 
-Status BloomFilterIndexReader::load(bool use_page_cache, bool kept_in_memory) {
+Status BloomFilterIndexReader::load(bool use_page_cache, bool kept_in_memory,
+                                    OlapReaderStatistics* index_load_stats) {
+    // TODO yyq: implement a new once flag to avoid status construct.
+    return _load_once.call([this, use_page_cache, kept_in_memory, index_load_stats] {
+        return _load(use_page_cache, kept_in_memory, index_load_stats);
+    });
+}
+
+int64_t BloomFilterIndexReader::get_metadata_size() const {
+    return sizeof(BloomFilterIndexReader) +
+           (_bloom_filter_index_meta ? _bloom_filter_index_meta->ByteSizeLong() : 0);
+}
+
+Status BloomFilterIndexReader::_load(bool use_page_cache, bool kept_in_memory,
+                                     OlapReaderStatistics* index_load_stats) {
     const IndexedColumnMetaPB& bf_index_meta = _bloom_filter_index_meta->bloom_filter();
 
     _bloom_filter_reader.reset(new IndexedColumnReader(_file_reader, bf_index_meta));
-    RETURN_IF_ERROR(_bloom_filter_reader->load(use_page_cache, kept_in_memory));
+    RETURN_IF_ERROR(_bloom_filter_reader->load(use_page_cache, kept_in_memory, index_load_stats));
+    update_metadata_size();
     return Status::OK();
 }
 
-Status BloomFilterIndexReader::new_iterator(std::unique_ptr<BloomFilterIndexIterator>* iterator) {
-    iterator->reset(new BloomFilterIndexIterator(this));
+Status BloomFilterIndexReader::new_iterator(std::unique_ptr<BloomFilterIndexIterator>* iterator,
+                                            OlapReaderStatistics* index_load_stats) {
+    DBUG_EXECUTE_IF("BloomFilterIndexReader::new_iterator.fail", {
+        return Status::InternalError("new_iterator for bloom filter index failed");
+    });
+    iterator->reset(new BloomFilterIndexIterator(this, index_load_stats));
     return Status::OK();
 }
 
@@ -51,12 +71,14 @@ Status BloomFilterIndexIterator::read_bloom_filter(rowid_t ordinal,
     auto column = data_type->create_column();
 
     RETURN_IF_ERROR(_bloom_filter_iter.seek_to_ordinal(ordinal));
+    DCHECK(current_bloom_filter_index() == ordinal);
     size_t num_read = num_to_read;
     RETURN_IF_ERROR(_bloom_filter_iter.next_batch(&num_read, column));
     DCHECK(num_to_read == num_read);
     // construct bloom filter
     StringRef value = column->get_data_at(0);
-    BloomFilter::create(_reader->_bloom_filter_index_meta->algorithm(), bf, value.size);
+    RETURN_IF_ERROR(
+            BloomFilter::create(_reader->_bloom_filter_index_meta->algorithm(), bf, value.size));
     RETURN_IF_ERROR((*bf)->init(value.data, value.size,
                                 _reader->_bloom_filter_index_meta->hash_strategy()));
     return Status::OK();

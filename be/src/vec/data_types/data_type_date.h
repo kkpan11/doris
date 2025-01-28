@@ -35,6 +35,7 @@
 #include "vec/data_types/serde/data_type_date64_serde.h"
 
 namespace doris {
+#include "common/compile_check_begin.h"
 namespace vectorized {
 class BufferWritable;
 class ReadBuffer;
@@ -47,18 +48,31 @@ namespace doris::vectorized {
 class DataTypeDate final : public DataTypeNumberBase<Int64> {
 public:
     TypeIndex get_type_id() const override { return TypeIndex::Date; }
-    PrimitiveType get_type_as_primitive_type() const override { return TYPE_DATE; }
-    TPrimitiveType::type get_type_as_tprimitive_type() const override {
-        return TPrimitiveType::DATE;
+    TypeDescriptor get_type_as_type_descriptor() const override {
+        return TypeDescriptor(TYPE_DATE);
+    }
+
+    doris::FieldType get_storage_field_type() const override {
+        return doris::FieldType::OLAP_FIELD_TYPE_DATE;
     }
     const char* get_family_name() const override { return "DateTime"; }
     std::string do_get_name() const override { return "Date"; }
 
-    bool can_be_inside_nullable() const override { return true; }
-
     bool equals(const IDataType& rhs) const override;
     std::string to_string(const IColumn& column, size_t row_num) const override;
     void to_string(const IColumn& column, size_t row_num, BufferWritable& ostr) const override;
+    void to_string_batch(const IColumn& column, ColumnString& column_to) const final {
+        DataTypeNumberBase<Int64>::template to_string_batch_impl<DataTypeDate>(column, column_to);
+    }
+
+    size_t number_length() const;
+    void push_number(ColumnString::Chars& chars, const Int64& num) const;
+    std::string to_string(Int64 int_val) const {
+        doris::VecDateTimeValue value = binary_cast<Int64, doris::VecDateTimeValue>(int_val);
+        char buf[64];
+        value.to_string(buf);
+        return buf;
+    }
     Status from_string(ReadBuffer& rb, IColumn* column) const override;
 
     static void cast_to_date(Int64& x);
@@ -75,7 +89,9 @@ public:
 
     MutableColumnPtr create_column() const override;
 
-    DataTypeSerDeSPtr get_serde() const override { return std::make_shared<DataTypeDate64SerDe>(); }
+    DataTypeSerDeSPtr get_serde(int nesting_level = 1) const override {
+        return std::make_shared<DataTypeDate64SerDe>(nesting_level);
+    }
 };
-
+#include "common/compile_check_end.h"
 } // namespace doris::vectorized

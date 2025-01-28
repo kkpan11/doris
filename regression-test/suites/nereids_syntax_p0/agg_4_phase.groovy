@@ -43,17 +43,46 @@ suite("agg_4_phase") {
         (0, 0, "aa", 10), (1, 1, "bb",20), (2, 2, "cc", 30), (1, 1, "bb",20);
     """
     def test_sql = """
-        select /*+SET_VAR(disable_nereids_rules='THREE_PHASE_AGGREGATE_WITH_DISTINCT,TWO_PHASE_AGGREGATE_WITH_DISTINCT')*/ 
-            count(distinct name), sum(age) 
+        select
+            count(distinct id)
         from agg_4_phase_tbl;
         """
-    explain{
+    explain {
         sql(test_sql)
-        contains "6:VAGGREGATE (merge finalize)"
-        contains "5:VEXCHANGE"
-        contains "4:VAGGREGATE (update serialize)"
-        contains "3:VAGGREGATE (merge serialize)"
-        contains "1:VAGGREGATE (update serialize)"
+        contains ":VAGGREGATE (merge finalize)"
+        contains ":VEXCHANGE"
+        contains ":VAGGREGATE (update serialize)"
+        contains ":VAGGREGATE (merge serialize)"
+        contains ":VAGGREGATE (update serialize)"
     }
     qt_4phase (test_sql)
+
+    sql """select GROUP_CONCAT(distinct name, " ") from agg_4_phase_tbl;"""
+
+    sql """select /*+SET_VAR(disable_nereids_rules='TWO_PHASE_AGGREGATE_SINGLE_DISTINCT_TO_MULTI,THREE_PHASE_AGGREGATE_WITH_DISTINCT,FOUR_PHASE_AGGREGATE_WITH_DISTINCT')*/ GROUP_CONCAT(distinct name, " ") from agg_4_phase_tbl group by gender;"""
+
+
+    sql "drop table if exists agg_4_phase_tbl2"
+    sql "create table agg_4_phase_tbl2(id int, field1 int, field2 varchar(255)) properties('replication_num'='1');"
+    sql "insert into agg_4_phase_tbl2 values(1, -10, null), (1, -10, 'a'), (2, -4, null), (2, -4, 'b'), (3, -4, 'f');\n"
+
+    qt_phase4_multi_distinct """
+        select /*+SET_VAR(disable_nereids_rules='TWO_PHASE_AGGREGATE_SINGLE_DISTINCT_TO_MULTI,TWO_PHASE_AGGREGATE_WITH_MULTI_DISTINCT,THREE_PHASE_AGGREGATE_WITH_DISTINCT,THREE_PHASE_AGGREGATE_WITH_COUNT_DISTINCT_MULTI')*/
+            id,
+            group_concat(cast(field1 as varchar), ','),
+            count(distinct field1),
+            group_concat(cast(field2 as varchar), ','),
+            count(distinct field2)
+        from agg_4_phase_tbl2
+        group by id
+        order by id"""
+
+    qt_phase4_single_distinct """
+        select /*+SET_VAR(disable_nereids_rules='TWO_PHASE_AGGREGATE_SINGLE_DISTINCT_TO_MULTI,TWO_PHASE_AGGREGATE_WITH_MULTI_DISTINCT,THREE_PHASE_AGGREGATE_WITH_DISTINCT,THREE_PHASE_AGGREGATE_WITH_COUNT_DISTINCT_MULTI')*/
+            id,
+            group_concat(cast(field1 as varchar), ','),
+            count(distinct field1)
+        from agg_4_phase_tbl2
+        group by id
+        order by id"""
 }

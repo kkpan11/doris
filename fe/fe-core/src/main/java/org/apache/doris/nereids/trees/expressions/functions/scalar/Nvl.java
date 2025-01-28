@@ -29,7 +29,6 @@ import org.apache.doris.nereids.types.DateTimeType;
 import org.apache.doris.nereids.types.DateTimeV2Type;
 import org.apache.doris.nereids.types.DateType;
 import org.apache.doris.nereids.types.DateV2Type;
-import org.apache.doris.nereids.types.DecimalV2Type;
 import org.apache.doris.nereids.types.DecimalV3Type;
 import org.apache.doris.nereids.types.DoubleType;
 import org.apache.doris.nereids.types.FloatType;
@@ -37,6 +36,8 @@ import org.apache.doris.nereids.types.IntegerType;
 import org.apache.doris.nereids.types.LargeIntType;
 import org.apache.doris.nereids.types.SmallIntType;
 import org.apache.doris.nereids.types.StringType;
+import org.apache.doris.nereids.types.TimeType;
+import org.apache.doris.nereids.types.TimeV2Type;
 import org.apache.doris.nereids.types.TinyIntType;
 import org.apache.doris.nereids.types.VarcharType;
 
@@ -58,20 +59,19 @@ public class Nvl extends ScalarFunction
             FunctionSignature.ret(IntegerType.INSTANCE).args(IntegerType.INSTANCE, IntegerType.INSTANCE),
             FunctionSignature.ret(BigIntType.INSTANCE).args(BigIntType.INSTANCE, BigIntType.INSTANCE),
             FunctionSignature.ret(LargeIntType.INSTANCE).args(LargeIntType.INSTANCE, LargeIntType.INSTANCE),
-            FunctionSignature.ret(FloatType.INSTANCE).args(FloatType.INSTANCE, FloatType.INSTANCE),
+            FunctionSignature.ret(DecimalV3Type.WILDCARD).args(DecimalV3Type.WILDCARD, DecimalV3Type.WILDCARD),
             FunctionSignature.ret(DoubleType.INSTANCE).args(DoubleType.INSTANCE, DoubleType.INSTANCE),
+            FunctionSignature.ret(FloatType.INSTANCE).args(FloatType.INSTANCE, FloatType.INSTANCE),
             FunctionSignature.ret(DateType.INSTANCE).args(DateType.INSTANCE, DateType.INSTANCE),
             FunctionSignature.ret(DateTimeType.INSTANCE).args(DateTimeType.INSTANCE, DateTimeType.INSTANCE),
-            FunctionSignature.ret(DateTimeType.INSTANCE).args(DateType.INSTANCE, DateTimeType.INSTANCE),
-            FunctionSignature.ret(DateTimeType.INSTANCE).args(DateTimeType.INSTANCE, DateType.INSTANCE),
             FunctionSignature.ret(DateTimeV2Type.SYSTEM_DEFAULT)
                     .args(DateTimeV2Type.SYSTEM_DEFAULT, DateTimeV2Type.SYSTEM_DEFAULT),
             FunctionSignature.ret(DateV2Type.INSTANCE)
-                    .args(DateV2Type.INSTANCE, DateV2Type.INSTANCE),
-            FunctionSignature.ret(DecimalV3Type.WILDCARD)
-                    .args(DecimalV3Type.WILDCARD, DecimalV3Type.WILDCARD),
-            FunctionSignature.ret(DecimalV2Type.SYSTEM_DEFAULT)
-                    .args(DecimalV2Type.SYSTEM_DEFAULT, DecimalV2Type.SYSTEM_DEFAULT),
+                            .args(DateV2Type.INSTANCE, DateV2Type.INSTANCE),
+            FunctionSignature.ret(TimeType.INSTANCE)
+                    .args(TimeType.INSTANCE, TimeType.INSTANCE),
+            FunctionSignature.ret(TimeV2Type.INSTANCE)
+                    .args(TimeV2Type.INSTANCE, TimeV2Type.INSTANCE),
             FunctionSignature.ret(BitmapType.INSTANCE).args(BitmapType.INSTANCE, BitmapType.INSTANCE),
             FunctionSignature.ret(VarcharType.SYSTEM_DEFAULT)
                     .args(VarcharType.SYSTEM_DEFAULT, VarcharType.SYSTEM_DEFAULT),
@@ -82,7 +82,7 @@ public class Nvl extends ScalarFunction
      * constructor with 2 arguments.
      */
     public Nvl(Expression arg0, Expression arg1) {
-        super("nvl", arg0, arg1);
+        super("ifnull", arg0, arg1);
     }
 
     /**

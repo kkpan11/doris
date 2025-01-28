@@ -41,6 +41,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 public class BDBHA implements HAProtocol {
     private static final Logger LOG = LogManager.getLogger(BDBHA.class);
@@ -104,11 +105,12 @@ public class BDBHA implements HAProtocol {
 
     @Override
     public List<InetSocketAddress> getObserverNodes() {
+        List<InetSocketAddress> ret = new ArrayList<InetSocketAddress>();
         ReplicationGroupAdmin replicationGroupAdmin = environment.getReplicationGroupAdmin();
         if (replicationGroupAdmin == null) {
-            return null;
+            return ret;
         }
-        List<InetSocketAddress> ret = new ArrayList<InetSocketAddress>();
+
         try {
             ReplicationGroup replicationGroup = replicationGroupAdmin.getGroup();
             for (ReplicationNode replicationNode : replicationGroup.getSecondaryNodes()) {
@@ -123,11 +125,12 @@ public class BDBHA implements HAProtocol {
 
     @Override
     public List<InetSocketAddress> getElectableNodes(boolean leaderIncluded) {
+        List<InetSocketAddress> ret = new ArrayList<InetSocketAddress>();
         ReplicationGroupAdmin replicationGroupAdmin = environment.getReplicationGroupAdmin();
         if (replicationGroupAdmin == null) {
-            return null;
+            return ret;
         }
-        List<InetSocketAddress> ret = new ArrayList<InetSocketAddress>();
+
         try {
             ReplicationGroup replicationGroup = replicationGroupAdmin.getGroup();
             for (ReplicationNode replicationNode : replicationGroup.getElectableNodes()) {
@@ -163,13 +166,14 @@ public class BDBHA implements HAProtocol {
             return false;
         }
         try {
+            LOG.info("remove electable node: {}", nodeName);
             replicationGroupAdmin.removeMember(nodeName);
         } catch (MemberNotFoundException e) {
-            LOG.error("the deleting electable node is not found {}", nodeName, e);
+            LOG.warn("the electable node is not found {}", nodeName, e);
             return false;
-        } catch (MasterStateException e) {
-            LOG.error("the deleting electable node is master {}", nodeName, e);
-            return false;
+        } catch (Exception e) {
+            LOG.error("remove electable node {} meeting unkown exception:", nodeName, e);
+            System.exit(-1);
         }
         return true;
     }
@@ -180,6 +184,7 @@ public class BDBHA implements HAProtocol {
             return false;
         }
         try {
+            LOG.info("update electable node {} with new host name: {}, port: {}", nodeName, newHostName, port);
             replicationGroupAdmin.updateAddress(nodeName, newHostName, port);
         } catch (MemberNotFoundException e) {
             LOG.error("the updating electable node is not found {}", nodeName, e);
@@ -214,8 +219,11 @@ public class BDBHA implements HAProtocol {
         unReadyElectableNodes.add(nodeName);
         ReplicatedEnvironment replicatedEnvironment = environment.getReplicatedEnvironment();
         if (replicatedEnvironment != null) {
+            int override = totalFollowerCount - unReadyElectableNodes.size();
+            LOG.info("set electable group size override to {}, total follower count: {}, add unready node: {}",
+                    override, totalFollowerCount, nodeName);
             replicatedEnvironment.setRepMutableConfig(new ReplicationMutableConfig()
-                    .setElectableGroupSizeOverride(totalFollowerCount - unReadyElectableNodes.size()));
+                    .setElectableGroupSizeOverride(override));
         }
     }
 
@@ -226,11 +234,38 @@ public class BDBHA implements HAProtocol {
             if (unReadyElectableNodes.isEmpty()) {
                 // Setting ElectableGroupSizeOverride to 0 means remove this config,
                 // and bdb will use the normal electable group size.
+                LOG.info("remove electable group size override, total follower count: {}, remove unready node: {}",
+                        totalFollowerCount, nodeName);
                 replicatedEnvironment.setRepMutableConfig(
                         new ReplicationMutableConfig().setElectableGroupSizeOverride(0));
             } else {
+                int override = totalFollowerCount - unReadyElectableNodes.size();
+                LOG.info("set electable group size override to {}, total follower count: {}, remove unready node: {}",
+                        override, totalFollowerCount, nodeName);
                 replicatedEnvironment.setRepMutableConfig(new ReplicationMutableConfig()
-                        .setElectableGroupSizeOverride(totalFollowerCount - unReadyElectableNodes.size()));
+                        .setElectableGroupSizeOverride(override));
+            }
+        }
+    }
+
+    public void removeDroppedMember(ConcurrentLinkedQueue<String> removedFrontends) {
+        ReplicationGroupAdmin replicationGroupAdmin = environment.getReplicationGroupAdmin();
+        if (replicationGroupAdmin == null) {
+            return;
+        }
+        Set<ReplicationNode> replicationNodes = replicationGroupAdmin.getGroup().getElectableNodes();
+        LOG.debug("removedFrontends:{}", removedFrontends);
+        for (ReplicationNode replicationNode : replicationNodes) {
+            LOG.debug("node:{}", replicationNode.toString());
+            if (removedFrontends.contains(replicationNode.getName())) {
+                try {
+                    replicationGroupAdmin.removeMember(replicationNode.getName());
+                } catch (MemberNotFoundException e) {
+                    LOG.warn("the electable node is not found {}", replicationNode.getName());
+                } catch (Exception e) {
+                    LOG.error("remove electable node {} meeting unknown exception:", replicationNode.getName(), e);
+                    System.exit(-1);
+                }
             }
         }
     }

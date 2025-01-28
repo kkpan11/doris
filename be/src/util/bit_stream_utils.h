@@ -82,7 +82,7 @@ private:
     // buffer_. This is faster than writing values byte by byte directly to buffer_.
     uint64_t buffered_values_;
 
-    faststring* buffer_;
+    faststring* buffer_ = nullptr;
     int byte_offset_; // Offset in buffer_
     int bit_offset_;  // Offset in buffered_values_
 };
@@ -145,12 +145,16 @@ public:
 
     bool is_initialized() const { return buffer_ != nullptr; }
 
+    const uint8_t* buffer() const { return buffer_; }
+
+    int max_bytes() const { return max_bytes_; }
+
 private:
     // Used by SeekToBit() and GetValue() to fetch the
     // the next word into buffer_.
     void BufferValues();
 
-    const uint8_t* buffer_;
+    const uint8_t* buffer_ = nullptr;
     int max_bytes_;
 
     // Bytes are memcpy'd from buffer_ and values are read from this variable. This is

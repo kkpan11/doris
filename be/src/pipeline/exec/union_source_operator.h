@@ -22,10 +22,9 @@
 
 #include "common/status.h"
 #include "operator.h"
-#include "vec/exec/vunion_node.h"
 
 namespace doris {
-class ExecNode;
+#include "common/compile_check_begin.h"
 class RuntimeState;
 
 namespace vectorized {
@@ -35,33 +34,99 @@ class Block;
 namespace pipeline {
 class DataQueue;
 
-class UnionSourceOperatorBuilder final : public OperatorBuilder<vectorized::VUnionNode> {
+class UnionSourceOperatorX;
+class UnionSourceLocalState final : public PipelineXLocalState<UnionSharedState> {
 public:
-    UnionSourceOperatorBuilder(int32_t id, ExecNode* node, std::shared_ptr<DataQueue>);
+    ENABLE_FACTORY_CREATOR(UnionSourceLocalState);
+    using Base = PipelineXLocalState<UnionSharedState>;
+    using Parent = UnionSourceOperatorX;
+    UnionSourceLocalState(RuntimeState* state, OperatorXBase* parent) : Base(state, parent) {};
+
+    Status init(RuntimeState* state, LocalStateInfo& info) override;
+    Status open(RuntimeState* state) override;
+
+    [[nodiscard]] std::string debug_string(int indentation_level = 0) const override;
+
+private:
+    friend class UnionSourceOperatorX;
+    friend class OperatorX<UnionSourceLocalState>;
+    bool _need_read_for_const_expr {true};
+    int _const_expr_list_idx {0};
+    std::vector<vectorized::VExprContextSPtrs> _const_expr_lists;
+
+    // If this operator has no children, there is no shared state which owns dependency. So we
+    // use this local state to hold this dependency.
+    DependencySPtr _only_const_dependency = nullptr;
+};
+
+class UnionSourceOperatorX final : public OperatorX<UnionSourceLocalState> {
+public:
+    using Base = OperatorX<UnionSourceLocalState>;
+    UnionSourceOperatorX(ObjectPool* pool, const TPlanNode& tnode, int operator_id,
+                         const DescriptorTbl& descs)
+            : Base(pool, tnode, operator_id, descs), _child_size(tnode.num_children) {
+        _is_serial_operator = tnode.__isset.is_serial_operator && tnode.is_serial_operator;
+    }
+    ~UnionSourceOperatorX() override = default;
+    Status get_block(RuntimeState* state, vectorized::Block* block, bool* eos) override;
 
     bool is_source() const override { return true; }
 
-    OperatorPtr build_operator() override;
+    Status init(const TPlanNode& tnode, RuntimeState* state) override {
+        RETURN_IF_ERROR(Base::init(tnode, state));
+        DCHECK(tnode.__isset.union_node);
+        // Create const_expr_ctx_lists_ from thrift exprs.
+        auto& const_texpr_lists = tnode.union_node.const_expr_lists;
+        for (auto& texprs : const_texpr_lists) {
+            vectorized::VExprContextSPtrs ctxs;
+            RETURN_IF_ERROR(vectorized::VExpr::create_expr_trees(texprs, ctxs));
+            _const_expr_lists.push_back(ctxs);
+        }
+        return Status::OK();
+    }
+
+    Status open(RuntimeState* state) override {
+        static_cast<void>(Base::open(state));
+        // Prepare const expr lists.
+        for (const vectorized::VExprContextSPtrs& exprs : _const_expr_lists) {
+            RETURN_IF_ERROR(vectorized::VExpr::prepare(exprs, state, _row_descriptor));
+        }
+        // open const expr lists.
+        for (const auto& exprs : _const_expr_lists) {
+            RETURN_IF_ERROR(vectorized::VExpr::open(exprs, state));
+        }
+        return Status::OK();
+    }
+    [[nodiscard]] int get_child_count() const { return _child_size; }
+    bool require_shuffled_data_distribution() const override {
+        return _followed_by_shuffled_operator;
+    }
+
+    bool is_shuffled_operator() const override { return _followed_by_shuffled_operator; }
+    Status set_child(OperatorPtr child) override {
+        Base::_child = child;
+        return Status::OK();
+    }
 
 private:
-    std::shared_ptr<DataQueue> _data_queue;
-};
-
-class UnionSourceOperator final : public SourceOperator<UnionSourceOperatorBuilder> {
-public:
-    UnionSourceOperator(OperatorBuilderBase* operator_builder, ExecNode* node,
-                        std::shared_ptr<DataQueue>);
-
-    Status get_block(RuntimeState* state, vectorized::Block* block,
-                     SourceState& source_state) override;
-    bool can_read() override;
-
-    Status pull_data(RuntimeState* state, vectorized::Block* output_block, bool* eos);
-
-private:
-    std::shared_ptr<DataQueue> _data_queue;
-    bool _need_read_for_const_expr;
+    bool _has_data(RuntimeState* state) const {
+        auto& local_state = get_local_state(state);
+        if (_child_size == 0) {
+            return local_state._need_read_for_const_expr;
+        }
+        return local_state._shared_state->data_queue.remaining_has_data();
+    }
+    bool has_more_const(RuntimeState* state) const {
+        auto& local_state = get_local_state(state);
+        return state->per_fragment_instance_idx() == 0 &&
+               local_state._const_expr_list_idx < local_state._const_expr_lists.size();
+    }
+    friend class UnionSourceLocalState;
+    const int _child_size;
+    Status get_next_const(RuntimeState* state, vectorized::Block* block);
+    std::vector<vectorized::VExprContextSPtrs> _const_expr_lists;
 };
 
 } // namespace pipeline
+#include "common/compile_check_end.h"
 } // namespace doris

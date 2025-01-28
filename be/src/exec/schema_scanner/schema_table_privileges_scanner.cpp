@@ -22,6 +22,7 @@
 
 #include <string>
 
+#include "common/status.h"
 #include "exec/schema_scanner/schema_helper.h"
 #include "runtime/define_primitive_type.h"
 #include "util/runtime_profile.h"
@@ -59,22 +60,23 @@ Status SchemaTablePrivilegesScanner::start(RuntimeState* state) {
 Status SchemaTablePrivilegesScanner::_get_new_table() {
     SCOPED_TIMER(_get_table_timer);
     TGetTablesParams table_params;
-    if (nullptr != _param->wild) {
-        table_params.__set_pattern(*(_param->wild));
+    if (nullptr != _param->common_param->wild) {
+        table_params.__set_pattern(*(_param->common_param->wild));
     }
-    if (nullptr != _param->current_user_ident) {
-        table_params.__set_current_user_ident(*(_param->current_user_ident));
+    if (nullptr != _param->common_param->current_user_ident) {
+        table_params.__set_current_user_ident(*(_param->common_param->current_user_ident));
     } else {
-        if (nullptr != _param->user) {
-            table_params.__set_user(*(_param->user));
+        if (nullptr != _param->common_param->user) {
+            table_params.__set_user(*(_param->common_param->user));
         }
-        if (nullptr != _param->user_ip) {
-            table_params.__set_user_ip(*(_param->user_ip));
+        if (nullptr != _param->common_param->user_ip) {
+            table_params.__set_user_ip(*(_param->common_param->user_ip));
         }
     }
 
-    if (nullptr != _param->ip && 0 != _param->port) {
-        RETURN_IF_ERROR(SchemaHelper::list_table_privilege_status(*(_param->ip), _param->port,
+    if (nullptr != _param->common_param->ip && 0 != _param->common_param->port) {
+        RETURN_IF_ERROR(SchemaHelper::list_table_privilege_status(*(_param->common_param->ip),
+                                                                  _param->common_param->port,
                                                                   table_params, &_priv_result));
     } else {
         return Status::InternalError("IP or port doesn't exists");
@@ -82,7 +84,7 @@ Status SchemaTablePrivilegesScanner::_get_new_table() {
     return Status::OK();
 }
 
-Status SchemaTablePrivilegesScanner::get_next_block(vectorized::Block* block, bool* eos) {
+Status SchemaTablePrivilegesScanner::get_next_block_internal(vectorized::Block* block, bool* eos) {
     if (!_is_init) {
         return Status::InternalError("Used before initialized.");
     }
@@ -91,7 +93,7 @@ Status SchemaTablePrivilegesScanner::get_next_block(vectorized::Block* block, bo
     }
 
     *eos = true;
-    if (!_priv_result.privileges.size()) {
+    if (_priv_result.privileges.empty()) {
         return Status::OK();
     }
     return _fill_block_impl(block);
@@ -104,13 +106,13 @@ Status SchemaTablePrivilegesScanner::_fill_block_impl(vectorized::Block* block) 
 
     // grantee
     {
-        StringRef strs[privileges_num];
+        std::vector<StringRef> strs(privileges_num);
         for (int i = 0; i < privileges_num; ++i) {
             const TPrivilegeStatus& priv_status = _priv_result.privileges[i];
             strs[i] = StringRef(priv_status.grantee.c_str(), priv_status.grantee.size());
-            datas[i] = strs + i;
+            datas[i] = strs.data() + i;
         }
-        fill_dest_column_for_range(block, 0, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 0, datas));
     }
     // catalog
     // This value is always def.
@@ -120,48 +122,48 @@ Status SchemaTablePrivilegesScanner::_fill_block_impl(vectorized::Block* block) 
         for (int i = 0; i < privileges_num; ++i) {
             datas[i] = &str;
         }
-        fill_dest_column_for_range(block, 1, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 1, datas));
     }
     // schema
     {
-        StringRef strs[privileges_num];
+        std::vector<StringRef> strs(privileges_num);
         for (int i = 0; i < privileges_num; ++i) {
             const TPrivilegeStatus& priv_status = _priv_result.privileges[i];
             strs[i] = StringRef(priv_status.schema.c_str(), priv_status.schema.size());
-            datas[i] = strs + i;
+            datas[i] = strs.data() + i;
         }
-        fill_dest_column_for_range(block, 2, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 2, datas));
     }
     // table name
     {
-        StringRef strs[privileges_num];
+        std::vector<StringRef> strs(privileges_num);
         for (int i = 0; i < privileges_num; ++i) {
             const TPrivilegeStatus& priv_status = _priv_result.privileges[i];
             strs[i] = StringRef(priv_status.table_name.c_str(), priv_status.table_name.size());
-            datas[i] = strs + i;
+            datas[i] = strs.data() + i;
         }
-        fill_dest_column_for_range(block, 3, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 3, datas));
     }
     // privilege type
     {
-        StringRef strs[privileges_num];
+        std::vector<StringRef> strs(privileges_num);
         for (int i = 0; i < privileges_num; ++i) {
             const TPrivilegeStatus& priv_status = _priv_result.privileges[i];
             strs[i] = StringRef(priv_status.privilege_type.c_str(),
                                 priv_status.privilege_type.size());
-            datas[i] = strs + i;
+            datas[i] = strs.data() + i;
         }
-        fill_dest_column_for_range(block, 4, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 4, datas));
     }
     // is grantable
     {
-        StringRef strs[privileges_num];
+        std::vector<StringRef> strs(privileges_num);
         for (int i = 0; i < privileges_num; ++i) {
             const TPrivilegeStatus& priv_status = _priv_result.privileges[i];
             strs[i] = StringRef(priv_status.is_grantable.c_str(), priv_status.is_grantable.size());
-            datas[i] = strs + i;
+            datas[i] = strs.data() + i;
         }
-        fill_dest_column_for_range(block, 5, datas);
+        RETURN_IF_ERROR(fill_dest_column_for_range(block, 5, datas));
     }
     return Status::OK();
 }

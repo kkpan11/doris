@@ -34,16 +34,21 @@
 #endif
 
 #include <assert.h>
+#include <fmt/format.h>
 #include <string.h>
 
+#include <algorithm>
 #include <cinttypes>
 #include <iostream>
 
 namespace doris {
 
+using int128_t = __int128;
+
 // lengths includes sign
 #define MAX_INT_DIGITS 11
 #define MAX_INT64_DIGITS 20
+#define MAX_INT128_DIGITS 40
 #define MAX_DOUBLE_DIGITS 23 // 1(sign)+16(significant)+1(decimal)+5(exponent)
 
 /*
@@ -67,7 +72,7 @@ public:
  */
 class JsonbOutStream : public std::ostream {
 public:
-    explicit JsonbOutStream(uint32_t capacity = 1024)
+    explicit JsonbOutStream(uint64_t capacity = 1024)
             : std::ostream(nullptr), head_(nullptr), size_(0), capacity_(capacity), alloc_(true) {
         if (capacity_ == 0) {
             capacity_ = 1024;
@@ -76,7 +81,7 @@ public:
         head_ = (char*)malloc(capacity_);
     }
 
-    JsonbOutStream(char* buffer, uint32_t capacity)
+    JsonbOutStream(char* buffer, uint64_t capacity)
             : std::ostream(nullptr), head_(buffer), size_(0), capacity_(capacity), alloc_(false) {
         assert(buffer && capacity_ > 0);
     }
@@ -89,10 +94,12 @@ public:
 
     void put(char c) { write(&c, 1); }
 
-    void write(const char* c_str) { write(c_str, (uint32_t)strlen(c_str)); }
+    void write(const char* c_str) { write(c_str, strlen(c_str)); }
 
-    void write(const char* bytes, uint32_t len) {
-        if (len == 0) return;
+    void write(const char* bytes, uint64_t len) {
+        if (len == 0) {
+            return;
+        }
 
         if (size_ + len > capacity_) {
             realloc(len);
@@ -126,9 +133,15 @@ public:
         size_ += len;
     }
 
-    void write(__int128 l) {
-        // TODO
-        assert(false);
+    void write(int128_t l) {
+        // snprintf automatically adds a NULL, so we need one more char
+        if (size_ + MAX_INT128_DIGITS + 1 > capacity_) {
+            realloc(MAX_INT128_DIGITS + 1);
+        }
+
+        const auto result = fmt::format_to_n(head_ + size_, MAX_INT128_DIGITS, "{}", l);
+        assert(result.size > 0);
+        size_ += result.size;
     }
 
     // write the double to string
@@ -145,14 +158,14 @@ public:
 
     pos_type tellp() const { return size_; }
 
-    void seekp(pos_type pos) { size_ = (uint32_t)pos; }
+    void seekp(pos_type pos) { size_ = (uint64_t)pos; }
 
     const char* getBuffer() const { return head_; }
 
     pos_type getSize() const { return tellp(); }
 
 private:
-    void realloc(uint32_t len) {
+    void realloc(uint64_t len) {
         assert(capacity_ > 0);
 
         capacity_ *= 2;
@@ -174,9 +187,9 @@ private:
     }
 
 private:
-    char* head_;
-    uint32_t size_;
-    uint32_t capacity_;
+    char* head_ = nullptr;
+    uint64_t size_;
+    uint64_t capacity_;
     bool alloc_;
 };
 

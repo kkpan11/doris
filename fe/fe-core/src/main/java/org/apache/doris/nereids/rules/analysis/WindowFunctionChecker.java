@@ -26,6 +26,7 @@ import org.apache.doris.nereids.trees.expressions.WindowFrame;
 import org.apache.doris.nereids.trees.expressions.WindowFrame.FrameBoundType;
 import org.apache.doris.nereids.trees.expressions.WindowFrame.FrameBoundary;
 import org.apache.doris.nereids.trees.expressions.WindowFrame.FrameUnitsType;
+import org.apache.doris.nereids.trees.expressions.functions.window.CumeDist;
 import org.apache.doris.nereids.trees.expressions.functions.window.DenseRank;
 import org.apache.doris.nereids.trees.expressions.functions.window.FirstOrLastValue;
 import org.apache.doris.nereids.trees.expressions.functions.window.FirstValue;
@@ -33,8 +34,10 @@ import org.apache.doris.nereids.trees.expressions.functions.window.Lag;
 import org.apache.doris.nereids.trees.expressions.functions.window.LastValue;
 import org.apache.doris.nereids.trees.expressions.functions.window.Lead;
 import org.apache.doris.nereids.trees.expressions.functions.window.Ntile;
+import org.apache.doris.nereids.trees.expressions.functions.window.PercentRank;
 import org.apache.doris.nereids.trees.expressions.functions.window.Rank;
 import org.apache.doris.nereids.trees.expressions.functions.window.RowNumber;
+import org.apache.doris.nereids.trees.expressions.literal.BooleanLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.Literal;
 import org.apache.doris.nereids.trees.expressions.visitor.DefaultExpressionVisitor;
 import org.apache.doris.nereids.util.TypeCoercionUtils;
@@ -313,6 +316,16 @@ public class WindowFunctionChecker extends DefaultExpressionVisitor<Expression, 
      */
     @Override
     public FirstOrLastValue visitFirstValue(FirstValue firstValue, Void ctx) {
+        FirstOrLastValue.checkSecondParameter(firstValue);
+        if (2 == firstValue.arity()) {
+            if (firstValue.child(1).equals(BooleanLiteral.TRUE)) {
+                return firstValue;
+            } else {
+                firstValue = (FirstValue) firstValue.withChildren(firstValue.child(0));
+                windowExpression = windowExpression.withFunction(firstValue);
+            }
+        }
+
         Optional<WindowFrame> windowFrame = windowExpression.getWindowFrame();
         if (windowFrame.isPresent()) {
             WindowFrame wf = windowFrame.get();
@@ -320,7 +333,7 @@ public class WindowFunctionChecker extends DefaultExpressionVisitor<Expression, 
                     && wf.getLeftBoundary().isNot(FrameBoundType.PRECEDING)) {
                 windowExpression = windowExpression.withWindowFrame(
                         wf.withFrameUnits(FrameUnitsType.ROWS).withRightBoundary(wf.getLeftBoundary()));
-                LastValue lastValue = new LastValue(firstValue.child());
+                LastValue lastValue = new LastValue(firstValue.children());
                 windowExpression = windowExpression.withFunction(lastValue);
                 return lastValue;
             }
@@ -335,6 +348,16 @@ public class WindowFunctionChecker extends DefaultExpressionVisitor<Expression, 
                 FrameBoundary.newPrecedingBoundary(), FrameBoundary.newCurrentRowBoundary()));
         }
         return firstValue;
+    }
+
+    @Override
+    public FirstOrLastValue visitLastValue(LastValue lastValue, Void ctx) {
+        FirstOrLastValue.checkSecondParameter(lastValue);
+        if (2 == lastValue.arity() && lastValue.child(1).equals(BooleanLiteral.FALSE)) {
+            lastValue = (LastValue) lastValue.withChildren(lastValue.child(0));
+            windowExpression = windowExpression.withFunction(lastValue);
+        }
+        return lastValue;
     }
 
     /**
@@ -362,6 +385,18 @@ public class WindowFunctionChecker extends DefaultExpressionVisitor<Expression, 
     }
 
     /**
+     * required WindowFrame: (RANGE, UNBOUNDED PRECEDING, CURRENT ROW)
+     */
+    @Override
+    public PercentRank visitPercentRank(PercentRank percentRank, Void ctx) {
+        WindowFrame requiredFrame = new WindowFrame(FrameUnitsType.RANGE,
+                FrameBoundary.newPrecedingBoundary(), FrameBoundary.newCurrentRowBoundary());
+
+        checkAndCompleteWindowFrame(requiredFrame, percentRank.getName());
+        return percentRank;
+    }
+
+    /**
      * required WindowFrame: (ROWS, UNBOUNDED PRECEDING, CURRENT ROW)
      */
     @Override
@@ -372,6 +407,18 @@ public class WindowFunctionChecker extends DefaultExpressionVisitor<Expression, 
 
         checkAndCompleteWindowFrame(requiredFrame, rowNumber.getName());
         return rowNumber;
+    }
+
+    /**
+     * required WindowFrame: (RANGE, UNBOUNDED PRECEDING, CURRENT ROW)
+     */
+    @Override
+    public CumeDist visitCumeDist(CumeDist cumeDist, Void ctx) {
+        WindowFrame requiredFrame = new WindowFrame(FrameUnitsType.RANGE,
+                FrameBoundary.newPrecedingBoundary(), FrameBoundary.newCurrentRowBoundary());
+
+        checkAndCompleteWindowFrame(requiredFrame, cumeDist.getName());
+        return cumeDist;
     }
 
     /**
@@ -416,7 +463,7 @@ public class WindowFunctionChecker extends DefaultExpressionVisitor<Expression, 
                                 new OrderKey(orderKey.getExpr(), !orderKey.isAsc(), !orderKey.isNullFirst()));
                     })
                     .collect(Collectors.toList());
-            windowExpression = windowExpression.withOrderKeyList(newOKList);
+            windowExpression = windowExpression.withOrderKeys(newOKList);
 
             // reverse WindowFrame
             // e.g. (3 preceding, unbounded following) -> (unbounded preceding, 3 following)

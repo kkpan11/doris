@@ -21,24 +21,34 @@ import org.apache.doris.nereids.CascadesContext;
 import org.apache.doris.nereids.jobs.Job;
 import org.apache.doris.nereids.jobs.JobContext;
 import org.apache.doris.nereids.jobs.JobType;
-import org.apache.doris.nereids.jobs.RewriteJob;
 import org.apache.doris.nereids.jobs.scheduler.JobStack;
 import org.apache.doris.nereids.rules.Rule;
 import org.apache.doris.nereids.trees.plans.Plan;
 
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Predicate;
 
 /** RootPlanTreeRewriteJob */
 public class RootPlanTreeRewriteJob implements RewriteJob {
+    private static final AtomicInteger BATCH_ID = new AtomicInteger();
+
     private final List<Rule> rules;
     private final RewriteJobBuilder rewriteJobBuilder;
     private final boolean once;
+    private final Predicate<Plan> isTraverseChildren;
 
     public RootPlanTreeRewriteJob(List<Rule> rules, RewriteJobBuilder rewriteJobBuilder, boolean once) {
+        this(rules, rewriteJobBuilder, plan -> true, once);
+    }
+
+    public RootPlanTreeRewriteJob(
+            List<Rule> rules, RewriteJobBuilder rewriteJobBuilder, Predicate<Plan> isTraverseChildren, boolean once) {
         this.rules = Objects.requireNonNull(rules, "rules cannot be null");
         this.rewriteJobBuilder = Objects.requireNonNull(rewriteJobBuilder, "rewriteJobBuilder cannot be null");
         this.once = once;
+        this.isTraverseChildren = isTraverseChildren;
     }
 
     @Override
@@ -47,8 +57,10 @@ public class RootPlanTreeRewriteJob implements RewriteJob {
         // get plan from the cascades context
         Plan root = cascadesContext.getRewritePlan();
         // write rewritten root plan to cascades context by the RootRewriteJobContext
-        RootRewriteJobContext rewriteJobContext = new RootRewriteJobContext(root, false, context);
-        Job rewriteJob = rewriteJobBuilder.build(rewriteJobContext, context, rules);
+        int batchId = BATCH_ID.incrementAndGet();
+        RootRewriteJobContext rewriteJobContext = new RootRewriteJobContext(
+                root, false, context, batchId);
+        Job rewriteJob = rewriteJobBuilder.build(rewriteJobContext, context, isTraverseChildren, rules);
 
         context.getScheduleContext().pushJob(rewriteJob);
         cascadesContext.getJobScheduler().executeJobPool(cascadesContext);
@@ -63,15 +75,17 @@ public class RootPlanTreeRewriteJob implements RewriteJob {
 
     /** RewriteJobBuilder */
     public interface RewriteJobBuilder {
-        Job build(RewriteJobContext rewriteJobContext, JobContext jobContext, List<Rule> rules);
+        Job build(RewriteJobContext rewriteJobContext, JobContext jobContext,
+                Predicate<Plan> isTraverseChildren, List<Rule> rules);
     }
 
     /** RootRewriteJobContext */
     public static class RootRewriteJobContext extends RewriteJobContext {
-        private JobContext jobContext;
 
-        RootRewriteJobContext(Plan plan, boolean childrenVisited, JobContext jobContext) {
-            super(plan, null, -1, childrenVisited);
+        private final JobContext jobContext;
+
+        RootRewriteJobContext(Plan plan, boolean childrenVisited, JobContext jobContext, int batchId) {
+            super(plan, null, -1, childrenVisited, batchId);
             this.jobContext = Objects.requireNonNull(jobContext, "jobContext cannot be null");
             jobContext.getCascadesContext().setCurrentRootRewriteJobContext(this);
         }
@@ -88,17 +102,17 @@ public class RootPlanTreeRewriteJob implements RewriteJob {
 
         @Override
         public RewriteJobContext withChildrenVisited(boolean childrenVisited) {
-            return new RootRewriteJobContext(plan, childrenVisited, jobContext);
+            return new RootRewriteJobContext(plan, childrenVisited, jobContext, batchId);
         }
 
         @Override
         public RewriteJobContext withPlan(Plan plan) {
-            return new RootRewriteJobContext(plan, childrenVisited, jobContext);
+            return new RootRewriteJobContext(plan, childrenVisited, jobContext, batchId);
         }
 
         @Override
         public RewriteJobContext withPlanAndChildrenVisited(Plan plan, boolean childrenVisited) {
-            return new RootRewriteJobContext(plan, childrenVisited, jobContext);
+            return new RootRewriteJobContext(plan, childrenVisited, jobContext, batchId);
         }
 
         /** linkChildren */
@@ -113,6 +127,10 @@ public class RootPlanTreeRewriteJob implements RewriteJob {
             }
             return linkPlanJob.result;
         }
+    }
+
+    public List<Rule> getRules() {
+        return rules;
     }
 
     /** use to assemble the rewriting plan */

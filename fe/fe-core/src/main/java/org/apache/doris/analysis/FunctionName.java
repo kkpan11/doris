@@ -20,20 +20,18 @@
 
 package org.apache.doris.analysis;
 
-import org.apache.doris.cluster.ClusterNamespace;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.io.Text;
-import org.apache.doris.common.io.Writable;
 import org.apache.doris.thrift.TFunctionName;
 
 import com.google.common.base.Strings;
+import com.google.gson.annotations.SerializedName;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.util.Objects;
 
@@ -41,10 +39,12 @@ import java.util.Objects;
  * Class to represent a function name. Function names are specified as
  * db.function_name.
  */
-public class FunctionName implements Writable {
+public class FunctionName {
     private static final Logger LOG = LogManager.getLogger(FunctionName.class);
 
+    @SerializedName("db")
     private String db;
+    @SerializedName("fn")
     private String fn;
 
     private FunctionName() {
@@ -105,6 +105,10 @@ public class FunctionName implements Writable {
         this.db = db;
     }
 
+    public void setFn(String fn) {
+        this.fn = fn;
+    }
+
     public String getFunction() {
         return fn;
     }
@@ -126,11 +130,6 @@ public class FunctionName implements Writable {
         String db = this.db;
         if (db == null) {
             db = analyzer.getDefaultDb();
-        } else {
-            if (Strings.isNullOrEmpty(analyzer.getClusterName())) {
-                ErrorReport.reportAnalysisException(ErrorCode.ERR_CLUSTER_NAME_NULL);
-            }
-            db = ClusterNamespace.getFullName(analyzer.getClusterName(), db);
         }
         return db;
     }
@@ -153,11 +152,6 @@ public class FunctionName implements Writable {
             if (Strings.isNullOrEmpty(db) && type != SetType.GLOBAL) {
                 ErrorReport.reportAnalysisException(ErrorCode.ERR_NO_DB_ERROR);
             }
-        } else {
-            if (Strings.isNullOrEmpty(analyzer.getClusterName())) {
-                ErrorReport.reportAnalysisException(ErrorCode.ERR_CLUSTER_NAME_NULL);
-            }
-            db = ClusterNamespace.getFullName(analyzer.getClusterName(), db);
         }
     }
 
@@ -170,17 +164,6 @@ public class FunctionName implements Writable {
         name.setDbName(db);
         name.setFunctionName(fn);
         return name;
-    }
-
-    @Override
-    public void write(DataOutput out) throws IOException {
-        if (db != null) {
-            out.writeBoolean(true);
-            Text.writeString(out, db);
-        } else {
-            out.writeBoolean(false);
-        }
-        Text.writeString(out, fn);
     }
 
     public void readFields(DataInput in) throws IOException {
@@ -199,5 +182,10 @@ public class FunctionName implements Writable {
     @Override
     public int hashCode() {
         return 31 * Objects.hashCode(db) + Objects.hashCode(fn);
+    }
+
+    @Override
+    public FunctionName clone() {
+        return new FunctionName(db, fn);
     }
 }

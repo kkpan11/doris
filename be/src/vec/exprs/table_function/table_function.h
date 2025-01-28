@@ -18,13 +18,15 @@
 #pragma once
 
 #include <fmt/core.h>
-#include <stddef.h>
+
+#include <cstddef>
 
 #include "common/status.h"
 #include "vec/core/block.h"
 #include "vec/exprs/vexpr_context.h"
 
 namespace doris::vectorized {
+#include "common/compile_check_begin.h"
 
 constexpr auto COMBINATOR_SUFFIX_OUTER = "_outer";
 
@@ -36,37 +38,29 @@ public:
 
     virtual Status open() { return Status::OK(); }
 
-    virtual Status process_init(Block* block) = 0;
+    virtual Status process_init(Block* block, RuntimeState* state) = 0;
 
-    virtual Status process_row(size_t row_idx) {
-        _cur_size = 0;
-        return reset();
+    virtual void process_row(size_t row_idx) {
+        if (!_is_const) {
+            _cur_size = 0;
+        }
+        reset();
     }
 
     // only used for vectorized.
-    virtual Status process_close() = 0;
+    virtual void process_close() = 0;
 
-    virtual Status reset() {
+    virtual void reset() {
         _eos = false;
         _cur_offset = 0;
-        return Status::OK();
     }
 
-    virtual void get_value(MutableColumnPtr& column) = 0;
-
-    virtual int get_value(MutableColumnPtr& column, int max_step) {
-        max_step = std::max(1, std::min(max_step, (int)(_cur_size - _cur_offset)));
-        int i = 0;
-        for (; i < max_step && !eos(); i++) {
-            get_value(column);
-            forward();
-        }
-        return i;
-    }
+    virtual void get_same_many_values(MutableColumnPtr& column, int length = 0) = 0;
+    virtual int get_value(MutableColumnPtr& column, int max_step) = 0;
 
     virtual Status close() { return Status::OK(); }
 
-    virtual Status forward(int step = 1) {
+    virtual void forward(int step = 1) {
         if (current_empty()) {
             _eos = true;
         } else {
@@ -75,7 +69,6 @@ public:
                 _eos = true;
             }
         }
-        return Status::OK();
     }
 
     std::string name() const { return _fn_name; }
@@ -110,4 +103,6 @@ protected:
     bool _is_nullable = false;
     bool _is_const = false;
 };
+
+#include "common/compile_check_end.h"
 } // namespace doris::vectorized

@@ -56,6 +56,9 @@ public class ExternalObjectLog implements Writable {
     @SerializedName(value = "partitionNames")
     private List<String> partitionNames;
 
+    @SerializedName(value = "lastUpdateTime")
+    private long lastUpdateTime;
+
     @Override
     public void write(DataOutput out) throws IOException {
         Text.writeString(out, GsonUtils.GSON.toJson(this));
@@ -65,5 +68,4 @@ public class ExternalObjectLog implements Writable {
         String json = Text.readString(in);
         return GsonUtils.GSON.fromJson(json, ExternalObjectLog.class);
     }
-
 }

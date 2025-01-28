@@ -38,17 +38,17 @@ public class DropUserStmtTest {
 
     @Before
     public void setUp() {
-        analyzer = AccessTestUtil.fetchAdminAnalyzer(true);
         MockedAuth.mockedAccess(accessManager);
         MockedAuth.mockedConnectContext(ctx, "root", "192.168.1.1");
+        analyzer = AccessTestUtil.fetchAdminAnalyzer(true);
     }
 
     @Test
     public void testNormal() throws UserException, AnalysisException {
         DropUserStmt stmt = new DropUserStmt(new UserIdentity("user", "%"));
         stmt.analyze(analyzer);
-        Assert.assertEquals("DROP USER 'testCluster:user'@'%'", stmt.toString());
-        Assert.assertEquals("testCluster:user", stmt.getUserIdentity().getQualifiedUser());
+        Assert.assertEquals("DROP USER 'user'@'%'", stmt.toString());
+        Assert.assertEquals("user", stmt.getUserIdentity().getQualifiedUser());
     }
 
     @Test(expected = AnalysisException.class)

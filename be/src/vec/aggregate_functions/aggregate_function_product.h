@@ -31,6 +31,7 @@
 #include "vec/io/io_helper.h"
 
 namespace doris {
+#include "common/compile_check_begin.h"
 namespace vectorized {
 
 template <typename T>
@@ -51,43 +52,45 @@ struct AggregateFunctionProductData {
 };
 
 template <>
-struct AggregateFunctionProductData<Decimal128> {
-    Decimal128 product {};
+struct AggregateFunctionProductData<Decimal128V2> {
+    Decimal128V2 product {};
 
-    void add(Decimal128 value, Decimal128) {
+    void add(Decimal128V2 value, Decimal128V2) {
         DecimalV2Value decimal_product(product);
         DecimalV2Value decimal_value(value);
         DecimalV2Value ret = decimal_product * decimal_value;
-        memcpy(&product, &ret, sizeof(Decimal128));
+        memcpy(&product, &ret, sizeof(Decimal128V2));
     }
 
-    void merge(const AggregateFunctionProductData& other, Decimal128) {
+    void merge(const AggregateFunctionProductData& other, Decimal128V2) {
         DecimalV2Value decimal_product(product);
         DecimalV2Value decimal_value(other.product);
         DecimalV2Value ret = decimal_product * decimal_value;
-        memcpy(&product, &ret, sizeof(Decimal128));
+        memcpy(&product, &ret, sizeof(Decimal128V2));
     }
 
     void write(BufferWritable& buffer) const { write_binary(product, buffer); }
 
     void read(BufferReadable& buffer) { read_binary(product, buffer); }
 
-    Decimal128 get() const { return product; }
+    Decimal128V2 get() const { return product; }
 
-    void reset(Decimal128 value) { product = std::move(value); }
+    void reset(Decimal128V2 value) { product = std::move(value); }
 };
+template <typename T>
+concept DecimalTypeConcept = std::is_same_v<T, Decimal128V3> || std::is_same_v<T, Decimal256>;
 
-template <>
-struct AggregateFunctionProductData<Decimal128I> {
-    Decimal128I product {};
+template <DecimalTypeConcept T>
+struct AggregateFunctionProductData<T> {
+    T product {};
 
     template <typename NestedType>
-    void add(Decimal<NestedType> value, Decimal128I multiplier) {
+    void add(Decimal<NestedType> value, T multiplier) {
         product *= value;
         product /= multiplier;
     }
 
-    void merge(const AggregateFunctionProductData& other, Decimal128I multiplier) {
+    void merge(const AggregateFunctionProductData& other, T multiplier) {
         product *= other.product;
         product /= multiplier;
     }
@@ -96,9 +99,9 @@ struct AggregateFunctionProductData<Decimal128I> {
 
     void read(BufferReadable& buffer) { read_binary(product, buffer); }
 
-    Decimal128 get() const { return product; }
+    T get() const { return product; }
 
-    void reset(Decimal128 value) { product = std::move(value); }
+    void reset(T value) { product = std::move(value); }
 };
 
 template <typename T, typename TResult, typename Data>
@@ -131,15 +134,16 @@ public:
         }
     }
 
-    void add(AggregateDataPtr __restrict place, const IColumn** columns, size_t row_num,
+    void add(AggregateDataPtr __restrict place, const IColumn** columns, ssize_t row_num,
              Arena*) const override {
-        const auto& column = assert_cast<const ColVecType&>(*columns[0]);
-        this->data(place).add(column.get_data()[row_num], multiplier);
+        const auto& column =
+                assert_cast<const ColVecType&, TypeCheckOnRelease::DISABLE>(*columns[0]);
+        this->data(place).add(TResult(column.get_data()[row_num]), multiplier);
     }
 
     void reset(AggregateDataPtr place) const override {
         if constexpr (IsDecimalNumber<T>) {
-            this->data(place).reset(T(1 * multiplier));
+            this->data(place).reset(multiplier);
         } else {
             this->data(place).reset(1);
         }
@@ -171,3 +175,5 @@ private:
 
 } // namespace vectorized
 } // namespace doris
+
+#include "common/compile_check_end.h"

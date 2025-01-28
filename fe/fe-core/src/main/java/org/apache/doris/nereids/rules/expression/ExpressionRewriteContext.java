@@ -19,13 +19,17 @@ package org.apache.doris.nereids.rules.expression;
 
 import org.apache.doris.nereids.CascadesContext;
 
+import java.util.Objects;
+
 /**
  * expression rewrite context.
  */
 public class ExpressionRewriteContext {
+
     public final CascadesContext cascadesContext;
 
     public ExpressionRewriteContext(CascadesContext cascadesContext) {
-        this.cascadesContext = cascadesContext;
+        this.cascadesContext = Objects.requireNonNull(cascadesContext, "cascadesContext can not be null");
     }
+
 }

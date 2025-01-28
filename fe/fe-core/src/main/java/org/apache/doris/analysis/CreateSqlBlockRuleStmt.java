@@ -31,9 +31,11 @@ import org.apache.doris.qe.ConnectContext;
 
 import com.google.common.collect.ImmutableSet;
 import lombok.Getter;
+import org.apache.commons.lang3.StringUtils;
 
 import java.util.Map;
 import java.util.Optional;
+import java.util.regex.Pattern;
 
 /*
  Create sqlBlockRule statement
@@ -47,7 +49,7 @@ import java.util.Optional;
       )
 */
 @Getter
-public class CreateSqlBlockRuleStmt extends DdlStmt {
+public class CreateSqlBlockRuleStmt extends DdlStmt implements NotFallbackInParser {
 
     public static final String SQL_PROPERTY = "sql";
 
@@ -116,6 +118,11 @@ public class CreateSqlBlockRuleStmt extends DdlStmt {
         // check properties
         CreateSqlBlockRuleStmt.checkCommonProperties(properties);
         setProperties(properties);
+
+        // avoid a rule block any ddl for itself
+        if (StringUtils.isNotEmpty(sql) && Pattern.compile(sql).matcher(this.ruleName).find()) {
+            throw new AnalysisException("sql of SQL_BLOCK_RULE should not match its name");
+        }
     }
 
     private void setProperties(Map<String, String> properties) throws UserException {
@@ -158,5 +165,10 @@ public class CreateSqlBlockRuleStmt extends DdlStmt {
         sb.append("CREATE SQL_BLOCK_RULE ").append(ruleName).append(" \nPROPERTIES(\n")
                 .append(new PrintableMap<>(properties, " = ", true, true, true)).append(")");
         return sb.toString();
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.CREATE;
     }
 }

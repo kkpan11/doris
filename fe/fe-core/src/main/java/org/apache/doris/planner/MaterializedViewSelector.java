@@ -125,15 +125,22 @@ public class MaterializedViewSelector {
         long start = System.currentTimeMillis();
         Preconditions.checkState(scanNode instanceof OlapScanNode);
         OlapScanNode olapScanNode = (OlapScanNode) scanNode;
+
+        if (olapScanNode.getOlapTable().getVisibleIndex().size() == 1) {
+            return new BestIndexInfo(olapScanNode.getOlapTable().getBaseIndexId(), isPreAggregation, reasonOfDisable);
+        }
+
         Map<Long, List<Column>> candidateIndexIdToSchema = predicates(olapScanNode);
         if (candidateIndexIdToSchema.keySet().size() == 0) {
             return null;
         }
         long bestIndexId = priorities(olapScanNode, candidateIndexIdToSchema);
-        LOG.debug("The best materialized view is {} for scan node {} in query {}, "
-                + "isPreAggregation: {}, reasonOfDisable: {}, cost {}",
-                bestIndexId, scanNode.getId(), selectStmt.toSql(), isPreAggregation, reasonOfDisable,
-                (System.currentTimeMillis() - start));
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("The best materialized view is {} for scan node {} in query {}, "
+                    + "isPreAggregation: {}, reasonOfDisable: {}, cost {}",
+                    bestIndexId, scanNode.getId(), selectStmt.toSql(), isPreAggregation, reasonOfDisable,
+                    (System.currentTimeMillis() - start));
+        }
         return new BestIndexInfo(bestIndexId, isPreAggregation, reasonOfDisable);
     }
 
@@ -143,7 +150,7 @@ public class MaterializedViewSelector {
     }
 
     private Map<Long, List<Column>> predicates(OlapScanNode scanNode) throws AnalysisException {
-        // Step1: all of predicates is compensating predicates
+        // Step1: all predicates is compensating predicates
         Map<Long, MaterializedIndexMeta> candidateIndexIdToMeta = scanNode.getOlapTable().getVisibleIndexIdToMeta();
         OlapTable table = scanNode.getOlapTable();
         Preconditions.checkState(table != null);
@@ -157,18 +164,15 @@ public class MaterializedViewSelector {
             }
         }
 
-        // Step2: check all columns in compensating predicates are available in the view
-        // output
+        // Step2: check all columns in compensating predicates are available in the view output
         checkCompensatingPredicates(columnNamesInPredicates.get(tableId), candidateIndexIdToMeta, selectBaseIndex,
                 scanNode.getTupleId());
-        // Step3: group by list in query is the subset of group by list in view or view
-        // contains no aggregation
+        // Step3: group by list in query is the subset of group by list in view or view contains no aggregation
         checkGrouping(table, columnNamesInGrouping.get(tableId), candidateIndexIdToMeta, selectBaseIndex,
                 scanNode.getTupleId());
         // Step4: aggregation functions are available in the view output
         checkAggregationFunction(table, aggColumnsInQuery.get(tableId), candidateIndexIdToMeta, scanNode.getTupleId());
-        // Step5: columns required to compute output expr are available in the view
-        // output
+        // Step5: columns required to compute output expr are available in the view output
         checkOutputColumns(columnNamesInQueryOutput.get(tableId), candidateIndexIdToMeta, selectBaseIndex,
                 scanNode.getTupleId());
         // Step6: if table type is aggregate and the candidateIndexIdToSchema is empty,
@@ -199,6 +203,19 @@ public class MaterializedViewSelector {
         Map<Long, List<Column>> result = Maps.newHashMap();
         for (Map.Entry<Long, MaterializedIndexMeta> entry : candidateIndexIdToMeta.entrySet()) {
             result.put(entry.getKey(), entry.getValue().getSchema());
+        }
+        // For query like `select v:a from tbl` when column v is variant type but v:a is not expicity
+        // in index, so the above check will filter all index. But we should at least choose the base
+        // index at present.TODO we should better handle it.
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("result {}, has variant col {}, tuple {}", result,
+                        analyzer.getTupleDesc(scanNode.getTupleId()).hasVariantCol(),
+                        analyzer.getTupleDesc(scanNode.getTupleId()).toString());
+        }
+        if (result.keySet().size() == 0 && scanNode.getOlapTable()
+                    .getBaseSchema().stream().anyMatch(column -> column.getType().isVariantType())) {
+            LOG.info("Using base schema");
+            result.put(scanNode.getOlapTable().getBaseIndexId(), scanNode.getOlapTable().getBaseSchema());
         }
         return result;
     }
@@ -261,16 +278,22 @@ public class MaterializedViewSelector {
             }
 
             if (prefixMatchCount == maxPrefixMatchCount) {
-                LOG.debug("find a equal prefix match index {}. match count: {}", indexId, prefixMatchCount);
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("find a equal prefix match index {}. match count: {}", indexId, prefixMatchCount);
+                }
                 indexesMatchingBestPrefixIndex.add(indexId);
             } else if (prefixMatchCount > maxPrefixMatchCount) {
-                LOG.debug("find a better prefix match index {}. match count: {}", indexId, prefixMatchCount);
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("find a better prefix match index {}. match count: {}", indexId, prefixMatchCount);
+                }
                 maxPrefixMatchCount = prefixMatchCount;
                 indexesMatchingBestPrefixIndex.clear();
                 indexesMatchingBestPrefixIndex.add(indexId);
             }
         }
-        LOG.debug("Those mv match the best prefix index:" + Joiner.on(",").join(indexesMatchingBestPrefixIndex));
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Those mv match the best prefix index:" + Joiner.on(",").join(indexesMatchingBestPrefixIndex));
+        }
         return indexesMatchingBestPrefixIndex;
     }
 
@@ -283,7 +306,9 @@ public class MaterializedViewSelector {
             for (Long partitionId : partitionIds) {
                 rowCount += olapTable.getPartition(partitionId).getIndex(indexId).getRowCount();
             }
-            LOG.debug("rowCount={} for table={}", rowCount, indexId);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("rowCount={} for table={}", rowCount, indexId);
+            }
             if (rowCount < minRowCount) {
                 minRowCount = rowCount;
                 selectedIndexId = indexId;
@@ -359,8 +384,10 @@ public class MaterializedViewSelector {
                 iterator.remove();
             }
         }
-        LOG.debug("Those mv pass the test of compensating predicates:"
-                + Joiner.on(",").join(candidateIndexIdToMeta.keySet()));
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Those mv pass the test of compensating predicates:"
+                    + Joiner.on(",").join(candidateIndexIdToMeta.keySet()));
+        }
     }
 
     /**
@@ -452,8 +479,10 @@ public class MaterializedViewSelector {
                 iterator.remove();
             }
         }
-        LOG.debug("Those mv pass the test of grouping:"
-                + Joiner.on(",").join(candidateIndexIdToMeta.keySet()));
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Those mv pass the test of grouping:"
+                    + Joiner.on(",").join(candidateIndexIdToMeta.keySet()));
+        }
     }
 
     // Step4: aggregation functions are available in the view output
@@ -511,8 +540,10 @@ public class MaterializedViewSelector {
                 iterator.remove();
             }
         }
-        LOG.debug("Those mv pass the test of aggregation function:"
-                + Joiner.on(",").join(candidateIndexIdToMeta.keySet()));
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Those mv pass the test of aggregation function:"
+                    + Joiner.on(",").join(candidateIndexIdToMeta.keySet()));
+        }
     }
 
     private boolean matchAllExpr(List<Expr> exprs, List<Expr> indexExprs, TupleId tid)
@@ -575,7 +606,10 @@ public class MaterializedViewSelector {
             candidateIndexSchema
                     .forEach(column -> indexColumnNames.add(CreateMaterializedViewStmt
                             .mvColumnBreaker(MaterializedIndexMeta.normalizeName(column.getName()))));
-
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("candidateIndexSchema {}, indexColumnNames {}, queryColumnNames {}",
+                                candidateIndexSchema, indexColumnNames, queryColumnNames);
+            }
             // Rollup index have no define expr.
             if (entry.getValue().getWhereClause() == null && indexExprs.isEmpty()
                     && !indexColumnNames.containsAll(queryColumnNames)) {
@@ -595,8 +629,10 @@ public class MaterializedViewSelector {
                 iterator.remove();
             }
         }
-        LOG.debug("Those mv pass the test of output columns:"
-                + Joiner.on(",").join(candidateIndexIdToMeta.keySet()));
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Those mv pass the test of output columns:"
+                    + Joiner.on(",").join(candidateIndexIdToMeta.keySet()));
+        }
     }
 
     private void compensateCandidateIndex(Map<Long, MaterializedIndexMeta> candidateIndexIdToMeta,
@@ -610,8 +646,10 @@ public class MaterializedViewSelector {
                 candidateIndexIdToMeta.put(mvIndexId, index.getValue());
             }
         }
-        LOG.debug("Those mv pass the test of output columns:"
-                + Joiner.on(",").join(candidateIndexIdToMeta.keySet()));
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Those mv pass the test of output columns:"
+                    + Joiner.on(",").join(candidateIndexIdToMeta.keySet()));
+        }
     }
 
     private void init() {
@@ -654,7 +692,7 @@ public class MaterializedViewSelector {
         }
 
         // Step4: compute the output column
-        // ISSUE-3174: all of columns which belong to top tuple should be considered in
+        // ISSUE-3174: all columns which belong to top tuple should be considered in
         // selector.
         List<TupleId> tupleIds = selectStmt.getTableRefIdsWithoutInlineView();
         for (TupleId tupleId : tupleIds) {
@@ -664,12 +702,7 @@ public class MaterializedViewSelector {
     }
 
     private void addAggColumnInQuery(Long tableId, FunctionCallExpr fnExpr) {
-        Set<FunctionCallExpr> aggColumns = aggColumnsInQuery.get(tableId);
-        if (aggColumns == null) {
-            aggColumns = Sets.newHashSet();
-            aggColumnsInQuery.put(tableId, aggColumns);
-        }
-        aggColumns.add(fnExpr);
+        aggColumnsInQuery.computeIfAbsent(tableId, k -> Sets.newHashSet()).add(fnExpr);
     }
 
     private boolean aggFunctionsMatchAggColumns(Set<FunctionCallExpr> queryExprList,

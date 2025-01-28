@@ -46,10 +46,10 @@ public:
 
     // Create a RowCursor based on the schema
     Status init(TabletSchemaSPtr schema);
-    Status init(const std::vector<TabletColumn>& schema);
+    Status init(const std::vector<TabletColumnPtr>& schema);
 
     // Create a RowCursor based on the first n columns of the schema
-    Status init(const std::vector<TabletColumn>& schema, size_t column_count);
+    Status init(const std::vector<TabletColumnPtr>& schema, size_t column_count);
     Status init(TabletSchemaSPtr schema, size_t column_count);
 
     // Create a RowCursor based on the schema and column id list
@@ -61,9 +61,6 @@ public:
 
     Status init_scan_key(TabletSchemaSPtr schema, const std::vector<std::string>& keys,
                          const std::shared_ptr<Schema>& shared_schema);
-
-    //allocate memory for string type, which include char, varchar, hyperloglog
-    Status allocate_memory_for_string_type(TabletSchemaSPtr schema);
 
     RowCursorCell cell(uint32_t cid) const { return RowCursorCell(nullable_cell_ptr(cid)); }
 
@@ -126,7 +123,7 @@ private:
     Status _init(const std::shared_ptr<Schema>& shared_schema,
                  const std::vector<uint32_t>& columns);
     // common init function
-    Status _init(const std::vector<TabletColumn>& schema, const std::vector<uint32_t>& columns);
+    Status _init(const std::vector<TabletColumnPtr>& schema, const std::vector<uint32_t>& columns);
     Status _alloc_buf();
 
     Status _init_scan_key(TabletSchemaSPtr schema, const std::vector<std::string>& scan_keys);
@@ -140,7 +137,7 @@ private:
     char* _variable_buf = nullptr;
     size_t _variable_len;
     size_t _string_field_count;
-    char** _long_text_buf;
+    char** _long_text_buf = nullptr;
 
     DISALLOW_COPY_AND_ASSIGN(RowCursor);
 };

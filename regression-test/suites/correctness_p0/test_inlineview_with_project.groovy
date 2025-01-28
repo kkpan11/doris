@@ -321,4 +321,432 @@ suite("test_inlineview_with_project") {
     sql """
         drop table if exists ods_table4;
     """
+
+    sql """
+        drop table if exists cir2824_table;
+    """
+
+    sql """
+        CREATE TABLE `cir2824_table` (
+        `id` BIGINT(20) NULL,
+        `create_user` BIGINT(20) NULL,
+        `event_content` TEXT NULL,
+        `dest_farm_id` BIGINT(20) NULL,
+        `weight` DOUBLE NULL
+        ) ENGINE=OLAP
+        UNIQUE KEY(`id`)
+        COMMENT 'OLAP'
+        DISTRIBUTED BY HASH(`id`) BUCKETS 48
+        PROPERTIES (
+        "replication_allocation" = "tag.location.default: 1",
+        "in_memory" = "false",
+        "storage_format" = "V2",
+        "function_column.sequence_type" = "BIGINT",
+        "disable_auto_compaction" = "false"
+        );
+    """
+
+    sql """
+        drop view if exists cir2824_view;
+    """
+
+    sql """
+        CREATE VIEW `cir2824_view` COMMENT 'VIEW' AS
+        select `ev`.`id` AS `id`,
+                CAST(`ev`.`create_user` AS BIGINT) AS `create_user`,
+                `ev`.`event_content` AS `event_content`,
+                `ev`.`dest_farm_id` AS `dest_farm_id`
+        FROM `cir2824_table` ev;
+    """
+
+    explain {
+        sql("""
+            WITH cir2824_temp1 AS( SELECT
+                    CASE
+                    WHEN dest_farm_id IS NULL
+                        AND get_json_string(t.event_content,'\$.destFarmId') != '' THEN
+                    0
+                    ELSE 1
+                    END AS is_trans
+                FROM cir2824_view t )
+            SELECT 1
+            FROM cir2824_temp1;
+        """)
+    }
+
+    sql """
+        drop view if exists cir2824_view;
+    """
+
+    sql """
+        drop table if exists cir2824_table;
+    """
+
+    sql """
+        drop table if exists dws_mf_wms_t1;
+    """
+
+    sql """
+        drop table if exists dws_mf_wms_t2;
+    """
+
+    sql """
+        drop table if exists dws_mf_wms_t3;
+    """
+
+    sql """
+        CREATE TABLE `dws_mf_wms_t1` (
+        `id` varchar(20) NOT NULL COMMENT '',
+        `final_weight` double NULL COMMENT ''
+        ) ENGINE=OLAP
+        UNIQUE KEY(`id`)
+        COMMENT ''
+        DISTRIBUTED BY HASH(`id`) BUCKETS 1
+        PROPERTIES (
+        "replication_allocation" = "tag.location.default: 1"
+        );
+    """
+
+    sql """
+        CREATE TABLE `dws_mf_wms_t2` (
+        `plate_id` varchar(32) NULL COMMENT '',
+        `entry_time` datetime NULL COMMENT ''
+        ) ENGINE=OLAP
+        UNIQUE KEY(`plate_id`)
+        COMMENT ''
+        DISTRIBUTED BY HASH(`plate_id`) BUCKETS 1
+        PROPERTIES (
+        "replication_allocation" = "tag.location.default: 1"
+        );
+    """
+
+    sql """
+        CREATE TABLE `dws_mf_wms_t3` (
+        `material_id` varchar(50) NULL,
+        `out_time` datetime NULL COMMENT ''
+        ) ENGINE=OLAP
+        UNIQUE KEY(`material_id`)
+        COMMENT ' '
+        DISTRIBUTED BY HASH(`material_id`) BUCKETS 1
+        PROPERTIES (
+        "replication_allocation" = "tag.location.default: 1"
+        );
+    """
+
+    sql """insert into dws_mf_wms_t1 values( '1', 1.0);"""
+    sql """insert into dws_mf_wms_t2 values( '1', '2020-02-02 22:22:22');"""
+    sql """insert into dws_mf_wms_t3 values( '1', '2020-02-02 22:22:22');"""
+
+    qt_select4 """select cur_final_weight from (
+                    SELECT
+                        round(`t1`.`final_weight` / 1000 , 2) AS `cur_final_weight`,
+                        coalesce(`t5`.`avg_inv_hours`, 0) AS `avg_inv_hours`,
+                        coalesce(`t5`.`max_inv_hours`, 0) AS `max_inv_hours`
+                    FROM
+                        `dws_mf_wms_t1` t1
+                    LEFT OUTER JOIN (
+                        SELECT
+                            round(avg(timestampdiff(SECOND, `t1`.`entry_time`, `t2`.`out_time`)) / 3600.0, 1) AS `avg_inv_hours`,
+                            round(max(timestampdiff(SECOND, `t1`.`entry_time`, `t2`.`out_time`)) / 3600.0, 1) AS `max_inv_hours`
+                        FROM
+                            `dws_mf_wms_t2` t1
+                        LEFT OUTER JOIN `dws_mf_wms_t3` t2 ON
+                            `t1`.`plate_id` = `t2`.`material_id`) t5 ON
+                        1 = 1
+                        )res;"""
+
+    sql """DROP TABLE IF EXISTS `dr_user_test_t1`;"""
+    sql """CREATE TABLE `dr_user_test_t1` (
+            `caseId` varchar(500) NULL
+            ) ENGINE=OLAP
+            UNIQUE KEY(`caseId`)
+            COMMENT 'OLAP'
+            DISTRIBUTED BY HASH(`caseId`) BUCKETS 16
+            PROPERTIES (
+            "replication_allocation" = "tag.location.default: 1"
+            );"""
+
+    sql """DROP TABLE IF EXISTS `dr_user_test_t2`;"""
+    sql """CREATE TABLE `dr_user_test_t2` (
+            `id` varchar(500) NULL COMMENT 'id',
+            `caseId` varchar(500) NULL,
+            `content` text NULL,
+            `timestamp` datetime NULL
+            ) ENGINE=OLAP
+            UNIQUE KEY(`id`)
+            COMMENT 'OLAP'
+            DISTRIBUTED BY HASH(`id`) BUCKETS 16
+            PROPERTIES (
+            "replication_allocation" = "tag.location.default: 1"
+            );"""
+
+    sql """insert into dr_user_test_t1 values('1'),('2'),('3');"""
+    sql """insert into dr_user_test_t2 values('1','1','1','2020-02-02 22:22:22'), ('2','2','2','2020-02-02 22:22:22'), ('3','3','3','2020-02-02 22:22:22');"""
+
+    qt_select5 """
+    SELECT COUNT(*)
+        FROM (WITH test_01 AS 
+            (SELECT caseId,
+                count(judgementDate_labelObject)
+            FROM 
+                (SELECT CASE_COLUMN_TABLE.caseId AS caseId ,
+                `judgementDate_labelObject`
+                FROM 
+                    (SELECT CASE_ID_TABLE.caseId ,
+                JSON_OBJECT('id', `judgementDate_TABLE`.`judgementDateId`, 'content', `judgementDate_TABLE`.`judgementDate`) AS `judgementDate_labelObject`
+                    FROM 
+                        (SELECT DISTINCT caseId
+                        FROM dr_user_test_t1) CASE_ID_TABLE
+                        LEFT JOIN 
+                            (SELECT caseId,
+                id AS `judgementDateId`,
+                (CASE
+                                WHEN `timestamp` IS NOT NULL THEN
+                                to_date(`timestamp`)
+                                ELSE content END) AS `judgementDate`
+                            FROM dr_user_test_t2) `judgementDate_TABLE`
+                                ON CASE_ID_TABLE.caseId = `judgementDate_TABLE`.caseId
+                            LEFT JOIN 
+                                (SELECT caseId,
+                id AS `xx`,
+                content AS `xxx`
+                                FROM dr_user_test_t2) `xxxx`
+                                    ON CASE_ID_TABLE.caseId = `xxxx`.caseId) CASE_COLUMN_TABLE) AGG_RESULT
+                                GROUP BY  caseId)
+                                SELECT caseId
+                                FROM test_01 ) TOTAL;
+    """
+
+    qt_select5 """
+    SELECT
+        caseId
+    FROM
+        (
+            SELECT
+                caseId,
+                count(judgementDateId)
+            FROM
+                (
+                    SELECT
+                        abs(caseId) AS caseId,
+                        id as judgementDateId
+                    FROM
+                        dr_user_test_t2
+                ) AGG_RESULT
+            GROUP BY
+                caseId
+        ) TOTAL
+        order by 1;
+    """
+
+    qt_select5 """
+    SELECT
+        caseId
+    FROM
+        (
+            SELECT
+                caseId,
+                count(judgementDateId)
+            FROM
+                (
+                    SELECT
+                        caseId AS caseId,
+                        abs(id) as judgementDateId
+                    FROM
+                        dr_user_test_t2
+                ) AGG_RESULT
+            GROUP BY
+                caseId
+        ) TOTAL
+        order by 1;
+    """
+
+    qt_select5 """
+    select
+            count(*)
+        from
+            (
+                select
+                    random(),
+                    group_concat(cast(ga.column3 as varchar)) as column111
+                from
+                    (
+                        select
+                            t1.id as id,
+                            upper(t1.caseId) as column1,
+                            t1.content as column3
+                        from
+                            (
+                                select
+                                    id,
+                                    caseId,
+                                    content
+                                from
+                                    dr_user_test_t2
+                                limit
+                                    10
+                            ) t1
+                            left join (
+                                select
+                                    id,
+                                    caseId,
+                                    content
+                                from
+                                    dr_user_test_t2
+                                limit
+                                    10
+                            ) t2 on t1.id = t2.id
+                    ) as ga
+                group by
+                    lower(ga.column3)
+            ) as a;
+    """
+
+    qt_select5 """
+        select
+            count(*)
+        from
+            (
+                select
+                    cast(random() * 10000000000000000 as bigint) as id,
+                    ga.column1 as column1,
+                    ga.column6 as column2,
+                    CAST(count(CAST(ga.column1 AS CHAR)) AS CHAR) as column3
+                from
+                    (
+                        select
+                            t1.id as id,
+                            upper(t1.caseId) as column1,
+                            t1.`timestamp` as column2,
+                            lower(t1.content) as column6
+                        from
+                            (
+                                select
+                                    id,
+                                    caseId,
+                                    content,
+                                    `timestamp`
+                                from
+                                    (
+                                        select
+                                            id,
+                                            caseId,
+                                            content,
+                                            `timestamp`
+                                        from
+                                            dr_user_test_t2
+                                    ) aaa
+                            ) t1
+                            left join (
+                                select
+                                    id,
+                                    caseId,
+                                    content,
+                                    `timestamp`
+                                from
+                                    (
+                                        select
+                                            id,
+                                            caseId,
+                                            content,
+                                            `timestamp`
+                                        from
+                                            dr_user_test_t2
+                                    ) bbb
+                            ) t2 on t1.id = t2.id
+                    ) as ga
+                group by
+                    ga.column1,
+                    ga.column6
+            ) as tda;
+
+
+    """
+
+    sql """DROP TABLE IF EXISTS `dr_user_test_t1`;"""
+    sql """DROP TABLE IF EXISTS `dr_user_test_t2`;"""
+
+    sql """
+        drop table if exists dws_mf_wms_join_t1;
+    """
+
+    sql """
+        drop table if exists dws_mf_wms_join_t2;
+    """
+    
+
+    sql """CREATE TABLE `dws_mf_wms_join_t1` (
+          `ddate` DATE NULL COMMENT '日期字段',
+          `game_id` VARCHAR(65533) NULL,
+          `main_currency_stock` BIGINT NULL
+          ) ENGINE=OLAP
+          DUPLICATE KEY(`ddate`)
+          DISTRIBUTED BY HASH(`ddate`) BUCKETS 10
+          PROPERTIES (
+          "replication_allocation" = "tag.location.default: 1"
+         );"""
+
+    sql """CREATE TABLE `dws_mf_wms_join_t2` (
+          `game_id` VARCHAR(65533) NULL,
+          ) ENGINE=OLAP
+          DUPLICATE KEY(`game_id`)
+          DISTRIBUTED BY HASH(`game_id`) BUCKETS 10
+          PROPERTIES (
+          "replication_allocation" = "tag.location.default: 1"
+         );"""
+
+    sql """insert into dws_mf_wms_join_t1 values('2020-01-01','12345',100);"""
+    sql """insert into dws_mf_wms_join_t2 values('12345');"""
+
+    qt_select6 """SELECT
+                a1.ddate
+            FROM
+                (
+                    SELECT
+                        aaa.ddate
+                    FROM
+                        (
+                            SELECT
+                                aa.ddate,
+                                CONCAT('main', aa.main_currency_stock) AS arr,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY aa.ddate
+                                ) AS rn
+                            FROM
+                                (
+                                    SELECT
+                                        ddate,
+                                        main_currency_stock,
+                                        game_id
+                                    FROM
+                                        dws_mf_wms_join_t1 a
+                                ) aa
+                                LEFT JOIN (
+                                    SELECT
+                                        game_id
+                                    FROM
+                                        dws_mf_wms_join_t2
+                                ) b ON aa.game_id = b.game_id
+                        ) aaa
+                        CROSS JOIN (
+                            select
+                                1 as newarr
+                        ) b
+                    WHERE
+                        rn = 1
+                ) a1
+            GROUP BY
+                GROUPING SETS (
+                    (
+                        a1.ddate
+                    )
+                );"""
+
+    sql """
+        drop table if exists dws_mf_wms_join_join_t1;
+    """
+
+    sql """
+        drop table if exists dws_mf_wms_join_join_t2;
+    """
 }

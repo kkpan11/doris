@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_string_function") {
+suite("test_string_function", "arrow_flight_sql") {
     sql "set batch_size = 4096;"
 
     qt_sql "select elt(0, \"hello\", \"doris\");"
@@ -68,11 +68,15 @@ suite("test_string_function") {
     qt_sql "select unhex('68656C6C6F2C646F726973');"
     qt_sql "select unhex('41');"
     qt_sql "select unhex('4142');"
+    qt_sql "select unhex('');"
+    qt_sql "select unhex(NULL);"
 
-    qt_sql "select instr(\"abc\", \"b\");"
-    qt_sql "select instr(\"abc\", \"d\");"
-    qt_sql "select instr(\"abc\", null);"
-    qt_sql "select instr(null, \"a\");"
+    qt_sql_instr "select instr(\"abc\", \"b\");"
+    qt_sql_instr "select instr(\"abc\", \"d\");"
+    qt_sql_instr "select instr(\"abc\", null);"
+    qt_sql_instr "select instr(null, \"a\");"
+    qt_sql_instr "SELECT instr('foobar', '');"
+    qt_sql_instr "SELECT instr('上海天津北京杭州', '北京');"
 
     qt_sql "SELECT lcase(\"AbC123\");"
     qt_sql "SELECT lower(\"AbC123\");"
@@ -84,8 +88,10 @@ suite("test_string_function") {
 
     qt_sql "select length(\"abc\");"
 
-    qt_sql "SELECT LOCATE('bar', 'foobarbar');"
-    qt_sql "SELECT LOCATE('xbar', 'foobar');"
+    qt_sql_locate "SELECT LOCATE('bar', 'foobarbar');"
+    qt_sql_locate "SELECT LOCATE('xbar', 'foobar');"
+    qt_sql_locate "SELECT LOCATE('', 'foobar');"
+    qt_sql_locate "SELECT LOCATE('北京', '上海天津北京杭州');"
 
     qt_sql "SELECT lpad(\"hi\", 5, \"xy\");"
     qt_sql "SELECT lpad(\"hi\", 1, \"xy\");"
@@ -136,13 +142,104 @@ suite("test_string_function") {
     qt_sql "select starts_with(\"hello world\",\"world\");"
     qt_sql "select starts_with(\"hello world\",null);"
 
-    qt_sql "select strleft(\"Hello doris\",5);"
-    qt_sql "select strright(\"Hello doris\",5);"
+    qt_sql "select strleft(NULL, 1);"
+    qt_sql "select strleft(\"good morning\", NULL);"
+    qt_sql "select left(NULL, 1);"
+    qt_sql "select left(\"good morning\", NULL);"
+    qt_sql "select strleft(\"Hello doris\", 5);"
+    qt_sql "select left(\"Hello doris\", 5)"
+    qt_sql "select strright(NULL, 1);"
+    qt_sql "select strright(\"good morning\", NULL);"
+    qt_sql "select right(NULL, 1);"
+    qt_sql "select right(\"good morning\", NULL);"
+    qt_sql "select strright(\"Hello doris\", 5);"
+    qt_sql "select right(\"Hello doris\", 5);"
+    qt_sql "select strleft(\"good morning\", 120);"
+    qt_sql "select strleft(\"good morning\", -5);"
+    qt_sql "select strright(\"Hello doris\", 120);"
+    qt_sql "select strright(\"Hello doris\", -5);"
+    qt_sql "select left(\"good morning\", 120);"
+    qt_sql "select left(\"good morning\", -5);"
+    qt_sql "select right(\"Hello doris\", 120);"
+    qt_sql "select right(\"Hello doris\", -6);"
+
+    qt_convert_1 "select convert('装装装装装' using gbk);"
+
+    sql """ drop table if exists left_right_test; """
+    sql """ create table left_right_test (
+        id INT NULL,
+        name VARCHAR(16) NULL
+    )
+    UNIQUE KEY(id)
+    DISTRIBUTED BY HASH(id) BUCKETS 1
+    PROPERTIES ("replication_num"="1");
+    """
+    sql """
+        insert into left_right_test values
+        (1, "Isaac Newton"),
+        (2, "Albert Einstein"),
+        (3, "Marie Curie"),
+        (4, "Charles Darwin"),
+        (5, "Stephen Hawking");
+    """
+
+    qt_select_null_str """
+    select
+    id,
+    strleft(name, 5),
+    strright(name, 5),
+    left(name, 6),
+    right(name, 6)
+    from left_right_test
+    order by id;
+    """
+
+    sql """ drop table if exists left_right_test; """
+    sql """ create table left_right_test (
+        id INT,
+        name VARCHAR(16)
+    )
+    UNIQUE KEY(id)
+    DISTRIBUTED BY HASH(id) BUCKETS 1
+    PROPERTIES ("replication_num"="1");
+    """
+    sql """
+        insert into left_right_test values
+        (1, "Isaac Newton"),
+        (2, "Albert Einstein"),
+        (3, "Marie Curie"),
+        (4, "Charles Darwin"),
+        (5, "Stephen Hawking");
+    """
+
+    qt_select_not_null_str """
+    select
+    id,
+    strleft(name, 5),
+    strright(name, 5),
+    left(name, 6),
+    right(name, 6)
+    from left_right_test
+    order by id;
+    """
 
     qt_sql "select substring('abc1', 2);"
     qt_sql "select substring('abc1', -2);"
     qt_sql "select substring('abc1', 5);"
     qt_sql "select substring('abc1def', 2, 2);"
+    qt_sql "select substring('abcdef',3,-1);"
+    qt_sql "select substring('abcdef',-3,-1);"
+    qt_sql "select substring('abcdef',10,1);"
+    sql """ set debug_skip_fold_constant = true;"""
+    qt_substring_utf8_sql "select substring('中文测试',5);"
+    qt_substring_utf8_sql "select substring('中文测试',4);"
+    qt_substring_utf8_sql "select substring('中文测试',2,2);"
+    qt_substring_utf8_sql "select substring('中文测试',-1,2);"
+    sql """ set debug_skip_fold_constant = false;"""
+    qt_substring_utf8_sql "select substring('中文测试',5);"
+    qt_substring_utf8_sql "select substring('中文测试',4);"
+    qt_substring_utf8_sql "select substring('中文测试',2,2);"
+    qt_substring_utf8_sql "select substring('中文测试',-1,2);"
 
     sql """ drop table if exists test_string_function; """
     sql """ create table test_string_function (
@@ -171,7 +268,7 @@ suite("test_string_function") {
         ("aaaaaaaa", 1)
     """
     // bug fix
-    qt_sql_substring1 """ select /*+SET_VAR(parallel_fragment_exec_instance_num=1)*/ substring(k1, cast(null as int), cast(null as int)) from test_string_function; """
+    qt_sql_substring1 """ select /*+SET_VAR(parallel_pipeline_task_num=1)*/ substring(k1, cast(null as int), cast(null as int)) from test_string_function; """
 
     qt_sql "select substr('a',3,1);"
     qt_sql "select substr('a',2,1);"
@@ -180,6 +277,8 @@ suite("test_string_function") {
     qt_sql "select substr('a',-1,1);"
     qt_sql "select substr('a',-2,1);"
     qt_sql "select substr('a',-3,1);"
+    qt_sql "select substr('abcdef',3,-1);"
+    qt_sql "select substr('abcdef',-3,-1);"
 
     qt_sql "select sub_replace(\"this is origin str\",\"NEW-STR\",1);"
     qt_sql "select sub_replace(\"doris\",\"***\",1,2);"
@@ -198,9 +297,6 @@ suite("test_string_function") {
     qt_sql "select substring_index(\"prefix_string\", \"_\", null);"
     qt_sql "select substring_index(\"prefix_string\", \"__\", -1);"
 
-    sql 'set enable_nereids_planner=true'
-    sql 'set enable_fallback_to_original_planner=false'
-
     qt_sql "select elt(0, \"hello\", \"doris\");"
     qt_sql "select elt(1, \"hello\", \"doris\");"
     qt_sql "select elt(2, \"hello\", \"doris\");"
@@ -210,15 +306,10 @@ suite("test_string_function") {
     qt_sql "select sub_replace(\"doris\",\"***\",1,2);"
 
     // test function char
-    sql 'set enable_nereids_planner=false'
-    def success = false
-    try {
+    test {
         sql """ select char(68 using abc); """
-        success = true
-    } catch (Exception e) {
-        assertTrue(e.getMessage().contains("only support charset name 'utf8'"), e.getMessage())
+        exception "only support charset name 'utf8'"
     }
-    assertFalse(success)
 
     // const
     qt_sql_func_char_const1 """ select char(68); """
@@ -276,5 +367,58 @@ suite("test_string_function") {
     qt_sql_func_char6 """ select char(k1) from test_function_char order by k1; """
     qt_sql_func_char7 """ select char(k1, k2, k3, k4) from test_function_char order by k1, k2, k3, k4; """
     qt_sql_func_char8 """ select char(k1, k2, k3, k4, 65) from test_function_char order by k1, k2, k3, k4; """
+    qt_sql_func_char9 """ select char(0) = ' '; """
+    qt_sql_func_char10 """ select char(0) = '\0'; """
 
+    qt_strcmp1 """ select strcmp('a', 'abc'); """
+    qt_strcmp2 """ select strcmp('abc', 'abc'); """
+    qt_strcmp3 """ select strcmp('abcd', 'abc'); """
+
+    sql "drop table if exists test_function_ngram_search;";
+    sql """ create table test_function_ngram_search (
+        k1 int not null,
+        s string null 
+    ) distributed by hash (k1) buckets 1
+    properties ("replication_num"="1");
+    """
+
+    sql """  insert into test_function_ngram_search values(1,"fffhhhkkkk"),(2,"abc1313131"),(3,'1313131') ,(4,'abc') , (5,null)"""
+
+    qt_ngram_search1 """ select k1, ngram_search(s,'abc1313131',3) as x , s from test_function_ngram_search order by x ;"""
+
+    qt_ngram_search2 """select ngram_search('abc','abc1313131',3); """
+    qt_ngram_search3 """select ngram_search('abc1313131','abc1313131',3); """
+    qt_ngram_search3 """select ngram_search('1313131','abc1313131',3); """
+    
+
+    sql "drop table if exists test_function_ngram_search;";
+    sql """ create table test_function_ngram_search (
+        k1 int not null,
+        s string not null 
+    ) distributed by hash (k1) buckets 1
+    properties ("replication_num"="1");
+    """
+
+    sql """  insert into test_function_ngram_search values(1,"fffhhhkkkk"),(2,"abc1313131"),(3,'1313131') ,(4,'abc') """
+
+    qt_ngram_search1_not_null """ select k1, ngram_search(s,'abc1313131',3) as x , s from test_function_ngram_search order by x ;"""
+
+    sql "SELECT random_bytes(7);"
+    qt_sql_random_bytes "SELECT random_bytes(null);"
+    test {
+        sql " select random_bytes(-1); "
+        exception "argument -1 of function random_bytes at row 0 was invalid"
+    }
+    def some_result = sql """ SELECT random_bytes(10) a FROM numbers("number" = "10") """
+    assertTrue(some_result[0][0] != some_result[1][0], "${some_result[0][0]} should different with ${some_result[1][0]}")
+    sql "select random_bytes(k1) from test_function_ngram_search;"
+
+    explain {
+        sql("""select/*+SET_VAR(enable_fold_constant_by_be=true)*/ random_bytes(10) from numbers("number" = "10");""")
+        contains "final projections: random_bytes(10)"
+    }
+    explain {
+        sql("""select/*+SET_VAR(enable_fold_constant_by_be=true)*/ random(10) from numbers("number" = "10");""")
+        contains "final projections: random(10)"
+    }
 }

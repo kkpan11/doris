@@ -20,82 +20,104 @@ package org.apache.doris.nereids.trees.plans.logical;
 import org.apache.doris.nereids.memo.GroupExpression;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.trees.expressions.CTEId;
-import org.apache.doris.nereids.trees.expressions.Expression;
+import org.apache.doris.nereids.trees.expressions.NamedExpression;
 import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.expressions.SlotReference;
 import org.apache.doris.nereids.trees.expressions.StatementScopeIdGenerator;
+import org.apache.doris.nereids.trees.plans.BlockFuncDepsPropagation;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.PlanType;
+import org.apache.doris.nereids.trees.plans.RelationId;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.nereids.util.Utils;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableMultimap;
+import com.google.common.collect.LinkedHashMultimap;
+import com.google.common.collect.Multimap;
 
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Objects;
 import java.util.Optional;
 
 /**
  * LogicalCTEConsumer
  */
-public class LogicalCTEConsumer extends LogicalLeaf {
-
-    private final CTEId cteId;
-
-    private final Map<Slot, Slot> consumerToProducerOutputMap = new LinkedHashMap<>();
-
-    private final Map<Slot, Slot> producerToConsumerOutputMap = new LinkedHashMap<>();
-
-    private final int consumerId;
+//TODO: find cte producer and propagate its functional dependencies
+public class LogicalCTEConsumer extends LogicalRelation implements BlockFuncDepsPropagation, OutputPrunable {
 
     private final String name;
+    private final CTEId cteId;
+    private final Map<Slot, Slot> consumerToProducerOutputMap;
+    private final Multimap<Slot, Slot> producerToConsumerOutputMap;
 
     /**
      * Logical CTE consumer.
      */
-    public LogicalCTEConsumer(Optional<GroupExpression> groupExpression,
-            Optional<LogicalProperties> logicalProperties, LogicalPlan childPlan, CTEId cteId, String name) {
-        super(PlanType.LOGICAL_CTE_RELATION, groupExpression, logicalProperties);
-        this.cteId = cteId;
-        this.name = name;
-        initProducerToConsumerOutputMap(childPlan);
-        for (Map.Entry<Slot, Slot> entry : producerToConsumerOutputMap.entrySet()) {
-            this.consumerToProducerOutputMap.put(entry.getValue(), entry.getKey());
-        }
-        this.consumerId = StatementScopeIdGenerator.newCTEId().asInt();
+    public LogicalCTEConsumer(RelationId relationId, CTEId cteId, String name,
+            Map<Slot, Slot> consumerToProducerOutputMap, Multimap<Slot, Slot> producerToConsumerOutputMap) {
+        this(relationId, cteId, name, consumerToProducerOutputMap, producerToConsumerOutputMap,
+                Optional.empty(), Optional.empty());
     }
 
     /**
      * Logical CTE consumer.
      */
-    public LogicalCTEConsumer(Optional<GroupExpression> groupExpression,
-            Optional<LogicalProperties> logicalProperties, CTEId cteId,
-            Map<Slot, Slot> consumerToProducerOutputMap,
-            Map<Slot, Slot> producerToConsumerOutputMap, int consumerId, String name) {
-        super(PlanType.LOGICAL_CTE_RELATION, groupExpression, logicalProperties);
-        this.cteId = cteId;
-        this.consumerToProducerOutputMap.putAll(consumerToProducerOutputMap);
-        this.producerToConsumerOutputMap.putAll(producerToConsumerOutputMap);
-        this.consumerId = consumerId;
-        this.name = name;
-    }
-
-    private void initProducerToConsumerOutputMap(LogicalPlan childPlan) {
-        List<Slot> producerOutput = childPlan.getOutput();
+    public LogicalCTEConsumer(RelationId relationId, CTEId cteId, String name, LogicalPlan producerPlan) {
+        super(relationId, PlanType.LOGICAL_CTE_CONSUMER, Optional.empty(), Optional.empty());
+        this.cteId = Objects.requireNonNull(cteId, "cteId should not null");
+        this.name = Objects.requireNonNull(name, "name should not null");
+        ImmutableMap.Builder<Slot, Slot> cToPBuilder = ImmutableMap.builder();
+        ImmutableMultimap.Builder<Slot, Slot> pToCBuilder = ImmutableMultimap.builder();
+        List<Slot> producerOutput = producerPlan.getOutput();
         for (Slot producerOutputSlot : producerOutput) {
-            Slot consumerSlot = new SlotReference(producerOutputSlot.getName(),
-                    producerOutputSlot.getDataType(), producerOutputSlot.nullable(), ImmutableList.of(name));
-            producerToConsumerOutputMap.put(producerOutputSlot, consumerSlot);
+            Slot consumerSlot = generateConsumerSlot(this.name, producerOutputSlot);
+            cToPBuilder.put(consumerSlot, producerOutputSlot);
+            pToCBuilder.put(producerOutputSlot, consumerSlot);
         }
+        consumerToProducerOutputMap = cToPBuilder.build();
+        producerToConsumerOutputMap = pToCBuilder.build();
+    }
+
+    /**
+     * Logical CTE consumer.
+     */
+    public LogicalCTEConsumer(RelationId relationId, CTEId cteId, String name,
+            Map<Slot, Slot> consumerToProducerOutputMap, Multimap<Slot, Slot> producerToConsumerOutputMap,
+            Optional<GroupExpression> groupExpression, Optional<LogicalProperties> logicalProperties) {
+        super(relationId, PlanType.LOGICAL_CTE_CONSUMER, groupExpression, logicalProperties);
+        this.cteId = Objects.requireNonNull(cteId, "cteId should not null");
+        this.name = Objects.requireNonNull(name, "name should not null");
+        this.consumerToProducerOutputMap = ImmutableMap.copyOf(Objects.requireNonNull(consumerToProducerOutputMap,
+                "consumerToProducerOutputMap should not null"));
+        this.producerToConsumerOutputMap = ImmutableMultimap.copyOf(Objects.requireNonNull(producerToConsumerOutputMap,
+                "producerToConsumerOutputMap should not null"));
+    }
+
+    /**
+     * generate a consumer slot mapping from producer slot.
+     */
+    public static SlotReference generateConsumerSlot(String cteName, Slot producerOutputSlot) {
+        SlotReference slotRef =
+                producerOutputSlot instanceof SlotReference ? (SlotReference) producerOutputSlot : null;
+        return new SlotReference(StatementScopeIdGenerator.newExprId(),
+                producerOutputSlot.getName(), producerOutputSlot.getDataType(),
+                producerOutputSlot.nullable(), ImmutableList.of(cteName),
+                slotRef != null ? (slotRef.getTable().isPresent() ? slotRef.getTable().get() : null) : null,
+                slotRef != null ? (slotRef.getColumn().isPresent() ? slotRef.getColumn().get() : null) : null,
+                slotRef != null ? Optional.of(slotRef.getInternalName()) : Optional.empty());
     }
 
     public Map<Slot, Slot> getConsumerToProducerOutputMap() {
         return consumerToProducerOutputMap;
     }
 
-    public Map<Slot, Slot> getProducerToConsumerOutputMap() {
+    public Multimap<Slot, Slot> getProducerToConsumerOutputMap() {
         return producerToConsumerOutputMap;
     }
 
@@ -104,25 +126,30 @@ public class LogicalCTEConsumer extends LogicalLeaf {
         return visitor.visitLogicalCTEConsumer(this, context);
     }
 
-    @Override
-    public List<? extends Expression> getExpressions() {
-        return ImmutableList.of();
+    public Plan withTwoMaps(Map<Slot, Slot> consumerToProducerOutputMap,
+            Multimap<Slot, Slot> producerToConsumerOutputMap) {
+        return new LogicalCTEConsumer(relationId, cteId, name,
+                consumerToProducerOutputMap, producerToConsumerOutputMap);
     }
 
     @Override
     public Plan withGroupExpression(Optional<GroupExpression> groupExpression) {
-        return new LogicalCTEConsumer(groupExpression, Optional.of(getLogicalProperties()), cteId,
-                consumerToProducerOutputMap,
-                producerToConsumerOutputMap,
-                consumerId, name);
+        return new LogicalCTEConsumer(relationId, cteId, name,
+                consumerToProducerOutputMap, producerToConsumerOutputMap,
+                groupExpression, Optional.of(getLogicalProperties()));
     }
 
     @Override
-    public Plan withLogicalProperties(Optional<LogicalProperties> logicalProperties) {
-        return new LogicalCTEConsumer(groupExpression, logicalProperties, cteId,
-                consumerToProducerOutputMap,
-                producerToConsumerOutputMap,
-                consumerId, name);
+    public Plan withGroupExprLogicalPropChildren(Optional<GroupExpression> groupExpression,
+            Optional<LogicalProperties> logicalProperties, List<Plan> children) {
+        return new LogicalCTEConsumer(relationId, cteId, name,
+                consumerToProducerOutputMap, producerToConsumerOutputMap,
+                groupExpression, logicalProperties);
+    }
+
+    @Override
+    public LogicalCTEConsumer withRelationId(RelationId relationId) {
+        throw new RuntimeException("should not call LogicalCTEConsumer's withRelationId method");
     }
 
     @Override
@@ -130,35 +157,34 @@ public class LogicalCTEConsumer extends LogicalLeaf {
         return ImmutableList.copyOf(producerToConsumerOutputMap.values());
     }
 
+    @Override
+    public Plan pruneOutputs(List<NamedExpression> prunedOutputs) {
+        Map<Slot, Slot> consumerToProducerOutputMap = new LinkedHashMap<>(this.consumerToProducerOutputMap.size());
+        Multimap<Slot, Slot> producerToConsumerOutputMap = LinkedHashMultimap.create(
+                this.consumerToProducerOutputMap.size(), this.consumerToProducerOutputMap.size());
+        for (Entry<Slot, Slot> consumerToProducerSlot : this.consumerToProducerOutputMap.entrySet()) {
+            if (prunedOutputs.contains(consumerToProducerSlot.getKey())) {
+                consumerToProducerOutputMap.put(consumerToProducerSlot.getKey(), consumerToProducerSlot.getValue());
+                producerToConsumerOutputMap.put(consumerToProducerSlot.getValue(), consumerToProducerSlot.getKey());
+            }
+        }
+        return withTwoMaps(consumerToProducerOutputMap, producerToConsumerOutputMap);
+    }
+
+    @Override
+    public List<NamedExpression> getOutputs() {
+        return (List) this.getOutput();
+    }
+
     public CTEId getCteId() {
         return cteId;
-    }
-
-    @Override
-    public int hashCode() {
-        return consumerId;
-    }
-
-    @Override
-    public boolean equals(Object o) {
-        if (this == o) {
-            return true;
-        }
-        if (o == null || getClass() != o.getClass()) {
-            return false;
-        }
-        return this.consumerId == ((LogicalCTEConsumer) o).consumerId;
-    }
-
-    public int getConsumerId() {
-        return consumerId;
     }
 
     public String getName() {
         return name;
     }
 
-    public Slot findProducerSlot(Slot consumerSlot) {
+    public Slot getProducerSlot(Slot consumerSlot) {
         Slot slot = consumerToProducerOutputMap.get(consumerSlot);
         Preconditions.checkArgument(slot != null, String.format("Required producer"
                 + "slot for :%s doesn't exist", consumerSlot));
@@ -169,6 +195,7 @@ public class LogicalCTEConsumer extends LogicalLeaf {
     public String toString() {
         return Utils.toSqlString("LogicalCteConsumer[" + id.asInt() + "]",
                 "cteId", cteId,
-                "consumerId", consumerId);
+                "relationId", relationId,
+                "name", name);
     }
 }

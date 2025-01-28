@@ -35,6 +35,7 @@
 #include <utility>
 
 #include "common/config.h"
+#include "common/status.h"
 #include "io/fs/broker_file_reader.h"
 #include "io/fs/broker_file_writer.h"
 #include "io/fs/file_reader.h"
@@ -45,8 +46,7 @@
 #include "runtime/exec_env.h"
 #include "util/slice.h"
 
-namespace doris {
-namespace io {
+namespace doris::io {
 
 #ifdef BE_TEST
 inline BrokerServiceClientCache* client_cache() {
@@ -69,46 +69,50 @@ inline const std::string& client_id(const TNetworkAddress& addr) {
 #endif
 
 #ifndef CHECK_BROKER_CLIENT
-#define CHECK_BROKER_CLIENT(client)                         \
-    if (!client) {                                          \
-        return Status::IOError("init Broker client error"); \
+#define CHECK_BROKER_CLIENT(client)                               \
+    if (!client || !client->is_alive()) {                         \
+        return Status::InternalError("connect to broker failed"); \
     }
 #endif
 
-Status BrokerFileSystem::create(const TNetworkAddress& broker_addr,
-                                const std::map<std::string, std::string>& broker_prop,
-                                std::shared_ptr<BrokerFileSystem>* fs) {
-    (*fs).reset(new BrokerFileSystem(broker_addr, broker_prop));
-    return (*fs)->connect();
+Result<std::shared_ptr<BrokerFileSystem>> BrokerFileSystem::create(
+        const TNetworkAddress& broker_addr, const std::map<std::string, std::string>& broker_prop,
+        std::string id) {
+    std::shared_ptr<BrokerFileSystem> fs(
+            new BrokerFileSystem(broker_addr, broker_prop, std::move(id)));
+    RETURN_IF_ERROR_RESULT(fs->init());
+    return fs;
 }
 
 BrokerFileSystem::BrokerFileSystem(const TNetworkAddress& broker_addr,
-                                   const std::map<std::string, std::string>& broker_prop)
-        : RemoteFileSystem("", "", FileSystemType::BROKER),
+                                   const std::map<std::string, std::string>& broker_prop,
+                                   std::string id)
+        : RemoteFileSystem("", std::move(id), FileSystemType::BROKER),
           _broker_addr(broker_addr),
           _broker_prop(broker_prop) {}
 
-Status BrokerFileSystem::connect_impl() {
+Status BrokerFileSystem::init() {
     Status status = Status::OK();
-    _client.reset(new BrokerServiceConnection(client_cache(), _broker_addr,
-                                              config::thrift_rpc_timeout_ms, &status));
+    _connection = std::make_shared<BrokerServiceConnection>(client_cache(), _broker_addr,
+                                                            config::thrift_rpc_timeout_ms, &status);
     return status;
 }
 
-Status BrokerFileSystem::create_file_impl(const Path& path, FileWriterPtr* writer) {
-    *writer = std::make_unique<BrokerFileWriter>(ExecEnv::GetInstance(), _broker_addr, _broker_prop,
-                                                 path, 0 /* offset */, getSPtr());
+Status BrokerFileSystem::create_file_impl(const Path& path, FileWriterPtr* writer,
+                                          const FileWriterOptions* opts) {
+    *writer = DORIS_TRY(
+            BrokerFileWriter::create(ExecEnv::GetInstance(), _broker_addr, _broker_prop, path));
     return Status::OK();
 }
 
-Status BrokerFileSystem::open_file_internal(const Path& file, int64_t file_size,
-                                            FileReaderSPtr* reader) {
-    int64_t fsize = file_size;
-    if (fsize < 0) {
+Status BrokerFileSystem::open_file_internal(const Path& file, FileReaderSPtr* reader,
+                                            const FileReaderOptions& opts) {
+    int64_t fsize = opts.file_size;
+    if (fsize <= 0) {
         RETURN_IF_ERROR(file_size_impl(file, &fsize));
     }
 
-    CHECK_BROKER_CLIENT(_client);
+    CHECK_BROKER_CLIENT(_connection);
     TBrokerOpenReaderRequest request;
     request.__set_version(TBrokerVersion::VERSION_ONE);
     request.__set_path(file);
@@ -120,11 +124,11 @@ Status BrokerFileSystem::open_file_internal(const Path& file, int64_t file_size,
     try {
         Status status;
         try {
-            (*_client)->openReader(*response, request);
-        } catch (apache::thrift::transport::TTransportException& e) {
+            (*_connection)->openReader(*response, request);
+        } catch (apache::thrift::transport::TTransportException&) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
-            RETURN_IF_ERROR((*_client).reopen());
-            (*_client)->openReader(*response, request);
+            RETURN_IF_ERROR(_connection->reopen());
+            (*_connection)->openReader(*response, request);
         }
     } catch (apache::thrift::TException& e) {
         return Status::RpcError("failed to open file {}: {}", file.native(), error_msg(e.what()));
@@ -134,9 +138,8 @@ Status BrokerFileSystem::open_file_internal(const Path& file, int64_t file_size,
         return Status::IOError("failed to open file {}: {}", file.native(),
                                error_msg(response->opStatus.message));
     }
-    *reader = std::make_shared<BrokerFileReader>(
-            _broker_addr, file, fsize, response->fd,
-            std::static_pointer_cast<BrokerFileSystem>(shared_from_this()));
+    *reader = std::make_shared<BrokerFileReader>(_broker_addr, file, fsize, response->fd,
+                                                 _connection);
     return Status::OK();
 }
 
@@ -145,7 +148,7 @@ Status BrokerFileSystem::create_directory_impl(const Path& /*path*/, bool /*fail
 }
 
 Status BrokerFileSystem::delete_file_impl(const Path& file) {
-    CHECK_BROKER_CLIENT(_client);
+    CHECK_BROKER_CLIENT(_connection);
     try {
         // rm file from remote path
         TBrokerDeletePathRequest del_req;
@@ -155,10 +158,10 @@ Status BrokerFileSystem::delete_file_impl(const Path& file) {
         del_req.__set_properties(_broker_prop);
 
         try {
-            (*_client)->deletePath(del_rep, del_req);
-        } catch (apache::thrift::transport::TTransportException& e) {
-            RETURN_IF_ERROR((*_client).reopen());
-            (*_client)->deletePath(del_rep, del_req);
+            (*_connection)->deletePath(del_rep, del_req);
+        } catch (apache::thrift::transport::TTransportException&) {
+            RETURN_IF_ERROR((*_connection).reopen());
+            (*_connection)->deletePath(del_rep, del_req);
         }
 
         if (del_rep.statusCode == TBrokerOperationStatusCode::OK) {
@@ -185,7 +188,7 @@ Status BrokerFileSystem::batch_delete_impl(const std::vector<Path>& files) {
 }
 
 Status BrokerFileSystem::exists_impl(const Path& path, bool* res) const {
-    CHECK_BROKER_CLIENT(_client);
+    CHECK_BROKER_CLIENT(_connection);
     *res = false;
     try {
         TBrokerCheckPathExistRequest check_req;
@@ -195,10 +198,10 @@ Status BrokerFileSystem::exists_impl(const Path& path, bool* res) const {
         check_req.__set_properties(_broker_prop);
 
         try {
-            (*_client)->checkPathExist(check_rep, check_req);
-        } catch (apache::thrift::transport::TTransportException& e) {
-            RETURN_IF_ERROR((*_client).reopen());
-            (*_client)->checkPathExist(check_rep, check_req);
+            (*_connection)->checkPathExist(check_rep, check_req);
+        } catch (apache::thrift::transport::TTransportException&) {
+            RETURN_IF_ERROR((*_connection).reopen());
+            (*_connection)->checkPathExist(check_rep, check_req);
         }
 
         if (check_rep.opStatus.statusCode != TBrokerOperationStatusCode::OK) {
@@ -218,7 +221,7 @@ Status BrokerFileSystem::exists_impl(const Path& path, bool* res) const {
 }
 
 Status BrokerFileSystem::file_size_impl(const Path& path, int64_t* file_size) const {
-    CHECK_BROKER_CLIENT(_client);
+    CHECK_BROKER_CLIENT(_connection);
     try {
         TBrokerFileSizeRequest req;
         req.__set_version(TBrokerVersion::VERSION_ONE);
@@ -227,10 +230,10 @@ Status BrokerFileSystem::file_size_impl(const Path& path, int64_t* file_size) co
 
         TBrokerFileSizeResponse resp;
         try {
-            (*_client)->fileSize(resp, req);
-        } catch (apache::thrift::transport::TTransportException& e) {
-            RETURN_IF_ERROR((*_client).reopen());
-            (*_client)->fileSize(resp, req);
+            (*_connection)->fileSize(resp, req);
+        } catch (apache::thrift::transport::TTransportException&) {
+            RETURN_IF_ERROR((*_connection).reopen());
+            (*_connection)->fileSize(resp, req);
         }
 
         if (resp.opStatus.statusCode != TBrokerOperationStatusCode::OK) {
@@ -255,7 +258,7 @@ Status BrokerFileSystem::list_impl(const Path& dir, bool only_file, std::vector<
     if (!(*exists)) {
         return Status::OK();
     }
-    CHECK_BROKER_CLIENT(_client);
+    CHECK_BROKER_CLIENT(_connection);
     Status status = Status::OK();
     try {
         // get existing files from remote path
@@ -268,10 +271,10 @@ Status BrokerFileSystem::list_impl(const Path& dir, bool only_file, std::vector<
         list_req.__set_fileNameOnly(true); // we only need file name, not abs path
 
         try {
-            (*_client)->listPath(list_rep, list_req);
-        } catch (apache::thrift::transport::TTransportException& e) {
-            RETURN_IF_ERROR((*_client).reopen());
-            (*_client)->listPath(list_rep, list_req);
+            (*_connection)->listPath(list_rep, list_req);
+        } catch (apache::thrift::transport::TTransportException&) {
+            RETURN_IF_ERROR((*_connection).reopen());
+            (*_connection)->listPath(list_rep, list_req);
         }
 
         if (list_rep.opStatus.statusCode == TBrokerOperationStatusCode::FILE_NOT_FOUND) {
@@ -308,7 +311,7 @@ Status BrokerFileSystem::list_impl(const Path& dir, bool only_file, std::vector<
 }
 
 Status BrokerFileSystem::rename_impl(const Path& orig_name, const Path& new_name) {
-    CHECK_BROKER_CLIENT(_client);
+    CHECK_BROKER_CLIENT(_connection);
     try {
         TBrokerOperationStatus op_status;
         TBrokerRenamePathRequest rename_req;
@@ -318,10 +321,10 @@ Status BrokerFileSystem::rename_impl(const Path& orig_name, const Path& new_name
         rename_req.__set_properties(_broker_prop);
 
         try {
-            (*_client)->renamePath(op_status, rename_req);
-        } catch (apache::thrift::transport::TTransportException& e) {
-            RETURN_IF_ERROR((*_client).reopen());
-            (*_client)->renamePath(op_status, rename_req);
+            (*_connection)->renamePath(op_status, rename_req);
+        } catch (apache::thrift::transport::TTransportException&) {
+            RETURN_IF_ERROR((*_connection).reopen());
+            (*_connection)->renamePath(op_status, rename_req);
         }
 
         if (op_status.statusCode != TBrokerOperationStatusCode::OK) {
@@ -335,10 +338,6 @@ Status BrokerFileSystem::rename_impl(const Path& orig_name, const Path& new_name
 
     LOG(INFO) << "finished to rename file. orig: " << orig_name << ", new: " << new_name;
     return Status::OK();
-}
-
-Status BrokerFileSystem::rename_dir_impl(const Path& orig_name, const Path& new_name) {
-    return rename_impl(orig_name, new_name);
 }
 
 Status BrokerFileSystem::upload_impl(const Path& local_file, const Path& remote_file) {
@@ -355,7 +354,7 @@ Status BrokerFileSystem::upload_impl(const Path& local_file, const Path& remote_
 
     // NOTICE: broker writer must be closed before calling rename
     FileWriterPtr broker_writer = nullptr;
-    RETURN_IF_ERROR(create_file_impl(remote_file, &broker_writer));
+    RETURN_IF_ERROR(create_file_impl(remote_file, &broker_writer, nullptr));
 
     constexpr size_t buf_sz = 1024 * 1024;
     char read_buf[buf_sz];
@@ -388,25 +387,10 @@ Status BrokerFileSystem::batch_upload_impl(const std::vector<Path>& local_files,
     return Status::OK();
 }
 
-Status BrokerFileSystem::direct_upload_impl(const Path& remote_file, const std::string& content) {
-    FileWriterPtr broker_writer = nullptr;
-    RETURN_IF_ERROR(create_file_impl(remote_file, &broker_writer));
-    RETURN_IF_ERROR(broker_writer->append({content}));
-    return broker_writer->close();
-}
-
-Status BrokerFileSystem::upload_with_checksum_impl(const Path& local_file, const Path& remote_file,
-                                                   const std::string& checksum) {
-    std::string temp = remote_file.string() + ".part";
-    std::string final_file = remote_file.string() + "." + checksum;
-    RETURN_IF_ERROR(upload_impl(local_file, temp));
-    return rename_impl(temp, final_file);
-}
-
 Status BrokerFileSystem::download_impl(const Path& remote_file, const Path& local_file) {
     // 1. open remote file for read
     FileReaderSPtr broker_reader = nullptr;
-    RETURN_IF_ERROR(open_file_internal(remote_file, -1, &broker_reader));
+    RETURN_IF_ERROR(open_file_internal(remote_file, &broker_reader, FileReaderOptions::DEFAULT));
 
     // 2. remove the existing local file if exist
     if (std::filesystem::remove(local_file)) {
@@ -422,7 +406,6 @@ Status BrokerFileSystem::download_impl(const Path& remote_file, const Path& loca
     VLOG(2) << "read remote file: " << remote_file << " to local: " << local_file;
     constexpr size_t buf_sz = 1024 * 1024;
     std::unique_ptr<uint8_t[]> read_buf(new uint8_t[buf_sz]);
-    size_t write_offset = 0;
     size_t cur_offset = 0;
     while (true) {
         size_t read_len = 0;
@@ -433,46 +416,14 @@ Status BrokerFileSystem::download_impl(const Path& remote_file, const Path& loca
             break;
         }
 
-        RETURN_IF_ERROR(local_writer->write_at(write_offset, {read_buf.get(), read_len}));
-        write_offset += read_len;
+        RETURN_IF_ERROR(local_writer->append({read_buf.get(), read_len}));
     } // file_handler should be closed before calculating checksum
 
-    return Status::OK();
-}
-
-Status BrokerFileSystem::direct_download_impl(const Path& remote_impl, std::string* content) {
-    // 1. open remote file for read
-    FileReaderSPtr broker_reader = nullptr;
-    RETURN_IF_ERROR(open_file_internal(remote_impl, -1, &broker_reader));
-
-    constexpr size_t buf_sz = 1024 * 1024;
-    std::unique_ptr<char[]> read_buf(new char[buf_sz]);
-    size_t write_offset = 0;
-    size_t cur_offset = 0;
-    while (true) {
-        size_t read_len = 0;
-        Slice file_slice(read_buf.get(), buf_sz);
-        RETURN_IF_ERROR(broker_reader->read_at(cur_offset, file_slice, &read_len));
-        cur_offset += read_len;
-        if (read_len == 0) {
-            break;
-        }
-
-        content->insert(write_offset, read_buf.get(), read_len);
-        write_offset += read_len;
-    }
-    return Status::OK();
-}
-
-Status BrokerFileSystem::get_client(std::shared_ptr<BrokerServiceConnection>* client) const {
-    CHECK_BROKER_CLIENT(_client);
-    *client = _client;
-    return Status::OK();
+    return local_writer->close();
 }
 
 std::string BrokerFileSystem::error_msg(const std::string& err) const {
     return fmt::format("({}:{}), {}", _broker_addr.hostname, _broker_addr.port, err);
 }
 
-} // namespace io
-} // namespace doris
+} // namespace doris::io

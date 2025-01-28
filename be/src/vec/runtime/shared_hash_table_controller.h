@@ -26,8 +26,10 @@
 #include <vector>
 
 #include "common/status.h"
+#include "vec/core/block.h"
 
 namespace doris {
+#include "common/compile_check_begin.h"
 
 class RuntimeState;
 class MinMaxFuncBase;
@@ -35,31 +37,38 @@ class HybridSetBase;
 class BloomFilterFuncBase;
 class BitmapFilterFuncBase;
 
-namespace vectorized {
+namespace pipeline {
+class Dependency;
+}
 
-class Arena;
-class Block;
-
-struct SharedRuntimeFilterContext {
+struct RuntimeFilterContext {
     std::shared_ptr<MinMaxFuncBase> minmax_func;
     std::shared_ptr<HybridSetBase> hybrid_set;
     std::shared_ptr<BloomFilterFuncBase> bloom_filter_func;
     std::shared_ptr<BitmapFilterFuncBase> bitmap_filter_func;
+    bool ignored = false;
+    bool disabled = false;
+    std::string err_msg;
 };
+
+using RuntimeFilterContextSPtr = std::shared_ptr<RuntimeFilterContext>;
+
+namespace vectorized {
+
+class Arena;
 
 struct SharedHashTableContext {
     SharedHashTableContext()
-            : hash_table_variants(nullptr),
-              signaled(false),
-              short_circuit_for_null_in_probe_side(false) {}
+            : hash_table_variants(nullptr), block(std::make_shared<vectorized::Block>()) {}
 
     Status status;
     std::shared_ptr<Arena> arena;
     std::shared_ptr<void> hash_table_variants;
-    std::shared_ptr<std::vector<Block>> blocks;
-    std::map<int, SharedRuntimeFilterContext> runtime_filters;
-    bool signaled;
-    bool short_circuit_for_null_in_probe_side;
+    std::shared_ptr<Block> block;
+    std::shared_ptr<std::vector<uint32_t>> build_indexes_null;
+    std::map<int, RuntimeFilterContextSPtr> runtime_filters;
+    std::atomic<bool> signaled = false;
+    bool short_circuit_for_null_in_probe_side = false;
 };
 
 using SharedHashTableContextPtr = std::shared_ptr<SharedHashTableContext>;
@@ -67,24 +76,32 @@ using SharedHashTableContextPtr = std::shared_ptr<SharedHashTableContext>;
 class SharedHashTableController {
 public:
     /// set hash table builder's fragment instance id and consumers' fragment instance id
-    void set_builder_and_consumers(TUniqueId builder, const std::vector<TUniqueId>& consumers,
-                                   int node_id);
+    void set_builder_and_consumers(TUniqueId builder, int node_id);
     TUniqueId get_builder_fragment_instance_id(int my_node_id);
     SharedHashTableContextPtr get_context(int my_node_id);
-    void signal(int my_node_id);
-    void signal(int my_node_id, Status status);
-    Status wait_for_signal(RuntimeState* state, const SharedHashTableContextPtr& context);
-    bool should_build_hash_table(const TUniqueId& fragment_instance_id, int my_node_id);
-    void set_pipeline_engine_enabled(bool enabled) { _pipeline_engine_enabled = enabled; }
+    void signal_finish(int my_node_id);
+    void append_dependency(int node_id, std::shared_ptr<pipeline::Dependency> dep,
+                           std::shared_ptr<pipeline::Dependency> finish_dep) {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (!_dependencies.contains(node_id)) {
+            _dependencies.insert({node_id, {}});
+            _finish_dependencies.insert({node_id, {}});
+        }
+        _dependencies[node_id].push_back(dep);
+        _finish_dependencies[node_id].push_back(finish_dep);
+    }
 
 private:
-    bool _pipeline_engine_enabled = false;
     std::mutex _mutex;
-    std::condition_variable _cv;
-    std::map<int, std::vector<TUniqueId>> _ref_fragments;
+    // For pipelineX, we update all dependencies once hash table is built;
+    std::map<int /*node id*/, std::vector<std::shared_ptr<pipeline::Dependency>>> _dependencies;
+    std::map<int /*node id*/, std::vector<std::shared_ptr<pipeline::Dependency>>>
+            _finish_dependencies;
     std::map<int /*node id*/, TUniqueId /*fragment instance id*/> _builder_fragment_ids;
     std::map<int /*node id*/, SharedHashTableContextPtr> _shared_contexts;
 };
 
 } // namespace vectorized
 } // namespace doris
+
+#include "common/compile_check_end.h"

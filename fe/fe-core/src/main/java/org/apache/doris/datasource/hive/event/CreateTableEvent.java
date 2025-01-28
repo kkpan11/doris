@@ -15,19 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-
 package org.apache.doris.datasource.hive.event;
 
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.DdlException;
+import org.apache.doris.datasource.ExternalMetaIdMgr;
+import org.apache.doris.datasource.MetaIdMappingsLog;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import org.apache.hadoop.hive.metastore.api.NotificationEvent;
 import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hadoop.hive.metastore.messaging.CreateTableMessage;
 
 import java.util.List;
+import java.util.Locale;
 
 /**
  * MetastoreEvent for CREATE_TABLE event type
@@ -35,19 +38,26 @@ import java.util.List;
 public class CreateTableEvent extends MetastoreTableEvent {
     private final Table hmsTbl;
 
+    // for test
+    public CreateTableEvent(long eventId, String catalogName, String dbName, String tblName) {
+        super(eventId, catalogName, dbName, tblName, MetastoreEventType.CREATE_TABLE);
+        this.hmsTbl = null;
+    }
+
     private CreateTableEvent(NotificationEvent event, String catalogName) throws MetastoreNotificationException {
         super(event, catalogName);
         Preconditions.checkArgument(MetastoreEventType.CREATE_TABLE.equals(getEventType()));
         Preconditions
-                .checkNotNull(event.getMessage(), debugString("Event message is null"));
+                .checkNotNull(event.getMessage(), getMsgWithEventInfo("Event message is null"));
         try {
             CreateTableMessage createTableMessage =
                     MetastoreEventsProcessor.getMessageDeserializer(event.getMessageFormat())
                             .getCreateTableMessage(event.getMessage());
             hmsTbl = Preconditions.checkNotNull(createTableMessage.getTableObj());
+            hmsTbl.setTableName(hmsTbl.getTableName().toLowerCase(Locale.ROOT));
         } catch (Exception e) {
             throw new MetastoreNotificationException(
-                    debugString("Unable to deserialize the event message"), e);
+                    getMsgWithEventInfo("Unable to deserialize the event message"), e);
         }
     }
 
@@ -56,13 +66,33 @@ public class CreateTableEvent extends MetastoreTableEvent {
     }
 
     @Override
+    protected boolean willCreateOrDropTable() {
+        return true;
+    }
+
+    @Override
+    protected boolean willChangeTableName() {
+        return false;
+    }
+
+    @Override
     protected void process() throws MetastoreNotificationException {
         try {
-            infoLog("catalogName:[{}],dbName:[{}],tableName:[{}]", catalogName, dbName, tblName);
-            Env.getCurrentEnv().getCatalogMgr().createExternalTable(dbName, hmsTbl.getTableName(), catalogName, true);
+            logInfo("catalogName:[{}],dbName:[{}],tableName:[{}]", catalogName, dbName, tblName);
+            Env.getCurrentEnv().getCatalogMgr()
+                    .registerExternalTableFromEvent(dbName, hmsTbl.getTableName(), catalogName, eventTime, true);
         } catch (DdlException e) {
             throw new MetastoreNotificationException(
-                    debugString("Failed to process event"), e);
+                    getMsgWithEventInfo("Failed to process event"), e);
         }
+    }
+
+    @Override
+    protected List<MetaIdMappingsLog.MetaIdMapping> transferToMetaIdMappings() {
+        MetaIdMappingsLog.MetaIdMapping metaIdMapping = new MetaIdMappingsLog.MetaIdMapping(
+                    MetaIdMappingsLog.OPERATION_TYPE_ADD,
+                    MetaIdMappingsLog.META_OBJECT_TYPE_TABLE,
+                    dbName, tblName, ExternalMetaIdMgr.nextMetaId());
+        return ImmutableList.of(metaIdMapping);
     }
 }

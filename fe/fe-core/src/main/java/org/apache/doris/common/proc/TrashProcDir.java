@@ -22,6 +22,7 @@ import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ClientPool;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.util.DebugUtil;
+import org.apache.doris.common.util.NetUtils;
 import org.apache.doris.system.Backend;
 import org.apache.doris.thrift.BackendService;
 import org.apache.doris.thrift.TNetworkAddress;
@@ -49,7 +50,13 @@ public class TrashProcDir implements ProcDirInterface {
     private List<Backend> backends = Lists.newArrayList();
 
     public TrashProcDir() {
-        ImmutableMap<Long, Backend> backendsInfo = Env.getCurrentSystemInfo().getIdToBackend();
+        ImmutableMap<Long, Backend> backendsInfo;
+        try {
+            backendsInfo = Env.getCurrentSystemInfo().getAllBackendsByAllCluster();
+        } catch (AnalysisException e) {
+            LOG.warn("Can't get backends info", e);
+            return;
+        }
         for (Backend backend : backendsInfo.values()) {
             this.backends.add(backend);
         }
@@ -94,7 +101,7 @@ public class TrashProcDir implements ProcDirInterface {
 
             List<String> backendInfo = new ArrayList<>();
             backendInfo.add(String.valueOf(backend.getId()));
-            backendInfo.add(backend.getHost() + ":" + backend.getHeartbeatPort());
+            backendInfo.add(NetUtils.getHostPortInAccessibleFormat(backend.getHost(), backend.getHeartbeatPort()));
             if (trashUsedCapacityB != null) {
                 Pair<Double, String> trashUsedCapacity = DebugUtil.getByteUint(trashUsedCapacityB);
                 backendInfo.add(DebugUtil.DECIMAL_FORMAT_SCALE_3.format(trashUsedCapacity.first) + " "

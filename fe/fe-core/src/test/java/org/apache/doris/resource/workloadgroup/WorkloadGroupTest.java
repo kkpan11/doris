@@ -52,13 +52,6 @@ public class WorkloadGroupTest {
         WorkloadGroup.create(name1, properties1);
     }
 
-    @Test(expected = DdlException.class)
-    public void testRequiredProperty() throws DdlException {
-        Map<String, String> properties1 = Maps.newHashMap();
-        String name1 = "g1";
-        WorkloadGroup.create(name1, properties1);
-    }
-
     @Test
     public void testCpuShareValue() {
         Map<String, String> properties1 = Maps.newHashMap();
@@ -69,7 +62,7 @@ public class WorkloadGroupTest {
             WorkloadGroup.create(name1, properties1);
             Assert.fail();
         } catch (DdlException e) {
-            Assert.assertTrue(e.getMessage().contains("requires a positive integer."));
+            Assert.assertTrue(e.getMessage().contains("value is -1 or a positive integer"));
         }
 
         properties1.put(WorkloadGroup.CPU_SHARE, "cpu");
@@ -77,7 +70,7 @@ public class WorkloadGroupTest {
             WorkloadGroup.create(name1, properties1);
             Assert.fail();
         } catch (DdlException e) {
-            Assert.assertTrue(e.getMessage().contains("requires a positive integer."));
+            Assert.assertTrue(e.getMessage().contains("value is -1 or a positive integer"));
         }
     }
 
@@ -90,8 +83,8 @@ public class WorkloadGroupTest {
         WorkloadGroup group1 = WorkloadGroup.create(name1, properties1);
 
         BaseProcResult result = new BaseProcResult();
-        group1.getProcNodeData(result);
+        group1.getProcNodeData(result, null);
         List<List<String>> rows = result.getRows();
-        Assert.assertEquals(5, rows.size());
+        Assert.assertEquals(1, rows.size());
     }
 }

@@ -17,7 +17,7 @@
 
 package org.apache.doris.analysis;
 
-import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.common.DdlException;
 
 import com.google.common.base.Preconditions;
 
@@ -28,7 +28,7 @@ import java.util.Map;
  * Used for load refactor, as an adapter for original load stmt, will proxy to insert stmt or original load stmt, chosen
  * by configuration
  */
-public class UnifiedLoadStmt extends DdlStmt {
+public class UnifiedLoadStmt extends DdlStmt implements NotFallbackInParser {
 
     private final StatementBase proxyStmt;
 
@@ -43,25 +43,22 @@ public class UnifiedLoadStmt extends DdlStmt {
     }
 
     public static UnifiedLoadStmt buildMysqlLoadStmt(DataDescription dataDescription, Map<String, String> properties,
-                                                     String comment) {
-        final ConnectContext connectContext = ConnectContext.get();
-        if (connectContext != null && connectContext.getSessionVariable().isEnableUnifiedLoad()) {
-            return new UnifiedLoadStmt(new MysqlLoadStmt(dataDescription, properties, comment));
-        }
+            String comment) {
         return new UnifiedLoadStmt(new LoadStmt(dataDescription, properties, comment));
     }
 
     public static UnifiedLoadStmt buildBrokerLoadStmt(LabelName label, List<DataDescription> dataDescriptions,
-                                                      BrokerDesc brokerDesc,
-                                                      Map<String, String> properties, String comment) {
-        final ConnectContext connectContext = ConnectContext.get();
-        if (connectContext != null && connectContext.getSessionVariable().isEnableUnifiedLoad()) {
-            return new UnifiedLoadStmt(new BrokerLoadStmt(label, dataDescriptions, brokerDesc, properties, comment));
-        }
+            BrokerDesc brokerDesc,
+            Map<String, String> properties, String comment) throws DdlException {
         return new UnifiedLoadStmt(new LoadStmt(label, dataDescriptions, brokerDesc, properties, comment));
     }
 
     public StatementBase getProxyStmt() {
         return proxyStmt;
+    }
+
+    @Override
+    public RedirectStatus getRedirectStatus() {
+        return proxyStmt.getRedirectStatus();
     }
 }

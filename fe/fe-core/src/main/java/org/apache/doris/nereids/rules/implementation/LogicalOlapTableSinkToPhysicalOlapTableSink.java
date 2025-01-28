@@ -36,9 +36,15 @@ public class LogicalOlapTableSinkToPhysicalOlapTableSink extends OneImplementati
             return new PhysicalOlapTableSink<>(
                     sink.getDatabase(),
                     sink.getTargetTable(),
-                    sink.getPartitionIds(),
                     sink.getCols(),
+                    sink.getPartitionIds(),
+                    sink.getOutputExprs(),
                     ctx.connectContext.getSessionVariable().isEnableSingleReplicaInsert(),
+                    sink.isPartialUpdate(),
+                    sink.getDmlCommandType(),
+                    sink.getPartitionExprList(),
+                    sink.getSyncMvWhereClauses(),
+                    sink.getTargetTableSlots(),
                     Optional.empty(),
                     sink.getLogicalProperties(),
                     sink.child());

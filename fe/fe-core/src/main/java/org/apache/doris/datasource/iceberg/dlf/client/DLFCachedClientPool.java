@@ -31,34 +31,43 @@ import java.util.concurrent.TimeUnit;
 
 public class DLFCachedClientPool implements ClientPool<IMetaStoreClient, TException> {
 
-    private static Cache<String, DLFClientPool> clientPoolCache;
+    private Cache<String, DLFClientPool> clientPoolCache;
     private final Configuration conf;
     private final String endpoint;
     private final int clientPoolSize;
     private final long evictionInterval;
 
+    // This cached client pool should belong to the catalog level,
+    // each catalog has its own pool
     public DLFCachedClientPool(Configuration conf, Map<String, String> properties) {
         this.conf = conf;
         this.endpoint = conf.get("", "");
-        this.clientPoolSize =
-            PropertyUtil.propertyAsInt(
+        this.clientPoolSize = getClientPoolSize(properties);
+        this.evictionInterval = getEvictionInterval(properties);
+        initializeClientPoolCache();
+    }
+
+    private int getClientPoolSize(Map<String, String> properties) {
+        return PropertyUtil.propertyAsInt(
                 properties,
                 CatalogProperties.CLIENT_POOL_SIZE,
-                CatalogProperties.CLIENT_POOL_SIZE_DEFAULT);
-        this.evictionInterval =
-            PropertyUtil.propertyAsLong(
+                CatalogProperties.CLIENT_POOL_SIZE_DEFAULT
+        );
+    }
+
+    private long getEvictionInterval(Map<String, String> properties) {
+        return PropertyUtil.propertyAsLong(
                 properties,
                 CatalogProperties.CLIENT_POOL_CACHE_EVICTION_INTERVAL_MS,
-                CatalogProperties.CLIENT_POOL_CACHE_EVICTION_INTERVAL_MS_DEFAULT);
-        synchronized (this) {
-            if (clientPoolCache == null) {
-                clientPoolCache =
-                    Caffeine.newBuilder()
-                        .expireAfterAccess(evictionInterval, TimeUnit.MILLISECONDS)
-                        .removalListener((key, value, cause) -> ((DLFClientPool) value).close())
-                        .build();
-            }
-        }
+                CatalogProperties.CLIENT_POOL_CACHE_EVICTION_INTERVAL_MS_DEFAULT
+        );
+    }
+
+    private void initializeClientPoolCache() {
+        clientPoolCache = Caffeine.newBuilder()
+                .expireAfterAccess(evictionInterval, TimeUnit.MILLISECONDS)
+                .removalListener((key, value, cause) -> ((DLFClientPool) value).close())
+                .build();
     }
 
     protected DLFClientPool clientPool() {
@@ -76,3 +85,4 @@ public class DLFCachedClientPool implements ClientPool<IMetaStoreClient, TExcept
         return clientPool().run(action, retry);
     }
 }
+

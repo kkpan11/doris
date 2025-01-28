@@ -20,13 +20,16 @@
 
 #pragma once
 
+#include <type_traits>
+
+#include "vec/core/wide_integer.h"
 #ifndef __APPLE__
 #include <endian.h>
 #endif
 
-// IWYU pragma: no_include <opentelemetry/common/threadlocal.h>
 #include "common/compiler_util.h" // IWYU pragma: keep
 #include "gutil/bits.h"
+#include "gutil/endian.h"
 #include "util/cpu_info.h"
 #include "util/sse_util.hpp"
 
@@ -96,6 +99,28 @@ public:
 
         int n = 64 - num_bits;
         return (v << n) >> n;
+    }
+
+    template <typename T>
+    static std::string IntToByteBuffer(T input) {
+        std::string buffer;
+        T value = input;
+        for (int i = 0; i < sizeof(value); ++i) {
+            // Applies a mask for a byte range on the input.
+            signed char value_to_save = value & 0XFF;
+            buffer.push_back(value_to_save);
+            // Remove the just processed part from the input so that we can exit early if there
+            // is nothing left to process.
+            value >>= 8;
+            if (value == 0 && value_to_save >= 0) {
+                break;
+            }
+            if (value == -1 && value_to_save < 0) {
+                break;
+            }
+        }
+        std::reverse(buffer.begin(), buffer.end());
+        return buffer;
     }
 
     // Returns ceil(log2(x)).
@@ -184,6 +209,37 @@ public:
     static inline int16_t big_endian(int16_t val) { return val; }
     static inline uint16_t big_endian(uint16_t val) { return val; }
 #endif
+
+    template <typename T>
+    static T big_endian_to_host(T value) {
+        if constexpr (std::is_same_v<T, wide::Int256>) {
+            return BigEndian::ToHost256(value);
+        } else if constexpr (std::is_same_v<T, wide::UInt256>) {
+            return BigEndian::ToHost256(value);
+        } else if constexpr (std::is_same_v<T, __int128>) {
+            return BigEndian::ToHost128(value);
+        } else if constexpr (std::is_same_v<T, unsigned __int128>) {
+            return BigEndian::ToHost128(value);
+        } else if constexpr (std::is_same_v<T, int64_t>) {
+            return BigEndian::ToHost64(value);
+        } else if constexpr (std::is_same_v<T, uint64_t>) {
+            return BigEndian::ToHost64(value);
+        } else if constexpr (std::is_same_v<T, int32_t>) {
+            return BigEndian::ToHost32(value);
+        } else if constexpr (std::is_same_v<T, uint32_t>) {
+            return BigEndian::ToHost32(value);
+        } else if constexpr (std::is_same_v<T, int16_t>) {
+            return BigEndian::ToHost16(value);
+        } else if constexpr (std::is_same_v<T, uint16_t>) {
+            return BigEndian::ToHost16(value);
+        } else if constexpr (std::is_same_v<T, int8_t>) {
+            return value;
+        } else if constexpr (std::is_same_v<T, uint8_t>) {
+            return value;
+        } else {
+            throw Exception(Status::FatalError("__builtin_unreachable"));
+        }
+    }
 
     /// Returns the smallest power of two that contains v. If v is a power of two, v is
     /// returned. Taken from

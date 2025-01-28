@@ -17,49 +17,59 @@
 
 package org.apache.doris.nereids.rules.expression.rules;
 
-import org.apache.doris.nereids.rules.expression.AbstractExpressionRewriteRule;
-import org.apache.doris.nereids.rules.expression.ExpressionRewriteContext;
+import org.apache.doris.nereids.rules.expression.ExpressionPatternMatcher;
+import org.apache.doris.nereids.rules.expression.ExpressionPatternRuleFactory;
+import org.apache.doris.nereids.rules.expression.ExpressionRuleType;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.DateFormat;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.FromUnixtime;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.UnixTimestamp;
 import org.apache.doris.nereids.trees.expressions.literal.Literal;
-import org.apache.doris.nereids.trees.expressions.literal.StringLiteral;
+import org.apache.doris.nereids.trees.expressions.literal.VarcharLiteral;
 
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 
 import java.util.List;
 
-/** SupportJavaDateFormatter */
-public class SupportJavaDateFormatter extends AbstractExpressionRewriteRule {
+/** SupportJavaDateFormatter2 */
+public class SupportJavaDateFormatter implements ExpressionPatternRuleFactory {
     public static final SupportJavaDateFormatter INSTANCE = new SupportJavaDateFormatter();
 
     @Override
-    public Expression visitDateFormat(DateFormat dateFormat, ExpressionRewriteContext context) {
-        Expression expr = super.visitDateFormat(dateFormat, context);
-        if (!(expr instanceof DateFormat)) {
-            return expr;
-        }
-        dateFormat = (DateFormat) expr;
+    public List<ExpressionPatternMatcher<? extends Expression>> buildRules() {
+        return ImmutableList.of(
+                matchesType(DateFormat.class).then(SupportJavaDateFormatter::rewriteDateFormat)
+                        .toRule(ExpressionRuleType.SUPPORT_JAVA_DATE_FORMATTER),
+                matchesType(FromUnixtime.class).then(SupportJavaDateFormatter::rewriteFromUnixtime)
+                        .toRule(ExpressionRuleType.SUPPORT_JAVA_DATE_FORMATTER),
+                matchesType(UnixTimestamp.class).then(SupportJavaDateFormatter::rewriteUnixTimestamp)
+                        .toRule(ExpressionRuleType.SUPPORT_JAVA_DATE_FORMATTER)
+        );
+    }
+
+    public static Expression rewriteDateFormat(DateFormat dateFormat) {
         if (dateFormat.arity() > 1) {
             return translateJavaFormatter(dateFormat, 1);
         }
         return dateFormat;
     }
 
-    @Override
-    public Expression visitFromUnixtime(FromUnixtime fromUnixtime, ExpressionRewriteContext context) {
-        Expression expr = super.visitFromUnixtime(fromUnixtime, context);
-        if (!(expr instanceof FromUnixtime)) {
-            return expr;
-        }
-        fromUnixtime = (FromUnixtime) expr;
+    public static Expression rewriteFromUnixtime(FromUnixtime fromUnixtime) {
         if (fromUnixtime.arity() > 1) {
             return translateJavaFormatter(fromUnixtime, 1);
         }
         return fromUnixtime;
     }
 
-    private Expression translateJavaFormatter(Expression function, int formatterIndex) {
+    public static Expression rewriteUnixTimestamp(UnixTimestamp unixTimestamp) {
+        if (unixTimestamp.arity() > 1) {
+            return translateJavaFormatter(unixTimestamp, 1);
+        }
+        return unixTimestamp;
+    }
+
+    private static Expression translateJavaFormatter(Expression function, int formatterIndex) {
         Expression formatterExpr = function.getArgument(formatterIndex);
         Expression newFormatterExpr = translateJavaFormatter(formatterExpr);
         if (newFormatterExpr != formatterExpr) {
@@ -70,16 +80,17 @@ public class SupportJavaDateFormatter extends AbstractExpressionRewriteRule {
         return function;
     }
 
-    private Expression translateJavaFormatter(Expression formatterExpr) {
+    /** translateJavaFormatter */
+    public static Expression translateJavaFormatter(Expression formatterExpr) {
         if (formatterExpr.isLiteral() && formatterExpr.getDataType().isStringLikeType()) {
             Literal literal = (Literal) formatterExpr;
             String originFormatter = literal.getStringValue();
             if (originFormatter.equals("yyyyMMdd")) {
-                return new StringLiteral("%Y%m%d");
+                return new VarcharLiteral("%Y%m%d");
             } else if (originFormatter.equals("yyyy-MM-dd")) {
-                return new StringLiteral("%Y-%m-%d");
+                return new VarcharLiteral("%Y-%m-%d");
             } else if (originFormatter.equals("yyyy-MM-dd HH:mm:ss")) {
-                return new StringLiteral("%Y-%m-%d %H:%i:%s");
+                return new VarcharLiteral("%Y-%m-%d %H:%i:%s");
             }
         }
         return formatterExpr;

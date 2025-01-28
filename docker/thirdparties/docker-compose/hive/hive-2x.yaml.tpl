@@ -18,42 +18,33 @@
 
 version: "3.8"
 
-networks:
-  doris--network:
-    driver: bridge
-
 services:
-  doris--namenode:
+  namenode:
     image: bde2020/hadoop-namenode:2.0.0-hadoop2.7.4-java8
+    restart: always
     environment:
       - CLUSTER_NAME=test
     env_file:
-      - ./hadoop-hive.env
-    hostname: doris--namenode
-    container_name: doris--namenode
+      - ./hadoop-hive-2x.env
+    container_name: ${CONTAINER_UID}hadoop2-namenode
     expose:
       - "50070"
-      - "8020"
-      - "9000"
       - "${FS_PORT}"
-    ports:
-      - "${FS_PORT}:${FS_PORT}"
     healthcheck:
       test: [ "CMD", "curl", "http://localhost:50070/" ]
       interval: 5s
       timeout: 120s
       retries: 120
-    networks:
-      - doris--network
+    network_mode: "host"
 
-  doris--datanode:
+  datanode:
     image: bde2020/hadoop-datanode:2.0.0-hadoop2.7.4-java8
+    restart: always
     env_file:
-      - ./hadoop-hive.env
+      - ./hadoop-hive-2x.env
     environment:
-      SERVICE_PRECONDITION: "doris--namenode:50070"
-    hostname: doris--datanode
-    container_name: doris--datanode
+      SERVICE_PRECONDITION: "${IP_HOST}:50070"
+    container_name: ${CONTAINER_UID}hadoop2-datanode
     expose:
       - "50075"
     healthcheck:
@@ -61,64 +52,61 @@ services:
       interval: 5s
       timeout: 60s
       retries: 120
-    networks:
-      - doris--network
+    network_mode: "host"
 
-  doris--hive-server:
+  hive-server:
     image: bde2020/hive:2.3.2-postgresql-metastore
     env_file:
-      - ./hadoop-hive.env
+      - ./hadoop-hive-2x.env
     environment:
-      HIVE_CORE_CONF_javax_jdo_option_ConnectionURL: "jdbc:postgresql://doris--hive-metastore-postgresql:5432/metastore"
-      SERVICE_PRECONDITION: "doris--hive-metastore:9083"
-    hostname: doris--hive-server
-    container_name: doris--hive-server
+      HIVE_CORE_CONF_javax_jdo_option_ConnectionURL: "jdbc:postgresql://${IP_HOST}:${PG_PORT}/metastore"
+      SERVICE_PRECONDITION: "${IP_HOST}:${HMS_PORT}"
+    container_name: ${CONTAINER_UID}hive2-server
     expose:
-      - "10000"
+      - "${HS_PORT}"
     depends_on:
-      - doris--datanode
-      - doris--namenode
+      datanode:
+        condition: service_healthy
+      namenode:
+        condition: service_healthy
     healthcheck:
-      test: beeline -u "jdbc:hive2://127.0.0.1:10000/default" -n health_check -e "show databases;"
+      test: beeline -u "jdbc:hive2://127.0.0.1:${HS_PORT}/default" -n health_check -e "show databases;"
       interval: 10s
       timeout: 120s
       retries: 120
-    networks:
-      - doris--network
+    network_mode: "host"
 
 
-  doris--hive-metastore:
+  hive-metastore:
     image: bde2020/hive:2.3.2-postgresql-metastore
     env_file:
-      - ./hadoop-hive.env
+      - ./hadoop-hive-2x.env
     command: /bin/bash /mnt/scripts/hive-metastore.sh
-    # command: /opt/hive/bin/hive --service metastore
     environment:
-      SERVICE_PRECONDITION: "doris--namenode:50070 doris--datanode:50075 doris--hive-metastore-postgresql:5432"
-    hostname: doris--hive-metastore
-    container_name: doris--hive-metastore
+      SERVICE_PRECONDITION: "${IP_HOST}:50070 ${IP_HOST}:50075 ${IP_HOST}:${PG_PORT}"
+      HMS_PORT: "${HMS_PORT}"
+    container_name: ${CONTAINER_UID}hive2-metastore
     expose:
-      - "9083"
-    ports:
-      - "${HMS_PORT}:9083"
+      - "${HMS_PORT}"
     volumes:
       - ./scripts:/mnt/scripts
     depends_on:
-      - doris--hive-metastore-postgresql
-    networks:
-      - doris--network
+      hive-metastore-postgresql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "sh", "-c", "/mnt/scripts/healthy_check.sh"]
+      interval: 20s
+      timeout: 60s
+      retries: 120
+    network_mode: "host"
 
-  doris--hive-metastore-postgresql:
+  hive-metastore-postgresql:
     image: bde2020/hive-metastore-postgresql:2.3.0
-    restart: always
-    hostname: doris--hive-metastore-postgresql
-    container_name: doris--hive-metastore-postgresql
-    expose:
-      - "5432"
+    container_name: ${CONTAINER_UID}hive2-metastore-postgresql
+    ports:
+      - "${PG_PORT}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
       timeout: 60s
       retries: 120
-    networks:
-      - doris--network

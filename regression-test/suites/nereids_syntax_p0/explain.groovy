@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("nereids_explain") {
+suite("explain") {
     sql """
         SET enable_nereids_planner=true
     """
@@ -26,9 +26,8 @@ suite("nereids_explain") {
 
     explain {
         sql("select count(2) + 1, sum(2) + sum(lo_suppkey) from lineorder")
-        contains "(sum(2) + sum(lo_suppkey))[#"
+        contains "sum(2) + sum(lo_suppkey)"
     }
-
 
     explain {
         sql("physical plan select 100")
@@ -42,7 +41,7 @@ suite("nereids_explain") {
 
     explain {
         sql("parsed plan select 100")
-        contains "UnboundOneRowRelation"
+        contains "LogicalOneRowRelation"
     }
 
     explain {
@@ -63,9 +62,15 @@ suite("nereids_explain") {
             when 1>1 then cast(1 as float)
             else 0.0 end;
             """
-        contains "SlotDescriptor{id=0, col=null, colUniqueId=null, type=decimalv3(14, 7), nullable=false}"
+        contains "SlotDescriptor{id=0, col=null, colUniqueId=null, type=double, nullable=false, isAutoIncrement=false, subColPath=null}"
     }
 
     def explainStr = sql("select sum(if(lo_tax=1,lo_tax,0)) from lineorder where false").toString()
     assertTrue(!explainStr.contains("projections"))
+
+    explain {
+        sql("select week(cast('0000-01-01' as DATEV2), cast(2 as INT));")
+        notContains "week"
+        contains "1"
+    }
 }

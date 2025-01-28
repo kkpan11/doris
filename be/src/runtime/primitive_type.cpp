@@ -51,10 +51,6 @@ bool is_type_compatible(PrimitiveType lhs, PrimitiveType rhs) {
     return lhs == rhs;
 }
 
-TExprOpcode::type to_in_opcode(PrimitiveType t) {
-    return TExprOpcode::FILTER_IN;
-}
-
 PrimitiveType thrift_to_type(TPrimitiveType::type ttype) {
     switch (ttype) {
     case TPrimitiveType::INVALID_TYPE:
@@ -103,7 +99,7 @@ PrimitiveType thrift_to_type(TPrimitiveType::type ttype) {
         return TYPE_TIMEV2;
 
     case TPrimitiveType::TIME:
-        return TYPE_TIME;
+        return TYPE_TIMEV2;
 
     case TPrimitiveType::VARCHAR:
         return TYPE_VARCHAR;
@@ -117,6 +113,12 @@ PrimitiveType thrift_to_type(TPrimitiveType::type ttype) {
     case TPrimitiveType::BINARY:
         return TYPE_BINARY;
 
+    case TPrimitiveType::IPV4:
+        return TYPE_IPV4;
+
+    case TPrimitiveType::IPV6:
+        return TYPE_IPV6;
+
     case TPrimitiveType::DECIMALV2:
         return TYPE_DECIMALV2;
 
@@ -128,6 +130,9 @@ PrimitiveType thrift_to_type(TPrimitiveType::type ttype) {
 
     case TPrimitiveType::DECIMAL128I:
         return TYPE_DECIMAL128I;
+
+    case TPrimitiveType::DECIMAL256:
+        return TYPE_DECIMAL256;
 
     case TPrimitiveType::CHAR:
         return TYPE_CHAR;
@@ -155,6 +160,9 @@ PrimitiveType thrift_to_type(TPrimitiveType::type ttype) {
 
     case TPrimitiveType::AGG_STATE:
         return TYPE_AGG_STATE;
+
+    case TPrimitiveType::VARIANT:
+        return TYPE_VARIANT;
 
     default:
         CHECK(false) << ", meet unknown type " << ttype;
@@ -200,9 +208,6 @@ TPrimitiveType::type to_thrift(PrimitiveType ptype) {
     case TYPE_DATETIME:
         return TPrimitiveType::DATETIME;
 
-    case TYPE_TIME:
-        return TPrimitiveType::TIME;
-
     case TYPE_DATEV2:
         return TPrimitiveType::DATEV2;
 
@@ -221,8 +226,17 @@ TPrimitiveType::type to_thrift(PrimitiveType ptype) {
     case TYPE_JSONB:
         return TPrimitiveType::JSONB;
 
+    case TYPE_VARIANT:
+        return TPrimitiveType::VARIANT;
+
     case TYPE_BINARY:
         return TPrimitiveType::BINARY;
+
+    case TYPE_IPV4:
+        return TPrimitiveType::IPV4;
+
+    case TYPE_IPV6:
+        return TPrimitiveType::IPV6;
 
     case TYPE_DECIMALV2:
         return TPrimitiveType::DECIMALV2;
@@ -235,6 +249,9 @@ TPrimitiveType::type to_thrift(PrimitiveType ptype) {
 
     case TYPE_DECIMAL128I:
         return TPrimitiveType::DECIMAL128I;
+
+    case TYPE_DECIMAL256:
+        return TPrimitiveType::DECIMAL256;
 
     case TYPE_CHAR:
         return TPrimitiveType::CHAR;
@@ -258,6 +275,8 @@ TPrimitiveType::type to_thrift(PrimitiveType ptype) {
         return TPrimitiveType::STRUCT;
     case TYPE_LAMBDA_FUNCTION:
         return TPrimitiveType::LAMBDA_FUNCTION;
+    case TYPE_AGG_STATE:
+        return TPrimitiveType::AGG_STATE;
 
     default:
         return TPrimitiveType::INVALID_TYPE;
@@ -302,9 +321,6 @@ std::string type_to_string(PrimitiveType t) {
     case TYPE_DATETIME:
         return "DATETIME";
 
-    case TYPE_TIME:
-        return "TIME";
-
     case TYPE_DATEV2:
         return "DATEV2";
 
@@ -326,6 +342,12 @@ std::string type_to_string(PrimitiveType t) {
     case TYPE_BINARY:
         return "BINARY";
 
+    case TYPE_IPV4:
+        return "IPV4";
+
+    case TYPE_IPV6:
+        return "IPV6";
+
     case TYPE_DECIMALV2:
         return "DECIMALV2";
 
@@ -337,6 +359,9 @@ std::string type_to_string(PrimitiveType t) {
 
     case TYPE_DECIMAL128I:
         return "DECIMAL128I";
+
+    case TYPE_DECIMAL256:
+        return "DECIMAL256";
 
     case TYPE_CHAR:
         return "CHAR";
@@ -363,6 +388,9 @@ std::string type_to_string(PrimitiveType t) {
         return "STRUCT";
     case TYPE_LAMBDA_FUNCTION:
         return "LAMBDA_FUNCTION TYPE";
+
+    case TYPE_VARIANT:
+        return "VARIANT";
 
     default:
         return "";
@@ -432,6 +460,12 @@ std::string type_to_odbc_string(PrimitiveType t) {
     case TYPE_BINARY:
         return "binary";
 
+    case TYPE_IPV4:
+        return "ipv4";
+
+    case TYPE_IPV6:
+        return "ipv6";
+
     case TYPE_DECIMALV2:
         return "decimalv2";
 
@@ -443,6 +477,9 @@ std::string type_to_odbc_string(PrimitiveType t) {
 
     case TYPE_DECIMAL128I:
         return "decimal128";
+
+    case TYPE_DECIMAL256:
+        return "decimal256";
 
     case TYPE_CHAR:
         return "char";

@@ -22,6 +22,8 @@
 
 #include <assert.h>
 
+#include <string_view>
+
 #include "vec/common/sip_hash.h"
 
 namespace doris::vectorized {
@@ -45,6 +47,26 @@ PathInData::PathInData(const Parts& parts_) {
 PathInData::PathInData(const PathInData& other) : path(other.path) {
     build_parts(other.get_parts());
 }
+
+PathInData::PathInData(const std::string& root, const std::vector<std::string>& paths) {
+    PathInDataBuilder path_builder;
+    path_builder.append(root, false);
+    for (const std::string& path : paths) {
+        path_builder.append(path, false);
+    }
+    build_path(path_builder.get_parts());
+    build_parts(path_builder.get_parts());
+}
+
+PathInData::PathInData(const std::vector<std::string>& paths) {
+    PathInDataBuilder path_builder;
+    for (size_t i = 0; i < paths.size(); ++i) {
+        path_builder.append(paths[i], false);
+    }
+    build_path(path_builder.get_parts());
+    build_parts(path_builder.get_parts());
+}
+
 PathInData& PathInData::operator=(const PathInData& other) {
     if (this != &other) {
         path = other.path;
@@ -63,6 +85,13 @@ UInt128 PathInData::get_parts_hash(const Parts& parts_) {
     UInt128 res;
     hash.get128(res);
     return res;
+}
+
+void PathInData::unset_nested() {
+    for (Part& part : parts) {
+        part.is_nested = false;
+    }
+    has_nested = false;
 }
 
 void PathInData::build_path(const Parts& other_parts) {
@@ -92,21 +121,113 @@ void PathInData::build_parts(const Parts& other_parts) {
         begin += part.key.length() + 1;
     }
 }
+
+void PathInData::from_protobuf(const segment_v2::ColumnPathInfo& pb) {
+    parts.clear();
+    path = pb.path();
+    has_nested = false;
+    parts.reserve(pb.path_part_infos().size());
+    const char* begin = path.data();
+    for (const segment_v2::ColumnPathPartInfo& part_info : pb.path_part_infos()) {
+        Part part;
+        part.is_nested = part_info.is_nested();
+        has_nested |= part.is_nested;
+        part.anonymous_array_level = part_info.anonymous_array_level();
+        // use string_view to ref data in path
+        part.key = std::string_view {begin, part_info.key().length()};
+        parts.push_back(part);
+        begin += part.key.length() + 1;
+    }
+}
+
+std::string PathInData::to_jsonpath() const {
+    std::string jsonpath = "$.";
+    if (parts.empty()) {
+        return jsonpath;
+    }
+    auto it = parts.begin();
+    jsonpath += it->key;
+    ++it;
+    for (; it != parts.end(); ++it) {
+        jsonpath += ".";
+        jsonpath += it->key;
+    }
+    return jsonpath;
+}
+
+void PathInData::to_protobuf(segment_v2::ColumnPathInfo* pb, int32_t parent_col_unique_id) const {
+    pb->set_path(path);
+    pb->set_has_nested(has_nested);
+    pb->set_parrent_column_unique_id(parent_col_unique_id);
+
+    // set parts info
+    for (const Part& part : parts) {
+        segment_v2::ColumnPathPartInfo& part_info = *pb->add_path_part_infos();
+        part_info.set_key(std::string(part.key.data(), part.key.size()));
+        part_info.set_is_nested(part.is_nested);
+        part_info.set_anonymous_array_level(part.anonymous_array_level);
+    }
+}
+
 size_t PathInData::Hash::operator()(const PathInData& value) const {
     auto hash = get_parts_hash(value.parts);
-    return hash.low ^ hash.high;
+    return hash.low() ^ hash.high();
 }
+
+PathInData PathInData::copy_pop_front() const {
+    return copy_pop_nfront(1);
+}
+
+PathInData PathInData::get_nested_prefix_path() const {
+    CHECK(has_nested_part());
+    PathInData new_path;
+    Parts new_parts;
+    for (const Part& part : parts) {
+        new_parts.push_back(part);
+        if (part.is_nested) {
+            break;
+        }
+    }
+    new_path.build_path(new_parts);
+    new_path.build_parts(new_parts);
+    return new_path;
+}
+
+PathInData PathInData::copy_pop_back() const {
+    if (parts.size() <= 1) {
+        return {};
+    }
+    PathInData new_path;
+    Parts new_parts = parts;
+    new_parts.pop_back();
+    new_path.build_path(new_parts);
+    new_path.build_parts(new_parts);
+    return new_path;
+}
+
+PathInData PathInData::copy_pop_nfront(size_t n) const {
+    if (n >= parts.size()) {
+        return {};
+    }
+    PathInData new_path;
+    Parts new_parts;
+    if (!parts.empty()) {
+        std::copy(parts.begin() + n, parts.end(), std::back_inserter(new_parts));
+    }
+    new_path.build_path(new_parts);
+    new_path.build_parts(new_parts);
+    return new_path;
+}
+
 PathInDataBuilder& PathInDataBuilder::append(std::string_view key, bool is_array) {
     if (parts.empty()) {
         current_anonymous_array_level += is_array;
     }
-    if (!key.empty()) {
-        if (!parts.empty()) {
-            parts.back().is_nested = is_array;
-        }
-        parts.emplace_back(key, false, current_anonymous_array_level);
-        current_anonymous_array_level = 0;
+    if (!parts.empty()) {
+        parts.back().is_nested = is_array;
     }
+    parts.emplace_back(key, false, current_anonymous_array_level);
+    current_anonymous_array_level = 0;
     return *this;
 }
 PathInDataBuilder& PathInDataBuilder::append(const PathInData::Parts& path, bool is_array) {
@@ -125,9 +246,13 @@ PathInDataBuilder& PathInDataBuilder::append(const PathInData::Parts& path, bool
     }
     return *this;
 }
+
 void PathInDataBuilder::pop_back() {
-    parts.pop_back();
+    if (!parts.empty()) {
+        parts.pop_back();
+    }
 }
+
 void PathInDataBuilder::pop_back(size_t n) {
     assert(n <= parts.size());
     parts.resize(parts.size() - n);

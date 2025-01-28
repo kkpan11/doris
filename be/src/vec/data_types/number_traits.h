@@ -20,12 +20,14 @@
 
 #pragma once
 
+#include <climits>
 #include <type_traits>
 
 #include "vec/columns/column_decimal.h"
 #include "vec/columns/column_vector.h"
 #include "vec/common/uint128.h"
 #include "vec/core/types.h"
+#include "vec/core/wide_integer.h"
 
 namespace doris::vectorized {
 
@@ -76,6 +78,10 @@ struct Construct<false, false, 16> {
     using Type = Int128;
 };
 template <>
+struct Construct<false, false, 32> {
+    using Type = wide::Int256;
+};
+template <>
 struct Construct<false, true, 1> {
     using Type = Float32;
 };
@@ -110,6 +116,10 @@ struct Construct<true, false, 8> {
 template <>
 struct Construct<true, false, 16> {
     using Type = Int128;
+};
+template <>
+struct Construct<true, false, 32> {
+    using Type = wide::Int256;
 };
 template <>
 struct Construct<true, true, 1> {
@@ -173,9 +183,22 @@ struct ResultOfIntegerDivision {
     */
 template <typename A, typename B>
 struct ResultOfModulo {
-    using Type = typename Construct<std::is_signed_v<A> || std::is_signed_v<B>,
-                                    std::is_floating_point_v<A> || std::is_floating_point_v<B>,
-                                    max(sizeof(A), sizeof(B))>::Type;
+    constexpr static auto has_float = std::is_floating_point_v<A> || std::is_floating_point_v<B>;
+    consteval static auto result_size() {
+        if constexpr (!has_float) {
+            return max(sizeof(A), sizeof(B));
+        }
+        size_t max_float_size = 0;
+        if constexpr (std::is_floating_point_v<A>) {
+            max_float_size = max(max_float_size, sizeof(A));
+        }
+        if constexpr (std::is_floating_point_v<B>) {
+            max_float_size = max(max_float_size, sizeof(B));
+        }
+        return max_float_size;
+    }
+    using Type = typename Construct<std::is_signed_v<A> || std::is_signed_v<B>, has_float,
+                                    result_size()>::Type;
 };
 
 template <typename A>
@@ -207,6 +230,72 @@ struct BinaryOperatorTraits {
     using ArrayNull = PaddedPODArray<UInt8>;
 };
 
+template <typename T>
+/// Returns the maximum ascii string length for this type.
+/// e.g. the max/min int8_t has 3 characters.
+int max_ascii_len() {
+    return 0;
+}
+
+template <>
+inline int max_ascii_len<uint8_t>() {
+    return 3;
+}
+
+template <>
+inline int max_ascii_len<uint16_t>() {
+    return 5;
+}
+
+template <>
+inline int max_ascii_len<uint32_t>() {
+    return 10;
+}
+
+template <>
+inline int max_ascii_len<uint64_t>() {
+    return 20;
+}
+
+template <>
+inline int max_ascii_len<int8_t>() {
+    return 3;
+}
+
+template <>
+inline int max_ascii_len<int16_t>() {
+    return 5;
+}
+
+template <>
+inline int max_ascii_len<int32_t>() {
+    return 10;
+}
+
+template <>
+inline int max_ascii_len<int64_t>() {
+    return 19;
+}
+
+template <>
+inline int max_ascii_len<__int128>() {
+    return 39;
+}
+
+template <>
+inline int max_ascii_len<wide::Int256>() {
+    return 77;
+}
+
+template <>
+inline int max_ascii_len<float>() {
+    return INT_MAX;
+}
+
+template <>
+inline int max_ascii_len<double>() {
+    return INT_MAX;
+}
 } // namespace NumberTraits
 
 } // namespace doris::vectorized

@@ -123,7 +123,7 @@ public:
     ssize_t ordinal() const { return _ordinal; }
 
 private:
-    const ShortKeyIndexDecoder* _decoder;
+    const ShortKeyIndexDecoder* _decoder = nullptr;
     ssize_t _ordinal;
 };
 
@@ -135,6 +135,7 @@ private:
 class ShortKeyIndexDecoder {
 public:
     ShortKeyIndexDecoder() : _parsed(false) {}
+    virtual ~ShortKeyIndexDecoder();
 
     // client should assure that body is available when this class is used
     Status parse(const Slice& body, const segment_v2::ShortKeyFooterPB& footer);

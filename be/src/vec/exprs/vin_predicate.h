@@ -42,15 +42,11 @@ class VInPredicate final : public VExpr {
 public:
     VInPredicate(const TExprNode& node);
     ~VInPredicate() override = default;
-    doris::Status execute(VExprContext* context, doris::vectorized::Block* block,
-                          int* result_column_id) override;
-    doris::Status prepare(doris::RuntimeState* state, const doris::RowDescriptor& desc,
-                          VExprContext* context) override;
-    doris::Status open(doris::RuntimeState* state, VExprContext* context,
-                       FunctionContext::FunctionStateScope scope) override;
-    void close(doris::RuntimeState* state, VExprContext* context,
-               FunctionContext::FunctionStateScope scope) override;
-    VExprSPtr clone() const override { return VInPredicate::create_shared(*this); }
+    Status execute(VExprContext* context, Block* block, int* result_column_id) override;
+    Status prepare(RuntimeState* state, const RowDescriptor& desc, VExprContext* context) override;
+    Status open(RuntimeState* state, VExprContext* context,
+                FunctionContext::FunctionStateScope scope) override;
+    void close(VExprContext* context, FunctionContext::FunctionStateScope scope) override;
     const std::string& expr_name() const override;
 
     std::string debug_string() const override;
@@ -58,6 +54,7 @@ public:
     const FunctionBasePtr function() { return _function; }
 
     bool is_not_in() const { return _is_not_in; };
+    Status evaluate_inverted_index(VExprContext* context, uint32_t segment_num_rows) override;
 
 private:
     FunctionBasePtr _function;
@@ -65,5 +62,7 @@ private:
 
     const bool _is_not_in;
     static const constexpr char* function_name = "in";
+    uint32_t _in_list_value_count_threshold = 10;
+    bool _is_args_all_constant = false;
 };
 } // namespace doris::vectorized

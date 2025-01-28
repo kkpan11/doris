@@ -24,14 +24,24 @@ import org.apache.doris.thrift.TAgentTaskRequest;
 import org.apache.doris.thrift.TCancelPlanFragmentParams;
 import org.apache.doris.thrift.TCancelPlanFragmentResult;
 import org.apache.doris.thrift.TCheckStorageFormatResult;
+import org.apache.doris.thrift.TCheckWarmUpCacheAsyncRequest;
+import org.apache.doris.thrift.TCheckWarmUpCacheAsyncResponse;
 import org.apache.doris.thrift.TDiskTrashInfo;
 import org.apache.doris.thrift.TExecPlanFragmentParams;
 import org.apache.doris.thrift.TExecPlanFragmentResult;
 import org.apache.doris.thrift.TExportStatusResult;
 import org.apache.doris.thrift.TExportTaskRequest;
+import org.apache.doris.thrift.TGetRealtimeExecStatusRequest;
+import org.apache.doris.thrift.TGetRealtimeExecStatusResponse;
+import org.apache.doris.thrift.TGetTopNHotPartitionsRequest;
+import org.apache.doris.thrift.TGetTopNHotPartitionsResponse;
 import org.apache.doris.thrift.TIngestBinlogRequest;
 import org.apache.doris.thrift.TIngestBinlogResult;
 import org.apache.doris.thrift.TNetworkAddress;
+import org.apache.doris.thrift.TPublishTopicRequest;
+import org.apache.doris.thrift.TPublishTopicResult;
+import org.apache.doris.thrift.TQueryIngestBinlogRequest;
+import org.apache.doris.thrift.TQueryIngestBinlogResult;
 import org.apache.doris.thrift.TRoutineLoadTask;
 import org.apache.doris.thrift.TScanBatchResult;
 import org.apache.doris.thrift.TScanCloseParams;
@@ -42,10 +52,14 @@ import org.apache.doris.thrift.TScanOpenResult;
 import org.apache.doris.thrift.TSnapshotRequest;
 import org.apache.doris.thrift.TStatus;
 import org.apache.doris.thrift.TStreamLoadRecordResult;
+import org.apache.doris.thrift.TSyncLoadForTabletsRequest;
+import org.apache.doris.thrift.TSyncLoadForTabletsResponse;
 import org.apache.doris.thrift.TTabletStatResult;
-import org.apache.doris.thrift.TTransmitDataParams;
-import org.apache.doris.thrift.TTransmitDataResult;
 import org.apache.doris.thrift.TUniqueId;
+import org.apache.doris.thrift.TWarmUpCacheAsyncRequest;
+import org.apache.doris.thrift.TWarmUpCacheAsyncResponse;
+import org.apache.doris.thrift.TWarmUpTabletsRequest;
+import org.apache.doris.thrift.TWarmUpTabletsResponse;
 import org.apache.doris.utframe.UtFrameUtils;
 
 import org.apache.commons.pool2.impl.GenericKeyedObjectPoolConfig;
@@ -120,11 +134,6 @@ public class GenericPoolTest {
         }
 
         @Override
-        public TTransmitDataResult transmitData(TTransmitDataParams params) {
-            return new TTransmitDataResult();
-        }
-
-        @Override
         public TAgentResult submitTasks(List<TAgentTaskRequest> tasks) throws TException {
             return null;
         }
@@ -136,6 +145,11 @@ public class GenericPoolTest {
 
         @Override
         public TAgentResult publishClusterState(TAgentPublishRequest request) throws TException {
+            return null;
+        }
+
+        @Override
+        public TPublishTopicResult publishTopicInfo(TPublishTopicRequest request) throws TException {
             return null;
         }
 
@@ -209,17 +223,50 @@ public class GenericPoolTest {
         }
 
         @Override
-        public void cleanTrash() throws TException {
-            // TODO Auto-generated method stub
-        }
-
-        @Override
         public TCheckStorageFormatResult checkStorageFormat() throws TException {
             return new TCheckStorageFormatResult();
         }
 
         @Override
         public TIngestBinlogResult ingestBinlog(TIngestBinlogRequest ingestBinlogRequest) throws TException {
+            return null;
+        }
+
+        @Override
+        public TQueryIngestBinlogResult queryIngestBinlog(TQueryIngestBinlogRequest queryIngestBinlogRequest)
+                throws TException {
+            return null;
+        }
+
+        @Override
+        public TWarmUpCacheAsyncResponse warmUpCacheAsync(TWarmUpCacheAsyncRequest request) throws TException {
+            return null;
+        }
+
+        @Override
+        public TCheckWarmUpCacheAsyncResponse checkWarmUpCacheAsync(TCheckWarmUpCacheAsyncRequest request) throws TException {
+            return null;
+        }
+
+        @Override
+        public TSyncLoadForTabletsResponse syncLoadForTablets(TSyncLoadForTabletsRequest request) throws TException {
+            return null;
+        }
+
+        @Override
+        public TGetTopNHotPartitionsResponse getTopNHotPartitions(TGetTopNHotPartitionsRequest request)
+                throws TException {
+            return null;
+        }
+
+        @Override
+        public TWarmUpTabletsResponse warmUpTablets(TWarmUpTabletsRequest request) throws TException {
+            return null;
+        }
+
+        @Override
+        public TGetRealtimeExecStatusResponse getRealtimeExecStatus(TGetRealtimeExecStatusRequest request)
+                throws TException {
             return null;
         }
     }

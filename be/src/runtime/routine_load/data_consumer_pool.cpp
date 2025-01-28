@@ -48,7 +48,7 @@ Status DataConsumerPool::get_consumer(std::shared_ptr<StreamLoadContext> ctx,
     while (iter != std::end(_pool)) {
         if ((*iter)->match(ctx)) {
             VLOG_NOTICE << "get an available data consumer from pool: " << (*iter)->id();
-            (*iter)->reset();
+            static_cast<void>((*iter)->reset());
             *ret = *iter;
             iter = _pool.erase(iter);
             return Status::OK();
@@ -87,11 +87,12 @@ Status DataConsumerPool::get_consumer_grp(std::shared_ptr<StreamLoadContext> ctx
         return Status::InternalError("PAUSE: The size of begin_offset of task should not be 0.");
     }
 
-    std::shared_ptr<KafkaDataConsumerGroup> grp = std::make_shared<KafkaDataConsumerGroup>();
-
     // one data consumer group contains at least one data consumers.
     int max_consumer_num = config::max_consumer_num_per_group;
     size_t consumer_num = std::min((size_t)max_consumer_num, ctx->kafka_info->begin_offset.size());
+
+    std::shared_ptr<KafkaDataConsumerGroup> grp =
+            std::make_shared<KafkaDataConsumerGroup>(consumer_num);
 
     for (int i = 0; i < consumer_num; ++i) {
         std::shared_ptr<DataConsumer> consumer;
@@ -107,13 +108,14 @@ Status DataConsumerPool::get_consumer_grp(std::shared_ptr<StreamLoadContext> ctx
 void DataConsumerPool::return_consumer(std::shared_ptr<DataConsumer> consumer) {
     std::unique_lock<std::mutex> l(_lock);
 
-    if (_pool.size() == _max_pool_size) {
-        VLOG_NOTICE << "data consumer pool is full: " << _pool.size() << "-" << _max_pool_size
+    if (_pool.size() == config::routine_load_consumer_pool_size) {
+        VLOG_NOTICE << "data consumer pool is full: " << _pool.size() << "-"
+                    << config::routine_load_consumer_pool_size
                     << ", discard the returned consumer: " << consumer->id();
         return;
     }
 
-    consumer->reset();
+    static_cast<void>(consumer->reset());
     _pool.push_back(consumer);
     VLOG_NOTICE << "return the data consumer: " << consumer->id()
                 << ", current pool size: " << _pool.size();

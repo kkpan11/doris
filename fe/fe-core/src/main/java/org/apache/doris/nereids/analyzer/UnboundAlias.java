@@ -26,6 +26,7 @@ import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
 import org.apache.doris.nereids.types.DataType;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
 
 import java.util.List;
 import java.util.Optional;
@@ -35,16 +36,29 @@ import java.util.Optional;
  */
 public class UnboundAlias extends NamedExpression implements UnaryExpression, Unbound, PropagateNullable {
 
-    private Optional<String> alias;
+    private final Optional<String> alias;
+    private final boolean nameFromChild;
 
     public UnboundAlias(Expression child) {
-        super(child);
-        this.alias = Optional.empty();
+        this(ImmutableList.of(child), Optional.empty());
     }
 
     public UnboundAlias(Expression child, String alias) {
-        super(child);
-        this.alias = Optional.of(alias);
+        this(ImmutableList.of(child), Optional.of(alias));
+    }
+
+    public UnboundAlias(Expression child, String alias, boolean nameFromChild) {
+        this(ImmutableList.of(child), Optional.of(alias), nameFromChild);
+    }
+
+    private UnboundAlias(List<Expression> children, Optional<String> alias) {
+        this(children, alias, false);
+    }
+
+    private UnboundAlias(List<Expression> children, Optional<String> alias, boolean nameFromChild) {
+        super(children);
+        this.alias = alias;
+        this.nameFromChild = nameFromChild;
     }
 
     @Override
@@ -53,7 +67,7 @@ public class UnboundAlias extends NamedExpression implements UnaryExpression, Un
     }
 
     @Override
-    public String toSql() {
+    public String computeToSql() {
         StringBuilder stringBuilder = new StringBuilder();
         stringBuilder.append("(" + child() + ")");
         alias.ifPresent(name -> stringBuilder.append(" AS " + name));
@@ -77,10 +91,14 @@ public class UnboundAlias extends NamedExpression implements UnaryExpression, Un
     @Override
     public UnboundAlias withChildren(List<Expression> children) {
         Preconditions.checkArgument(children.size() == 1);
-        return new UnboundAlias(children.get(0));
+        return new UnboundAlias(children, alias);
     }
 
     public Optional<String> getAlias() {
         return alias;
+    }
+
+    public boolean isNameFromChild() {
+        return nameFromChild;
     }
 }

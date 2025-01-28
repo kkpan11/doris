@@ -19,10 +19,11 @@ version: "2.1"
 
 services:
   doris--clickhouse:
-    image: "clickhouse/clickhouse-server:22.8.15.23-alpine"
+    image: "clickhouse/clickhouse-server:23.8"
     restart: always
     environment:
       CLICKHOUSE_PASSWORD: 123456
+      CLICKHOUSE_ALWAYS_RUN_INITDB_SCRIPTS: "true" # Add this line to always run init scripts
     ulimits:
       nofile:
         soft: 262144
@@ -30,7 +31,7 @@ services:
     ports:
       - ${DOCKER_CLICKHOUSE_EXTERNAL_HTTP_PORT}:8123
     healthcheck:
-      test: ["CMD-SHELL", "clickhouse-client --password=123456 --query 'SELECT 1'"]
+      test: ["CMD-SHELL", "clickhouse-client --password=123456 --query 'SELECT 1 FROM doris_test.deadline'"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -38,11 +39,10 @@ services:
       - ./init:/docker-entrypoint-initdb.d
     networks:
       - doris--clickhouse
-  hello-world:
-    image: hello-world
-    depends_on:
-      doris--clickhouse:
-        condition: service_healthy 
 
 networks:
   doris--clickhouse:
+    ipam:
+      driver: default
+      config:
+        - subnet: 168.35.0.0/24

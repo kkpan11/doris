@@ -48,10 +48,10 @@ constexpr uint8_t KEY_MINIMAL_MARKER = 0x00;
 constexpr uint8_t KEY_NULL_FIRST_MARKER = 0x01;
 // Used to represent a normal field, which content is encoded after this marker
 constexpr uint8_t KEY_NORMAL_MARKER = 0x02;
-// Used to represent
-constexpr uint8_t KEY_NULL_LAST_MARKER = 0xFE;
 // Used to represent maximal value for that field
 constexpr uint8_t KEY_MAXIMAL_MARKER = 0xFF;
+// Used to represent a value greater than the normal marker by 1, using by MoW
+constexpr uint8_t KEY_NORMAL_NEXT_MARKER = 0x03;
 
 // Encode one row into binary according given num_keys.
 // A cell will be encoded in the format of a marker and encoded content.
@@ -59,7 +59,7 @@ constexpr uint8_t KEY_MAXIMAL_MARKER = 0xFF;
 // fill a marker and return. If padding_minimal is true, KEY_MINIMAL_MARKER will
 // be added, if padding_minimal is false, KEY_MAXIMAL_MARKER will be added.
 // If all num_keys are found in row, no marker will be added.
-template <typename RowType, bool null_first = true, bool full_encode = false>
+template <typename RowType, bool is_mow = false>
 void encode_key_with_padding(std::string* buf, const RowType& row, size_t num_keys,
                              bool padding_minimal) {
     for (auto cid = 0; cid < num_keys; cid++) {
@@ -68,22 +68,22 @@ void encode_key_with_padding(std::string* buf, const RowType& row, size_t num_ke
             if (padding_minimal) {
                 buf->push_back(KEY_MINIMAL_MARKER);
             } else {
-                buf->push_back(KEY_MAXIMAL_MARKER);
+                if (is_mow) {
+                    buf->push_back(KEY_NORMAL_NEXT_MARKER);
+                } else {
+                    buf->push_back(KEY_MAXIMAL_MARKER);
+                }
             }
             break;
         }
 
         auto cell = row.cell(cid);
         if (cell.is_null()) {
-            if (null_first) {
-                buf->push_back(KEY_NULL_FIRST_MARKER);
-            } else {
-                buf->push_back(KEY_NULL_LAST_MARKER);
-            }
+            buf->push_back(KEY_NULL_FIRST_MARKER);
             continue;
         }
         buf->push_back(KEY_NORMAL_MARKER);
-        if (full_encode) {
+        if (is_mow) {
             field->full_encode_ascending(cell.cell_ptr(), buf);
         } else {
             field->encode_ascending(cell.cell_ptr(), buf);
@@ -94,16 +94,12 @@ void encode_key_with_padding(std::string* buf, const RowType& row, size_t num_ke
 // Encode one row into binary according given num_keys.
 // Client call this function must assure that row contains the first
 // num_keys columns.
-template <typename RowType, bool null_first = true, bool full_encode = false>
+template <typename RowType, bool full_encode = false>
 void encode_key(std::string* buf, const RowType& row, size_t num_keys) {
     for (auto cid = 0; cid < num_keys; cid++) {
         auto cell = row.cell(cid);
         if (cell.is_null()) {
-            if (null_first) {
-                buf->push_back(KEY_NULL_FIRST_MARKER);
-            } else {
-                buf->push_back(KEY_NULL_LAST_MARKER);
-            }
+            buf->push_back(KEY_NULL_FIRST_MARKER);
             continue;
         }
         buf->push_back(KEY_NORMAL_MARKER);

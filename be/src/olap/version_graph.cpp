@@ -366,7 +366,7 @@ PathVersionListSharedPtr TimestampedVersionTracker::fetch_and_delete_path_by_id(
     _stale_version_path_map.erase(path_id);
 
     for (auto& version : ptr->timestamped_versions()) {
-        _version_graph.delete_version_from_graph(version->version());
+        static_cast<void>(_version_graph.delete_version_from_graph(version->version()));
     }
     return ptr;
 }
@@ -521,9 +521,8 @@ Status VersionGraph::delete_version_from_graph(const Version& version) {
 
     if (_vertex_index_map.find(start_vertex_value) == _vertex_index_map.end() ||
         _vertex_index_map.find(end_vertex_value) == _vertex_index_map.end()) {
-        LOG(WARNING) << "vertex for version does not exists. "
-                     << "version=" << version.first << "-" << version.second;
-        return Status::Error<HEADER_DELETE_VERSION>();
+        return Status::Error<HEADER_DELETE_VERSION>(
+                "vertex for version does not exists. version={}-{}", version.first, version.second);
     }
 
     int64_t start_vertex_index = _vertex_index_map[start_vertex_value];
@@ -567,9 +566,9 @@ void VersionGraph::_add_vertex_to_graph(int64_t vertex_value) {
 Status VersionGraph::capture_consistent_versions(const Version& spec_version,
                                                  std::vector<Version>* version_path) const {
     if (spec_version.first > spec_version.second) {
-        LOG(WARNING) << "invalid specified version. "
-                     << "spec_version=" << spec_version.first << "-" << spec_version.second;
-        return Status::Error<INVALID_ARGUMENT>();
+        return Status::Error<INVALID_ARGUMENT, false>(
+                "invalid specified version. spec_version={}-{}", spec_version.first,
+                spec_version.second);
     }
 
     int64_t cur_idx = -1;
@@ -581,8 +580,9 @@ Status VersionGraph::capture_consistent_versions(const Version& spec_version,
     }
 
     if (cur_idx < 0) {
-        return Status::InternalError("failed to find path in version_graph. spec_version: {}-{}",
-                                     spec_version.first, spec_version.second);
+        return Status::InternalError<false>(
+                "failed to find path in version_graph. spec_version: {}-{}", spec_version.first,
+                spec_version.second);
     }
 
     int64_t end_value = spec_version.second + 1;
@@ -611,8 +611,9 @@ Status VersionGraph::capture_consistent_versions(const Version& spec_version,
             }
             cur_idx = next_idx;
         } else {
-            return Status::InternalError("fail to find path in version_graph. spec_version: {}-{}",
-                                         spec_version.first, spec_version.second);
+            return Status::InternalError<false>(
+                    "fail to find path in version_graph. spec_version: {}-{}", spec_version.first,
+                    spec_version.second);
         }
     }
 

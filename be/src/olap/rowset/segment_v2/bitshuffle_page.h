@@ -23,8 +23,8 @@
 #include <cstdint>
 #include <cstring>
 #include <ostream>
+#include <type_traits>
 
-// IWYU pragma: no_include <opentelemetry/common/threadlocal.h>
 #include "common/compiler_util.h" // IWYU pragma: keep
 #include "common/status.h"
 #include "gutil/port.h"
@@ -85,12 +85,12 @@ void warn_with_bitshuffle_error(int64_t val);
 //    The header is followed by the bitshuffle-compressed element data.
 //
 template <FieldType Type>
-class BitshufflePageBuilder : public PageBuilder {
+class BitshufflePageBuilder : public PageBuilderHelper<BitshufflePageBuilder<Type>> {
 public:
-    BitshufflePageBuilder(const PageBuilderOptions& options)
-            : _options(options), _count(0), _remain_element_capacity(0), _finished(false) {
-        reset();
-    }
+    using Self = BitshufflePageBuilder<Type>;
+    friend class PageBuilderHelper<Self>;
+
+    Status init() override { return reset(); }
 
     bool is_page_full() override { return _remain_element_capacity == 0; }
 
@@ -112,7 +112,9 @@ public:
         int to_add = std::min<int>(_remain_element_capacity, *count);
         int to_add_size = to_add * SIZE_OF_TYPE;
         size_t orig_size = _data.size();
-        _data.resize(orig_size + to_add_size);
+        // This may need a large memory, should return error if could not allocated
+        // successfully, to avoid BE OOM.
+        RETURN_IF_CATCH_EXCEPTION(_data.resize(orig_size + to_add_size));
         _count += to_add;
         _remain_element_capacity -= to_add;
         // return added number through count
@@ -140,25 +142,29 @@ public:
         return Status::OK();
     }
 
-    OwnedSlice finish() override {
+    Status finish(OwnedSlice* slice) override {
         if (_count > 0) {
             _first_value = cell(0);
             _last_value = cell(_count - 1);
         }
-        return _finish(SIZE_OF_TYPE);
+        RETURN_IF_CATCH_EXCEPTION({ *slice = _finish(SIZE_OF_TYPE); });
+        return Status::OK();
     }
 
-    void reset() override {
-        auto block_size = _options.data_page_size;
-        _count = 0;
-        _data.clear();
-        _data.reserve(block_size);
-        DCHECK_EQ(reinterpret_cast<uintptr_t>(_data.data()) & (alignof(CppType) - 1), 0)
-                << "buffer must be naturally-aligned";
-        _buffer.clear();
-        _buffer.resize(BITSHUFFLE_PAGE_HEADER_SIZE);
-        _finished = false;
-        _remain_element_capacity = block_size / SIZE_OF_TYPE;
+    Status reset() override {
+        RETURN_IF_CATCH_EXCEPTION({
+            auto block_size = _options.data_page_size;
+            _count = 0;
+            _data.clear();
+            _data.reserve(block_size);
+            DCHECK_EQ(reinterpret_cast<uintptr_t>(_data.data()) & (alignof(CppType) - 1), 0)
+                    << "buffer must be naturally-aligned";
+            _buffer.clear();
+            _buffer.resize(BITSHUFFLE_PAGE_HEADER_SIZE);
+            _finished = false;
+            _remain_element_capacity = block_size / SIZE_OF_TYPE;
+        });
+        return Status::OK();
     }
 
     size_t count() const override { return _count; }
@@ -168,7 +174,7 @@ public:
     Status get_first_value(void* value) const override {
         DCHECK(_finished);
         if (_count == 0) {
-            return Status::NotFound("page is empty");
+            return Status::Error<ErrorCode::ENTRY_NOT_FOUND>("page is empty");
         }
         memcpy(value, &_first_value, SIZE_OF_TYPE);
         return Status::OK();
@@ -176,13 +182,16 @@ public:
     Status get_last_value(void* value) const override {
         DCHECK(_finished);
         if (_count == 0) {
-            return Status::NotFound("page is empty");
+            return Status::Error<ErrorCode::ENTRY_NOT_FOUND>("page is empty");
         }
         memcpy(value, &_last_value, SIZE_OF_TYPE);
         return Status::OK();
     }
 
 private:
+    BitshufflePageBuilder(const PageBuilderOptions& options)
+            : _options(options), _count(0), _remain_element_capacity(0), _finished(false) {}
+
     OwnedSlice _finish(int final_size_of_type) {
         _data.resize(final_size_of_type * _count);
 
@@ -267,6 +276,7 @@ inline Status parse_bit_shuffle_header(const Slice& data, size_t& num_elements,
     case 8:
     case 12:
     case 16:
+    case 32:
         break;
     default:
         return Status::InternalError("invalid size_of_elem:{}", size_of_element);
@@ -320,7 +330,7 @@ public:
         DCHECK(_parsed) << "Must call init()";
         if (PREDICT_FALSE(_num_elements == 0)) {
             DCHECK_EQ(0, pos);
-            return Status::InvalidArgument("invalid pos");
+            return Status::Error<ErrorCode::INVALID_ARGUMENT, false>("invalid pos");
         }
 
         DCHECK_LE(pos, _num_elements);
@@ -332,7 +342,7 @@ public:
         DCHECK(_parsed) << "Must call init() firstly";
 
         if (_num_elements == 0) {
-            return Status::NotFound("page is empty");
+            return Status::Error<ErrorCode::ENTRY_NOT_FOUND>("page is empty");
         }
 
         size_t left = 0;
@@ -353,7 +363,7 @@ public:
             }
         }
         if (left >= _num_elements) {
-            return Status::NotFound("all value small than the value");
+            return Status::Error<ErrorCode::ENTRY_NOT_FOUND>("all value small than the value");
         }
         void* find_value = get_data(left);
         if (TypeTraits<Type>::cmp(find_value, value) == 0) {
@@ -399,17 +409,19 @@ public:
 
         auto total = *n;
         auto read_count = 0;
-        CppType data[total];
+        _buffer.resize(total);
         for (size_t i = 0; i < total; ++i) {
             ordinal_t ord = rowids[i] - page_first_ordinal;
             if (UNLIKELY(ord >= _num_elements)) {
                 break;
             }
 
-            data[read_count++] = *reinterpret_cast<CppType*>(get_data(ord));
+            _buffer[read_count++] = *reinterpret_cast<CppType*>(get_data(ord));
         }
 
-        if (LIKELY(read_count > 0)) dst->insert_many_fix_len_data((const char*)data, read_count);
+        if (LIKELY(read_count > 0)) {
+            dst->insert_many_fix_len_data((char*)_buffer.data(), read_count);
+        }
 
         *n = read_count;
         return Status::OK();
@@ -444,6 +456,8 @@ private:
 
     int _size_of_element;
     size_t _cur_index;
+
+    std::vector<std::conditional_t<std::is_same_v<CppType, bool>, uint8_t, CppType>> _buffer;
 
     friend class BinaryDictPageDecoder;
 };

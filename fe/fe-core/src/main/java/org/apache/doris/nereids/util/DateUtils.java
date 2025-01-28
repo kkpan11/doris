@@ -18,19 +18,31 @@
 package org.apache.doris.nereids.util;
 
 import org.apache.doris.nereids.exceptions.AnalysisException;
+import org.apache.doris.qe.ConnectContext;
 
+import com.google.common.collect.ImmutableSet;
+
+import java.time.DayOfWeek;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
+import java.time.format.SignStyle;
 import java.time.format.TextStyle;
 import java.time.temporal.ChronoField;
 import java.time.temporal.IsoFields;
 import java.time.temporal.TemporalAccessor;
+import java.time.temporal.WeekFields;
+import java.util.Set;
 
 /**
  * date util tools.
  */
 public class DateUtils {
+    public static final Set<String> monoFormat = ImmutableSet.of("yyyyMMdd", "yyyy-MM-dd", "yyyy-MM-dd HH:mm:ss",
+            "%Y", "%Y-%m", "%Y-%m-%d", "%Y-%m-%d %H", "%Y-%m-%d %H:%i", "%Y-%m-%d %H:%i:%s", "%Y-%m-%d %H:%i:%S",
+            "%Y-%m-%d %T", "%Y%m%d", "%Y%m");
+    private static final WeekFields weekFields = WeekFields.of(DayOfWeek.SUNDAY, 7);
 
     /**
      * format builder.
@@ -87,7 +99,9 @@ public class DateUtils {
                         break;
                     case 'r': // %r Time, 12-hour (hh:mm:ss followed by AM or PM)
                         builder.appendValue(ChronoField.HOUR_OF_AMPM, 2)
-                                .appendPattern(":mm:ss ")
+                                .appendValue(ChronoField.MINUTE_OF_HOUR, 2)
+                                .appendValue(ChronoField.SECOND_OF_MINUTE, 2)
+                                .appendLiteral(' ')
                                 .appendText(ChronoField.AMPM_OF_DAY, TextStyle.FULL)
                                 .toFormatter();
                         break;
@@ -99,7 +113,7 @@ public class DateUtils {
                         builder.appendPattern("HH:mm:ss");
                         break;
                     case 'V': // %V Week (01..53), where Sunday is the first day of the week; used with %X
-                        builder.appendValue(ChronoField.ALIGNED_WEEK_OF_YEAR, 2);
+                        builder.appendValue(weekFields.weekOfWeekBasedYear(), 2);
                         break;
                     case 'v': // %v Week (01..53), where Monday is the first day of the week; used with %x
                         builder.appendValue(IsoFields.WEEK_OF_WEEK_BASED_YEAR, 2);
@@ -111,6 +125,8 @@ public class DateUtils {
                         builder.appendValue(IsoFields.WEEK_BASED_YEAR, 4);
                         break;
                     case 'X':
+                        builder.appendValue(weekFields.weekBasedYear(), 4, 10, SignStyle.EXCEEDS_PAD);
+                        break;
                     case 'Y': // %Y Year, numeric, four digits
                         // %X Year for the week, where Sunday is the first day of the week,
                         // numeric, four digits; used with %v
@@ -153,14 +169,33 @@ public class DateUtils {
                 getOrDefault(accessor, ChronoField.YEAR),
                 getOrDefault(accessor, ChronoField.MONTH_OF_YEAR),
                 getOrDefault(accessor, ChronoField.DAY_OF_MONTH),
-                getOrDefault(accessor, ChronoField.HOUR_OF_DAY),
+                getHourOrDefault(accessor),
                 getOrDefault(accessor, ChronoField.MINUTE_OF_HOUR),
                 getOrDefault(accessor, ChronoField.SECOND_OF_MINUTE),
-                getOrDefault(accessor, ChronoField.MICRO_OF_SECOND)
-        );
+                getOrDefault(accessor, ChronoField.NANO_OF_SECOND));
     }
 
     public static int getOrDefault(final TemporalAccessor accessor, final ChronoField field) {
-        return accessor.isSupported(field) ? accessor.get(field) : /*default value*/ 0;
+        return accessor.isSupported(field) ? accessor.get(field) : /* default value */ 0;
+    }
+
+    /**
+     * get hour from accessor, if not support hour field, return 0
+     */
+    public static int getHourOrDefault(final TemporalAccessor accessor) {
+        if (accessor.isSupported(ChronoField.HOUR_OF_DAY)) {
+            return accessor.get(ChronoField.HOUR_OF_DAY);
+        } else if (accessor.isSupported(ChronoField.HOUR_OF_AMPM)) {
+            return accessor.get(ChronoField.HOUR_OF_AMPM);
+        } else {
+            return 0;
+        }
+    }
+
+    public static ZoneId getTimeZone() {
+        if (ConnectContext.get() == null || ConnectContext.get().getSessionVariable() == null) {
+            return ZoneId.systemDefault();
+        }
+        return ZoneId.of(ConnectContext.get().getSessionVariable().getTimeZone());
     }
 }

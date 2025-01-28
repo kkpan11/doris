@@ -17,30 +17,31 @@
 
 package org.apache.doris.httpv2.rest;
 
-import org.apache.doris.analysis.Analyzer;
-import org.apache.doris.analysis.QueryStmt;
-import org.apache.doris.analysis.SqlParser;
-import org.apache.doris.analysis.SqlScanner;
-import org.apache.doris.analysis.StatementBase;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.TableIf;
 import org.apache.doris.common.Config;
-import org.apache.doris.common.util.SqlParserUtils;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.httpv2.entity.ResponseEntityBuilder;
 import org.apache.doris.httpv2.util.ExecutionResultSet;
 import org.apache.doris.httpv2.util.StatementSubmitter;
 import org.apache.doris.mysql.privilege.PrivPredicate;
+import org.apache.doris.nereids.NereidsPlanner;
+import org.apache.doris.nereids.StatementContext;
+import org.apache.doris.nereids.parser.NereidsParser;
+import org.apache.doris.nereids.properties.PhysicalProperties;
+import org.apache.doris.nereids.trees.plans.commands.ExplainCommand;
+import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
+import org.apache.doris.nereids.util.PlanUtils;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.OriginStatement;
 import org.apache.doris.system.SystemInfoService;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.jetbrains.annotations.NotNull;
@@ -51,13 +52,11 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RestController;
 
-import java.io.StringReader;
 import java.lang.reflect.Type;
 import java.util.List;
-import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
+import java.util.stream.Collectors;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 
@@ -68,6 +67,9 @@ import javax.servlet.http.HttpServletResponse;
 public class StmtExecutionAction extends RestBaseController {
     private static final Logger LOG = LogManager.getLogger(StmtExecutionAction.class);
     private static StatementSubmitter stmtSubmitter = new StatementSubmitter();
+    private static final String  NEW_LINE_PATTERN = "[\n\r]";
+
+    private static final String NEW_LINE_REPLACEMENT = " ";
 
     private static final long DEFAULT_ROW_LIMIT = 1000;
     private static final long MAX_ROW_LIMIT = 10000;
@@ -109,7 +111,7 @@ public class StmtExecutionAction extends RestBaseController {
                 stmtRequestBody.limit);
 
         ConnectContext.get().changeDefaultCatalog(ns);
-        ConnectContext.get().setDatabase(getFullDbName(dbName));
+        ConnectContext.get().setDatabase(fullDbName);
 
         String streamHeader = request.getHeader("X-Doris-Stream");
         boolean isStream = !("false".equalsIgnoreCase(streamHeader));
@@ -140,8 +142,10 @@ public class StmtExecutionAction extends RestBaseController {
         if (ns.equalsIgnoreCase(SystemInfoService.DEFAULT_CLUSTER)) {
             ns = InternalCatalog.INTERNAL_CATALOG_NAME;
         }
+        if (StringUtils.isNotBlank(sql)) {
+            sql = sql.replaceAll(NEW_LINE_PATTERN, NEW_LINE_REPLACEMENT);
+        }
         LOG.info("sql: {}", sql);
-
         ConnectContext.get().changeDefaultCatalog(ns);
         ConnectContext.get().setDatabase(getFullDbName(dbName));
         return getSchema(sql);
@@ -159,7 +163,7 @@ public class StmtExecutionAction extends RestBaseController {
     private ResponseEntity executeQuery(ActionAuthorizationInfo authInfo, boolean isSync, long limit,
             StmtRequestBody stmtRequestBody, HttpServletResponse response, boolean isStream) {
         StatementSubmitter.StmtContext stmtCtx = new StatementSubmitter.StmtContext(stmtRequestBody.stmt,
-                authInfo.fullUserName, authInfo.password, limit, isStream, response);
+                authInfo.fullUserName, authInfo.password, limit, isStream, response, "");
         Future<ExecutionResultSet> future = stmtSubmitter.submit(stmtCtx);
 
         if (isSync) {
@@ -170,10 +174,7 @@ public class StmtExecutionAction extends RestBaseController {
                     return null;
                 }
                 return ResponseEntityBuilder.ok(resultSet.getResult());
-            } catch (InterruptedException e) {
-                LOG.warn("failed to execute stmt", e);
-                return ResponseEntityBuilder.okWithCommonError("Failed to execute sql: " + e.getMessage());
-            } catch (ExecutionException e) {
+            } catch (InterruptedException | ExecutionException e) {
                 LOG.warn("failed to execute stmt", e);
                 return ResponseEntityBuilder.okWithCommonError("Failed to execute sql: " + e.getMessage());
             }
@@ -184,30 +185,26 @@ public class StmtExecutionAction extends RestBaseController {
 
     @NotNull
     private String getSchema(String sql) {
-        SqlParser parser = new SqlParser(new SqlScanner(new StringReader(sql)));
-        StatementBase stmt = null;
-        try {
-            stmt = SqlParserUtils.getStmt(parser, 0);
-            if (!(stmt instanceof QueryStmt)) {
-                return "Only support query stmt";
-            }
-            Analyzer analyzer = new Analyzer(Env.getCurrentEnv(), ConnectContext.get());
-            QueryStmt queryStmt = (QueryStmt) stmt;
-            Map<Long, TableIf> tableMap = Maps.newHashMap();
-            Set<String> parentViewNameSet = Sets.newHashSet();
-            queryStmt.getTables(analyzer, true, tableMap, parentViewNameSet);
+        LogicalPlan unboundMvPlan = new NereidsParser().parseSingle(sql);
+        try (StatementContext statementContext = new StatementContext(ConnectContext.get(),
+                new OriginStatement(sql, 0))) {
+            StatementContext originalContext = ConnectContext.get().getStatementContext();
+            try {
+                ConnectContext.get().setStatementContext(statementContext);
+                NereidsPlanner planner = new NereidsPlanner(statementContext);
+                planner.planWithLock(unboundMvPlan, PhysicalProperties.ANY, ExplainCommand.ExplainLevel.ANALYZED_PLAN);
+                LogicalPlan logicalPlan = (LogicalPlan) planner.getCascadesContext().getRewritePlan();
 
-            List<String> createStmts = Lists.newArrayList();
-            for (TableIf tbl : tableMap.values()) {
-                List<String> createTableStmts = Lists.newArrayList();
-                Env.getDdlStmt(tbl, createTableStmts, null, null, false, true, -1L);
-                if (!createTableStmts.isEmpty()) {
-                    createStmts.add(createTableStmts.get(0));
-                }
+                List<String> createStmts = PlanUtils.getLogicalScanFromRootPlan(logicalPlan).stream().map(plan -> {
+                    TableIf tbl = plan.getTable();
+                    List<String> createTableStmts = Lists.newArrayList();
+                    Env.getDdlStmt(tbl, createTableStmts, null, null, false, true, -1L);
+                    return createTableStmts.get(0);
+                }).collect(Collectors.toList());
+                return Joiner.on("\n\n").join(createStmts);
+            } finally {
+                ConnectContext.get().setStatementContext(originalContext);
             }
-            return Joiner.on("\n\n").join(createStmts);
-        } catch (Exception e) {
-            return "Error:" + e.getMessage();
         }
     }
 

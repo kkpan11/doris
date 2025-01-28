@@ -36,15 +36,15 @@ public:
     SchemaCollationsScanner();
     ~SchemaCollationsScanner() override;
 
-    Status get_next_block(vectorized::Block* block, bool* eos) override;
+    Status get_next_block_internal(vectorized::Block* block, bool* eos) override;
 
 private:
     struct CollationStruct {
-        const char* name;
-        const char* charset;
+        const char* name = nullptr;
+        const char* charset = nullptr;
         int64_t id;
-        const char* is_default;
-        const char* is_compile;
+        const char* is_default = nullptr;
+        const char* is_compile = nullptr;
         int64_t sortlen;
     };
 

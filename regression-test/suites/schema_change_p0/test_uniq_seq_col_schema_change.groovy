@@ -29,7 +29,7 @@ suite("test_uniq_seq_col_schema_change", "schema_change") {
                 value3 INT
             )
             UNIQUE KEY (k1)
-            DISTRIBUTED BY HASH(k1) BUCKETS 1 
+            DISTRIBUTED BY HASH(k1) BUCKETS 8
             properties("replication_num" = "1",
                        "light_schema_change" = "false",
                        "function_column.sequence_type" = 'INT');
@@ -43,14 +43,16 @@ suite("test_uniq_seq_col_schema_change", "schema_change") {
         qt_sql "select * from ${tbName1} order by k1;"
 
         // alter and test light schema change
-        sql """ALTER TABLE ${tbName1} SET ("light_schema_change" = "true");"""
+        if (!isCloudMode()) {
+            sql """ALTER TABLE ${tbName1} SET ("light_schema_change" = "true");"""
+        }
 
         sql "ALTER TABLE ${tbName1} ADD COLUMN value4 INT;"
         qt_sql "select * from ${tbName1} order by k1;"
 
         sql "insert into ${tbName1} ${columnWithHidden_2}values(5,5,5,5,5,0,5);"
         sql "insert into ${tbName1} ${columnWithHidden_2}values(5,6,6,6,6,0,6);"
-        sql "insert into ${tbName1} values(5,6,6,7,6);"
+        sql "insert into ${tbName1} ${columnWithHidden_2}values(5,6,6,7,6,0,4);"
         qt_sql "select * from ${tbName1} order by k1;"
         sql "insert into ${tbName1} ${columnWithHidden_2}values(5,6,6,7,6,0,7);"
         qt_sql "select * from ${tbName1} order by k1;"

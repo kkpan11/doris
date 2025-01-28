@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -33,13 +34,11 @@
 #include "gutil/strings/numbers.h"
 #include "gutil/strings/split.h"
 #include "gutil/strings/substitute.h"
-#include "io/fs/fs_utils.h"
 #include "io/fs/local_file_system.h"
 
 using std::string;
 using std::vector;
 using strings::Split;
-using strings::Substitute;
 
 namespace doris {
 
@@ -84,13 +83,13 @@ Status parse_stat(const std::string& buffer, std::string* name, ThreadStats* sta
 
     int64_t tmp;
     if (safe_strto64(splits[kUserTicks], &tmp)) {
-        stats->user_ns = tmp * (1e9 / kTicksPerSec);
+        stats->user_ns = int64_t(tmp * (1e9 / kTicksPerSec));
     }
     if (safe_strto64(splits[kKernelTicks], &tmp)) {
-        stats->kernel_ns = tmp * (1e9 / kTicksPerSec);
+        stats->kernel_ns = int64_t(tmp * (1e9 / kTicksPerSec));
     }
     if (safe_strto64(splits[kIoWait], &tmp)) {
-        stats->iowait_ns = tmp * (1e9 / kTicksPerSec);
+        stats->iowait_ns = int64_t(tmp * (1e9 / kTicksPerSec));
     }
     if (name != nullptr) {
         *name = extracted_name;
@@ -104,9 +103,17 @@ Status get_thread_stats(int64_t tid, ThreadStats* stats) {
         return Status::NotSupported("ThreadStats not supported");
     }
     std::string buf;
-    RETURN_IF_ERROR(io::read_file_to_string(io::global_local_filesystem(),
-                                            strings::Substitute("/proc/self/task/$0/stat", tid),
-                                            &buf));
+    auto path = fmt::format("/proc/self/task/{}/stat", tid);
+    std::ifstream file(path);
+    if (file.is_open()) {
+        std::ostringstream oss;
+        oss << file.rdbuf();
+        buf = oss.str();
+        file.close();
+    } else {
+        return Status::InternalError("failed to open {}: {}", path, std::strerror(errno));
+    }
+
     return parse_stat(buf, nullptr, stats);
 }
 void disable_core_dumps() {

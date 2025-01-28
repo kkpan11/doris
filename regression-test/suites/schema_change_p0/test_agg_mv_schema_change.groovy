@@ -1,4 +1,4 @@
-      
+
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -44,35 +44,9 @@ suite ("test_agg_mv_schema_change") {
     def tableName = "schema_change_agg_mv_regression_test"
 
     try {
-        String backend_id;
         def backendId_to_backendIP = [:]
         def backendId_to_backendHttpPort = [:]
         getBackendIpHttpPort(backendId_to_backendIP, backendId_to_backendHttpPort);
-
-        backend_id = backendId_to_backendIP.keySet()[0]
-        StringBuilder showConfigCommand = new StringBuilder();
-        showConfigCommand.append("curl -X GET http://")
-        showConfigCommand.append(backendId_to_backendIP.get(backend_id))
-        showConfigCommand.append(":")
-        showConfigCommand.append(backendId_to_backendHttpPort.get(backend_id))
-        showConfigCommand.append("/api/show_config")
-        logger.info(showConfigCommand.toString())
-        def process = showConfigCommand.toString().execute()
-        int code = process.waitFor()
-        String err = IOGroovyMethods.getText(new BufferedReader(new InputStreamReader(process.getErrorStream())));
-        String out = process.getText()
-        logger.info("Show config: code=" + code + ", out=" + out + ", err=" + err)
-        assertEquals(code, 0)
-        def configList = parseJson(out.trim())
-        assert configList instanceof List
-
-        boolean disableAutoCompaction = true
-        for (Object ele in (List) configList) {
-            assert ele instanceof List<String>
-            if (((List<String>) ele)[0] == "disable_auto_compaction") {
-                disableAutoCompaction = Boolean.parseBoolean(((List<String>) ele)[2])
-            }
-        }
 
         sql """ DROP TABLE IF EXISTS ${tableName} """
         sql """
@@ -89,7 +63,7 @@ suite ("test_agg_mv_schema_change") {
                     `hll_col` HLL HLL_UNION NOT NULL COMMENT "HLL列",
                     `bitmap_col` Bitmap BITMAP_UNION NOT NULL COMMENT "bitmap列")
                 AGGREGATE KEY(`user_id`, `date`, `city`, `age`, `sex`) DISTRIBUTED BY HASH(`user_id`)
-                BUCKETS 1
+                BUCKETS 8
                 PROPERTIES ( "replication_num" = "1", "light_schema_change" = "false" );
             """
 
@@ -103,15 +77,20 @@ suite ("test_agg_mv_schema_change") {
 
         //add materialized view
         def mvName = "mv1"
-        sql "create materialized view ${mvName} as select user_id, date, city, age, sum(cost) from ${tableName} group by user_id, date, city, age, sex;"
+        sql "create materialized view ${mvName} as select user_id, date, city, age, sum(cost) from ${tableName} group by user_id, date, city, age;"
 
         waitForJob(tableName, 3000)
 
         // alter and test light schema change
-        sql """ALTER TABLE ${tableName} SET ("light_schema_change" = "true");"""
+        if (!isCloudMode()) {
+            sql """ALTER TABLE ${tableName} SET ("light_schema_change" = "true");"""
+        }
 
         def mvName2 = "mv2"
-        sql "create materialized view ${mvName2} as select user_id, date, city, cost, max(age) from ${tableName} group by user_id, date, city, cost, sex;"
+        test{
+            sql "create materialized view ${mvName2} as select user_id, date, city, cost, max(age) from ${tableName} group by user_id, date, city, cost, sex;"
+            exception "err"
+        }
 
         waitForJob(tableName, 3000)
 
@@ -124,7 +103,14 @@ suite ("test_agg_mv_schema_change") {
 
         qt_sc """ select * from ${tableName} order by user_id"""
 
-        // drop value column with mv, not light schema change
+        test {
+            sql "ALTER TABLE ${tableName} DROP COLUMN cost"
+            exception "Can not drop column contained by mv, mv=mv1"
+        }
+
+        sql""" drop materialized view mv1 on ${tableName}; """
+
+        // drop column
         sql """
             ALTER TABLE ${tableName} DROP COLUMN cost
             """
@@ -162,57 +148,8 @@ suite ("test_agg_mv_schema_change") {
             """
 
         // compaction
-        String[][] tablets = sql """ show tablets from ${tableName}; """
-        for (String[] tablet in tablets) {
-                String tablet_id = tablet[0]
-                backend_id = tablet[2]
-                logger.info("run compaction:" + tablet_id)
-                StringBuilder sb = new StringBuilder();
-                sb.append("curl -X POST http://")
-                sb.append(backendId_to_backendIP.get(backend_id))
-                sb.append(":")
-                sb.append(backendId_to_backendHttpPort.get(backend_id))
-                sb.append("/api/compaction/run?tablet_id=")
-                sb.append(tablet_id)
-                sb.append("&compact_type=cumulative")
+        trigger_and_wait_compaction(tableName, "cumulative")
 
-                String command = sb.toString()
-                process = command.execute()
-                code = process.waitFor()
-                err = IOGroovyMethods.getText(new BufferedReader(new InputStreamReader(process.getErrorStream())));
-                out = process.getText()
-                logger.info("Run compaction: code=" + code + ", out=" + out + ", err=" + err)
-                //assertEquals(code, 0)
-        }
-
-        // wait for all compactions done
-        for (String[] tablet in tablets) {
-                boolean running = true
-                do {
-                    Thread.sleep(100)
-                    String tablet_id = tablet[0]
-                    backend_id = tablet[2]
-                    StringBuilder sb = new StringBuilder();
-                    sb.append("curl -X GET http://")
-                    sb.append(backendId_to_backendIP.get(backend_id))
-                    sb.append(":")
-                    sb.append(backendId_to_backendHttpPort.get(backend_id))
-                    sb.append("/api/compaction/run_status?tablet_id=")
-                    sb.append(tablet_id)
-
-                    String command = sb.toString()
-                    process = command.execute()
-                    code = process.waitFor()
-                    err = IOGroovyMethods.getText(new BufferedReader(new InputStreamReader(process.getErrorStream())));
-                    out = process.getText()
-                    logger.info("Get compaction status: code=" + code + ", out=" + out + ", err=" + err)
-                    assertEquals(code, 0)
-                    def compactionStatus = parseJson(out.trim())
-                    assertEquals("success", compactionStatus.status.toLowerCase())
-                    running = compactionStatus.run_status
-                } while (running)
-        }
-         
         qt_sc """ select count(*) from ${tableName} """
 
         qt_sc """  SELECT * FROM ${tableName} WHERE user_id=2 """
@@ -223,4 +160,4 @@ suite ("test_agg_mv_schema_change") {
 
 }
 
-    
+

@@ -17,8 +17,9 @@
 
 package org.apache.doris.nereids.rules.expression.rules;
 
-import org.apache.doris.nereids.rules.expression.AbstractExpressionRewriteRule;
-import org.apache.doris.nereids.rules.expression.ExpressionRewriteContext;
+import org.apache.doris.nereids.rules.expression.ExpressionPatternMatcher;
+import org.apache.doris.nereids.rules.expression.ExpressionPatternRuleFactory;
+import org.apache.doris.nereids.rules.expression.ExpressionRuleType;
 import org.apache.doris.nereids.trees.expressions.Cast;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.literal.BigIntLiteral;
@@ -37,7 +38,11 @@ import org.apache.doris.nereids.types.DecimalV3Type;
 import org.apache.doris.nereids.types.StringType;
 import org.apache.doris.nereids.types.VarcharType;
 
+import com.google.common.collect.ImmutableList;
+
 import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.util.List;
 
 /**
  * Rewrite rule of simplify CAST expression.
@@ -46,17 +51,20 @@ import java.math.BigDecimal;
  * Merge cast like
  * - cast(cast(1 as bigint) as string) -> cast(1 as string).
  */
-public class SimplifyCastRule extends AbstractExpressionRewriteRule {
-
+public class SimplifyCastRule implements ExpressionPatternRuleFactory {
     public static SimplifyCastRule INSTANCE = new SimplifyCastRule();
 
     @Override
-    public Expression visitCast(Cast origin, ExpressionRewriteContext context) {
-        return simplify(origin, context);
+    public List<ExpressionPatternMatcher<? extends Expression>> buildRules() {
+        return ImmutableList.of(
+                matchesType(Cast.class).then(SimplifyCastRule::simplifyCast)
+                        .toRule(ExpressionRuleType.SIMPLIFY_CAST)
+        );
     }
 
-    private Expression simplify(Cast cast, ExpressionRewriteContext context) {
-        Expression child = rewrite(cast.child(), context);
+    /** simplifyCast */
+    public static Expression simplifyCast(Cast cast) {
+        Expression child = cast.child();
 
         // remove redundant cast
         // CAST(value as type), value is type
@@ -65,42 +73,60 @@ public class SimplifyCastRule extends AbstractExpressionRewriteRule {
         }
 
         if (child instanceof Literal) {
-            DataType castType = cast.getDataType();
-            if (castType instanceof StringType) {
-                if (child instanceof VarcharLiteral) {
-                    return new StringLiteral(((VarcharLiteral) child).getValue());
-                } else if (child instanceof CharLiteral) {
-                    return new StringLiteral(((CharLiteral) child).getValue());
+            try {
+                DataType castType = cast.getDataType();
+                if (castType instanceof StringType) {
+                    if (child instanceof VarcharLiteral) {
+                        return new StringLiteral(((VarcharLiteral) child).getValue());
+                    } else if (child instanceof CharLiteral) {
+                        return new StringLiteral(((CharLiteral) child).getValue());
+                    }
+                } else if (castType instanceof VarcharType) {
+                    if (child instanceof VarcharLiteral) {
+                        return new VarcharLiteral(((VarcharLiteral) child).getValue(),
+                                ((VarcharType) castType).getLen());
+                    } else if (child instanceof CharLiteral) {
+                        return new VarcharLiteral(((CharLiteral) child).getValue(),
+                                ((VarcharType) castType).getLen());
+                    }
+                } else if (castType instanceof DecimalV2Type) {
+                    DecimalV2Type decimalV2Type = (DecimalV2Type) castType;
+                    if (child instanceof TinyIntLiteral) {
+                        return new DecimalLiteral(decimalV2Type, new BigDecimal(((TinyIntLiteral) child).getValue()));
+                    } else if (child instanceof SmallIntLiteral) {
+                        return new DecimalLiteral(decimalV2Type, new BigDecimal(((SmallIntLiteral) child).getValue()));
+                    } else if (child instanceof IntegerLiteral) {
+                        return new DecimalLiteral(decimalV2Type, new BigDecimal(((IntegerLiteral) child).getValue()));
+                    } else if (child instanceof BigIntLiteral) {
+                        return new DecimalLiteral(decimalV2Type, new BigDecimal(((BigIntLiteral) child).getValue()));
+                    }
+                } else if (castType instanceof DecimalV3Type) {
+                    DecimalV3Type decimalV3Type = (DecimalV3Type) castType;
+                    if (child instanceof TinyIntLiteral) {
+                        return new DecimalV3Literal(decimalV3Type,
+                                new BigDecimal(((TinyIntLiteral) child).getValue()));
+                    } else if (child instanceof SmallIntLiteral) {
+                        return new DecimalV3Literal(decimalV3Type,
+                                new BigDecimal(((SmallIntLiteral) child).getValue()));
+                    } else if (child instanceof IntegerLiteral) {
+                        return new DecimalV3Literal(decimalV3Type,
+                                new BigDecimal(((IntegerLiteral) child).getValue()));
+                    } else if (child instanceof BigIntLiteral) {
+                        return new DecimalV3Literal(decimalV3Type,
+                                new BigDecimal(((BigIntLiteral) child).getValue()));
+                    } else if (child instanceof DecimalV3Literal) {
+                        DecimalV3Type childType = (DecimalV3Type) child.getDataType();
+                        if (childType.getRange() <= decimalV3Type.getRange()) {
+                            return new DecimalV3Literal(decimalV3Type,
+                                    ((DecimalV3Literal) child).getValue()
+                                            .setScale(decimalV3Type.getScale(), RoundingMode.HALF_UP));
+                        } else {
+                            return cast;
+                        }
+                    }
                 }
-            } else if (castType instanceof VarcharType) {
-                if (child instanceof VarcharLiteral) {
-                    return new VarcharLiteral(((VarcharLiteral) child).getValue(), ((VarcharType) castType).getLen());
-                } else if (child instanceof CharLiteral) {
-                    return new VarcharLiteral(((CharLiteral) child).getValue(), ((VarcharType) castType).getLen());
-                }
-            } else if (castType instanceof DecimalV2Type) {
-                if (child instanceof TinyIntLiteral) {
-                    return new DecimalLiteral(new BigDecimal(((TinyIntLiteral) child).getValue()));
-                } else if (child instanceof SmallIntLiteral) {
-                    return new DecimalLiteral(new BigDecimal(((SmallIntLiteral) child).getValue()));
-                } else if (child instanceof IntegerLiteral) {
-                    return new DecimalLiteral(new BigDecimal(((IntegerLiteral) child).getValue()));
-                } else if (child instanceof BigIntLiteral) {
-                    return new DecimalLiteral(new BigDecimal(((BigIntLiteral) child).getValue()));
-                }
-            } else if (castType instanceof DecimalV3Type) {
-                DecimalV3Type decimalV3Type = (DecimalV3Type) castType;
-                if (child instanceof TinyIntLiteral) {
-                    return new DecimalV3Literal(decimalV3Type, new BigDecimal(((TinyIntLiteral) child).getValue()));
-                } else if (child instanceof SmallIntLiteral) {
-                    return new DecimalV3Literal(decimalV3Type, new BigDecimal(((SmallIntLiteral) child).getValue()));
-                } else if (child instanceof IntegerLiteral) {
-                    return new DecimalV3Literal(decimalV3Type, new BigDecimal(((IntegerLiteral) child).getValue()));
-                } else if (child instanceof BigIntLiteral) {
-                    return new DecimalV3Literal(decimalV3Type, new BigDecimal(((BigIntLiteral) child).getValue()));
-                } else if (child instanceof DecimalV3Literal) {
-                    return new DecimalV3Literal(decimalV3Type, ((DecimalV3Literal) child).getValue());
-                }
+            } catch (Throwable t) {
+                return cast;
             }
         }
 

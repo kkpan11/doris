@@ -17,8 +17,7 @@
 
 #pragma once
 
-#include <stddef.h>
-
+#include <cstddef>
 #include <memory>
 
 #include "common/status.h"
@@ -26,13 +25,10 @@
 #include "vec/data_types/data_type.h"
 #include "vec/exprs/table_function/table_function.h"
 
-namespace doris {
-namespace vectorized {
-class Block;
-} // namespace vectorized
-} // namespace doris
-
 namespace doris::vectorized {
+#include "common/compile_check_begin.h"
+
+class Block;
 
 class VExplodeBitmapTableFunction final : public TableFunction {
     ENABLE_FACTORY_CREATOR(VExplodeBitmapTableFunction);
@@ -41,21 +37,24 @@ public:
     VExplodeBitmapTableFunction();
     ~VExplodeBitmapTableFunction() override = default;
 
-    Status reset() override;
-    void get_value(MutableColumnPtr& column) override;
-    Status forward(int step = 1) override;
+    void reset() override;
+    void get_same_many_values(MutableColumnPtr& column, int length) override;
+    int get_value(MutableColumnPtr& column, int max_step) override;
 
-    Status process_init(Block* block) override;
-    Status process_row(size_t row_idx) override;
-    Status process_close() override;
+    void forward(int step = 1) override;
+
+    Status process_init(Block* block, RuntimeState* state) override;
+    void process_row(size_t row_idx) override;
+    void process_close() override;
 
 private:
     void _reset_iterator();
     // Not own object, just a reference
     const BitmapValue* _cur_bitmap = nullptr;
     // iterator of _cur_bitmap
-    std::unique_ptr<BitmapValueIterator> _cur_iter = nullptr;
+    std::unique_ptr<BitmapValueIterator> _cur_iter;
     ColumnPtr _value_column;
 };
 
+#include "common/compile_check_end.h"
 } // namespace doris::vectorized

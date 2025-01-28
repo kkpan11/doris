@@ -20,6 +20,7 @@ package org.apache.doris.nereids.trees.expressions;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
 
 import java.util.List;
 
@@ -27,18 +28,30 @@ import java.util.List;
  * like expression: a like 'xxx%'.
  */
 public class Like extends StringRegexPredicate {
-
     public Like(Expression left, Expression right) {
-        super("like", left, right);
+        this(ImmutableList.of(left, right));
+    }
+
+    private Like(List<Expression> children) {
+        this(children, false);
+    }
+
+    private Like(List<Expression> children, boolean inferred) {
+        super("like", children, inferred);
     }
 
     @Override
     public Like withChildren(List<Expression> children) {
         Preconditions.checkArgument(children.size() == 2);
-        return new Like(children.get(0), children.get(1));
+        return new Like(children);
     }
 
     public <R, C> R accept(ExpressionVisitor<R, C> visitor, C context) {
         return visitor.visitLike(this, context);
+    }
+
+    @Override
+    public Expression withInferred(boolean inferred) {
+        return new Like(this.children, inferred);
     }
 }

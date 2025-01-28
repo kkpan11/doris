@@ -18,7 +18,7 @@
 package org.apache.doris.ha;
 
 import org.apache.doris.catalog.Env;
-import org.apache.doris.common.util.Util;
+import org.apache.doris.common.LogUtils;
 
 import com.google.common.base.Preconditions;
 import com.sleepycat.je.rep.StateChangeEvent;
@@ -28,8 +28,10 @@ import org.apache.logging.log4j.Logger;
 
 public class BDBStateChangeListener implements StateChangeListener {
     public static final Logger LOG = LogManager.getLogger(BDBStateChangeListener.class);
+    private final boolean isElectable;
 
-    public BDBStateChangeListener() {
+    public BDBStateChangeListener(boolean isElectable) {
+        this.isElectable = isElectable;
     }
 
     @Override
@@ -41,7 +43,7 @@ public class BDBStateChangeListener implements StateChangeListener {
                 break;
             }
             case REPLICA: {
-                if (Env.getCurrentEnv().isElectable()) {
+                if (isElectable) {
                     newType = FrontendNodeType.FOLLOWER;
                 } else {
                     newType = FrontendNodeType.OBSERVER;
@@ -55,7 +57,7 @@ public class BDBStateChangeListener implements StateChangeListener {
             default: {
                 String msg = "this node is " + sce.getState().name();
                 LOG.warn(msg);
-                Util.stdoutWithTime(msg);
+                LogUtils.stdout(msg);
                 return;
             }
         }

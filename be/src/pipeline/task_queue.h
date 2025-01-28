@@ -30,38 +30,9 @@
 
 #include "common/status.h"
 #include "pipeline_task.h"
-#include "runtime/task_group/task_group.h"
 
-namespace doris {
-
-namespace pipeline {
-
-class TaskQueue {
-public:
-    TaskQueue(size_t core_size) : _core_size(core_size) {}
-    virtual ~TaskQueue();
-    virtual void close() = 0;
-    // Get the task by core id.
-    // TODO: To think the logic is useful?
-    virtual PipelineTask* take(size_t core_id) = 0;
-
-    // push from scheduler
-    virtual Status push_back(PipelineTask* task) = 0;
-
-    // push from worker
-    virtual Status push_back(PipelineTask* task, size_t core_id) = 0;
-
-    virtual void update_statistics(PipelineTask* task, int64_t time_spent) {}
-
-    virtual void update_tg_cpu_share(const taskgroup::TaskGroupInfo& task_group_info,
-                                     taskgroup::TaskGroupPtr task_group) = 0;
-
-    int cores() const { return _core_size; }
-
-protected:
-    size_t _core_size;
-    static constexpr auto WAIT_CORE_TASK_TIMEOUT_MS = 100;
-};
+namespace doris::pipeline {
+#include "common/compile_check_begin.h"
 
 class SubTaskQueue {
     friend class PriorityTaskQueue;
@@ -76,11 +47,13 @@ public:
     // note:
     // runtime is the time consumed by the actual execution of the task
     // vruntime(means virtual runtime) = runtime / _level_factor
-    double get_vruntime() { return _runtime / _level_factor; }
+    double get_vruntime() { return double(_runtime) / _level_factor; }
 
     void inc_runtime(uint64_t delta_time) { _runtime += delta_time; }
 
-    void adjust_runtime(uint64_t vruntime) { this->_runtime = vruntime * _level_factor; }
+    void adjust_runtime(uint64_t vruntime) {
+        this->_runtime = uint64_t(double(vruntime) * _level_factor);
+    }
 
     bool empty() { return _queue.empty(); }
 
@@ -95,11 +68,9 @@ private:
 // A Multilevel Feedback Queue
 class PriorityTaskQueue {
 public:
-    explicit PriorityTaskQueue();
+    PriorityTaskQueue();
 
     void close();
-
-    PipelineTask* try_take_unprotected(bool is_steal);
 
     PipelineTask* try_take(bool is_steal);
 
@@ -112,6 +83,7 @@ public:
     }
 
 private:
+    PipelineTask* _try_take_unprotected(bool is_steal);
     static constexpr auto LEVEL_QUEUE_TIME_FACTOR = 2;
     static constexpr size_t SUB_QUEUE_LEVEL = 6;
     SubTaskQueue _sub_queues[SUB_QUEUE_LEVEL];
@@ -131,85 +103,38 @@ private:
 };
 
 // Need consider NUMA architecture
-class MultiCoreTaskQueue : public TaskQueue {
+class MultiCoreTaskQueue {
 public:
-    explicit MultiCoreTaskQueue(size_t core_size);
+    explicit MultiCoreTaskQueue(int core_size);
 
-    ~MultiCoreTaskQueue() override;
-
-    void close() override;
-
+#ifndef BE_TEST
+    ~MultiCoreTaskQueue();
     // Get the task by core id.
-    // TODO: To think the logic is useful?
-    PipelineTask* take(size_t core_id) override;
+    PipelineTask* take(int core_id);
+#else
+    virtual ~MultiCoreTaskQueue();
+    virtual PipelineTask* take(int core_id);
+#endif
+    void close();
 
     // TODO combine these methods to `push_back(task, core_id = -1)`
-    Status push_back(PipelineTask* task) override;
+    Status push_back(PipelineTask* task);
 
-    Status push_back(PipelineTask* task, size_t core_id) override;
+    Status push_back(PipelineTask* task, int core_id);
 
-    void update_statistics(PipelineTask* task, int64_t time_spent) override {
-        task->inc_runtime_ns(time_spent);
-        _prio_task_queue_list[task->get_core_id()].inc_sub_queue_runtime(task->get_queue_level(),
-                                                                         time_spent);
-    }
+    void update_statistics(PipelineTask* task, int64_t time_spent);
 
-    void update_tg_cpu_share(const taskgroup::TaskGroupInfo& task_group_info,
-                             taskgroup::TaskGroupPtr task_group) override {
-        LOG(FATAL) << "update_tg_cpu_share not implemented";
-    }
+    int cores() const { return _core_size; }
 
 private:
-    PipelineTask* _steal_take(size_t core_id);
+    PipelineTask* _steal_take(int core_id);
 
-    std::unique_ptr<PriorityTaskQueue[]> _prio_task_queue_list;
-    std::atomic<size_t> _next_core = 0;
+    std::vector<PriorityTaskQueue> _prio_task_queues;
+    std::atomic<uint32_t> _next_core = 0;
     std::atomic<bool> _closed;
+
+    int _core_size;
+    static constexpr auto WAIT_CORE_TASK_TIMEOUT_MS = 100;
 };
-
-class TaskGroupTaskQueue : public TaskQueue {
-public:
-    explicit TaskGroupTaskQueue(size_t);
-    ~TaskGroupTaskQueue() override;
-
-    void close() override;
-
-    PipelineTask* take(size_t core_id) override;
-
-    // from TaskScheduler or BlockedTaskScheduler
-    Status push_back(PipelineTask* task) override;
-
-    // from worker
-    Status push_back(PipelineTask* task, size_t core_id) override;
-
-    void update_statistics(PipelineTask* task, int64_t time_spent) override;
-
-    void update_tg_cpu_share(const taskgroup::TaskGroupInfo& task_group_info,
-                             taskgroup::TaskGroupPtr task_group) override;
-
-private:
-    template <bool from_executor>
-    Status _push_back(PipelineTask* task);
-    template <bool from_worker>
-    void _enqueue_task_group(taskgroup::TGEntityPtr);
-    void _dequeue_task_group(taskgroup::TGEntityPtr);
-    taskgroup::TGEntityPtr _next_tg_entity();
-    int64_t _ideal_runtime_ns(taskgroup::TGEntityPtr tg_entity) const;
-    void _update_min_tg();
-
-    // Like cfs rb tree in sched_entity
-    struct TaskGroupSchedEntityComparator {
-        bool operator()(const taskgroup::TGEntityPtr&, const taskgroup::TGEntityPtr&) const;
-    };
-    using ResouceGroupSet = std::set<taskgroup::TGEntityPtr, TaskGroupSchedEntityComparator>;
-    ResouceGroupSet _group_entities;
-    std::condition_variable _wait_task;
-    std::mutex _rs_mutex;
-    bool _closed = false;
-    int _total_cpu_share = 0;
-    std::atomic<taskgroup::TGEntityPtr> _min_tg_entity = nullptr;
-    uint64_t _min_tg_v_runtime_ns = 0;
-};
-
-} // namespace pipeline
-} // namespace doris
+#include "common/compile_check_end.h"
+} // namespace doris::pipeline

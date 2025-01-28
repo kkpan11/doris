@@ -26,6 +26,7 @@
 #include "vec/data_types/data_type.h"
 
 namespace doris::vectorized {
+#include "common/compile_check_begin.h"
 
 /** Aggregate function combinator allows to take one aggregate function
   *  and transform it to another aggregate function.
@@ -50,8 +51,6 @@ class IAggregateFunctionCombinator {
 public:
     virtual String get_name() const = 0;
 
-    virtual bool is_for_internal_usage_only() const { return false; }
-
     /** From the arguments for combined function (ex: UInt64, UInt8 for sumIf),
       *  get the arguments for nested function (ex: UInt64 for sum).
       * If arguments are not suitable for combined function, throw an exception.
@@ -71,3 +70,5 @@ public:
 };
 
 } // namespace doris::vectorized
+
+#include "common/compile_check_end.h"

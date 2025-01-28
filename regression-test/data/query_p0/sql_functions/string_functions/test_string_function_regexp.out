@@ -50,6 +50,18 @@ b
 d
 
 -- !sql --
+
+
+-- !sql --
+b
+
+-- !sql --
+d
+
+-- !sql --
+\N
+
+-- !sql --
 ['18','17']
 
 -- !sql --
@@ -62,6 +74,18 @@ d
 
 
 -- !sql --
+
+
+-- !sql --
+['ab','c','c','c']
+
+-- !sql_regexp_extract_all --
+	0
+	0
+	0
+	0
+
+-- !sql --
 a-b-c
 
 -- !sql --
@@ -72,6 +96,12 @@ a-b c
 
 -- !sql --
 a <b> b
+
+-- !sql_utf1 --
+true
+
+-- !sql_utf2 --
+true
 
 -- !sql_regexp_null --
 \N
@@ -211,4 +241,10 @@ Ben
 Suzi
 Suzi
 Ben
+
+-- !sql_field4 --
+3
+
+-- !sql_field5 --
+2
 

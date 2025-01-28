@@ -38,6 +38,7 @@ import java.util.Map;
 public class AddColumnClause extends AlterTableClause {
     private static final Logger LOG = LogManager.getLogger(AddColumnClause.class);
     private ColumnDef columnDef;
+    private String sql;
     // Column position
     private ColumnPosition colPos;
     // if rollupName is null, add to column to base index.
@@ -68,6 +69,17 @@ public class AddColumnClause extends AlterTableClause {
         this.properties = properties;
     }
 
+    // for nereids
+    public AddColumnClause(String sql, Column column, ColumnPosition colPos, String rollupName,
+            Map<String, String> properties) {
+        super(AlterOpType.SCHEMA_CHANGE);
+        this.sql = sql;
+        this.column = column;
+        this.colPos = colPos;
+        this.rollupName = rollupName;
+        this.properties = properties;
+    }
+
     @Override
     public void analyze(Analyzer analyzer) throws AnalysisException, DdlException {
         if (columnDef == null) {
@@ -80,7 +92,11 @@ public class AddColumnClause extends AlterTableClause {
                     && columnDef.getAggregateType() == null) {
                 columnDef.setIsKey(true);
             }
+            if (table instanceof OlapTable) {
+                columnDef.setKeysType(((OlapTable) table).getKeysType());
+            }
         }
+
         columnDef.analyze(true);
         if (colPos != null) {
             colPos.analyze();
@@ -107,16 +123,30 @@ public class AddColumnClause extends AlterTableClause {
     }
 
     @Override
+    public boolean allowOpMTMV() {
+        return false;
+    }
+
+    @Override
+    public boolean needChangeMTMVState() {
+        return false;
+    }
+
+    @Override
     public String toSql() {
-        StringBuilder sb = new StringBuilder();
-        sb.append("ADD COLUMN ").append(columnDef.toSql());
-        if (colPos != null) {
-            sb.append(" ").append(colPos.toSql());
+        if (sql != null) {
+            return sql;
+        } else {
+            StringBuilder sb = new StringBuilder();
+            sb.append("ADD COLUMN ").append(columnDef.toSql());
+            if (colPos != null) {
+                sb.append(" ").append(colPos.toSql());
+            }
+            if (rollupName != null) {
+                sb.append(" IN `").append(rollupName).append("`");
+            }
+            return sb.toString();
         }
-        if (rollupName != null) {
-            sb.append(" IN `").append(rollupName).append("`");
-        }
-        return sb.toString();
     }
 
     @Override

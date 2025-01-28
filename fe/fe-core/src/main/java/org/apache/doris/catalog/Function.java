@@ -20,18 +20,22 @@ package org.apache.doris.catalog;
 import org.apache.doris.analysis.Expr;
 import org.apache.doris.analysis.FunctionCallExpr;
 import org.apache.doris.analysis.FunctionName;
+import org.apache.doris.analysis.FunctionParams;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.FeMetaVersion;
 import org.apache.doris.common.UserException;
-import org.apache.doris.common.io.IOUtils;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.common.util.URI;
+import org.apache.doris.persist.gson.GsonUtils;
+import org.apache.doris.qe.SessionVariable;
 import org.apache.doris.thrift.TFunction;
 import org.apache.doris.thrift.TFunctionBinaryType;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import com.google.gson.annotations.SerializedName;
 import org.apache.commons.io.output.NullOutputStream;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -40,6 +44,7 @@ import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -103,35 +108,55 @@ public class Function implements Writable {
 
     public static final long UNIQUE_FUNCTION_ID = 0;
     // Function id, every function has a unique id. Now all built-in functions' id is 0
+    @SerializedName("id")
     private long id = 0;
     // User specified function name e.g. "Add"
+    @SerializedName("n")
     private FunctionName name;
+    @SerializedName("rt")
     private Type retType;
     // Array of parameter types.  empty array if this function does not have parameters.
+    @SerializedName("at")
     private Type[] argTypes;
     // If true, this function has variable arguments.
     // TODO: we don't currently support varargs with no fixed types. i.e. fn(...)
+    @SerializedName("hva")
     private boolean hasVarArgs;
 
     // If true (default), this function is called directly by the user. For operators,
     // this is false. If false, it also means the function is not visible from
     // 'show functions'.
+    @SerializedName("uv")
     private boolean userVisible;
 
     // Absolute path in HDFS for the binary that contains this function.
     // e.g. /udfs/udfs.jar
+    @SerializedName("l")
     private URI location;
+    @SerializedName("bt")
     private TFunctionBinaryType binaryType;
 
+    private Function nestedFunction = null;
+
+    @SerializedName("nm")
     protected NullableMode nullableMode = NullableMode.DEPEND_ON_ARGUMENT;
 
     protected boolean vectorized = true;
 
     // library's checksum to make sure all backends use one library to serve user's request
+    @SerializedName("cs")
     protected String checksum = "";
 
     // If true, this function is global function
     protected boolean isGlobal = false;
+    // If true, this function is table function, mainly used by java-udtf
+    @SerializedName("isU")
+    protected boolean isUDTFunction = false;
+    // iff true, this udf function is static load, and BE need cache class load.
+    @SerializedName("isS")
+    protected boolean isStaticLoad = false;
+    @SerializedName("eT")
+    protected long expirationTime = 360; // default 6 hours;
 
     // Only used for serialization
     protected Function() {
@@ -190,6 +215,18 @@ public class Function implements Writable {
             System.arraycopy(other.argTypes, 0, this.argTypes, 0, other.argTypes.length);
         }
         this.checksum = other.checksum;
+        this.isGlobal = other.isGlobal;
+        this.isUDTFunction = other.isUDTFunction;
+        this.isStaticLoad = other.isStaticLoad;
+        this.expirationTime = other.expirationTime;
+    }
+
+    public void setNestedFunction(Function nestedFunction) {
+        this.nestedFunction = nestedFunction;
+    }
+
+    public Function getNestedFunction() {
+        return nestedFunction;
     }
 
     public Function clone() {
@@ -349,14 +386,16 @@ public class Function implements Writable {
             return false;
         }
         for (int i = 0; i < this.argTypes.length; ++i) {
-            if (!Type.isImplicitlyCastable(other.argTypes[i], this.argTypes[i], true)) {
+            if (!Type.isImplicitlyCastable(other.argTypes[i], this.argTypes[i], true,
+                    SessionVariable.getEnableDecimal256())) {
                 return false;
             }
         }
         // Check trailing varargs.
         if (this.hasVarArgs) {
             for (int i = this.argTypes.length; i < other.argTypes.length; ++i) {
-                if (!Type.isImplicitlyCastable(other.argTypes[i], getVarArgsType(), true)) {
+                if (!Type.isImplicitlyCastable(other.argTypes[i], getVarArgsType(), true,
+                        SessionVariable.getEnableDecimal256())) {
                     return false;
                 }
             }
@@ -531,10 +570,6 @@ public class Function implements Writable {
             fn.setArgTypes(Type.toThrift(Lists.newArrayList(argTypes), Lists.newArrayList(realArgTypes)));
         }
 
-        if (realReturnType.isAggStateType()) {
-            realReturnType = new ScalarType(Arrays.asList(realArgTypes), Arrays.asList(realArgTypeNullables));
-        }
-
         // For types with different precisions and scales, return type only indicates a
         // type with default
         // precision and scale so we need to transform it to the correct type.
@@ -551,6 +586,9 @@ public class Function implements Writable {
             fn.setChecksum(checksum);
         }
         fn.setVectorized(vectorized);
+        fn.setIsUdtfFunction(isUDTFunction);
+        fn.setIsStaticLoad(isStaticLoad);
+        fn.setExpirationTime(expirationTime);
         return fn;
     }
 
@@ -607,6 +645,7 @@ public class Function implements Writable {
         AGGREGATE(2),
         ALIAS(3);
 
+        @SerializedName("c")
         private int code;
 
         FunctionType(int code) {
@@ -631,41 +670,21 @@ public class Function implements Writable {
             return null;
         }
 
-        public void write(DataOutput output) throws IOException {
-            output.writeInt(code);
-        }
-
         public static FunctionType read(DataInput input) throws IOException {
-            return fromCode(input.readInt());
+            if (Env.getCurrentEnvJournalVersion() < FeMetaVersion.VERSION_136) {
+                return fromCode(input.readInt());
+            } else {
+                return GsonUtils.GSON.fromJson(Text.readString(input), FunctionType.class);
+            }
         }
-    }
-
-    protected void writeFields(DataOutput output) throws IOException {
-        output.writeLong(id);
-        name.write(output);
-        ColumnType.write(output, retType);
-        output.writeInt(argTypes.length);
-        for (Type type : argTypes) {
-            ColumnType.write(output, type);
-        }
-        output.writeBoolean(hasVarArgs);
-        output.writeBoolean(userVisible);
-        output.writeInt(binaryType.getValue());
-        // write library URL
-        String libUrl = "";
-        if (location != null) {
-            libUrl = location.getLocation();
-        }
-        IOUtils.writeOptionString(output, libUrl);
-        IOUtils.writeOptionString(output, checksum);
     }
 
     @Override
     public void write(DataOutput output) throws IOException {
-        throw new Error("Origin function cannot be serialized");
+        Text.writeString(output, GsonUtils.GSON.toJson(this));
     }
 
-    public void readFields(DataInput input) throws IOException {
+    protected void readFields(DataInput input) throws IOException {
         id = input.readLong();
         name = FunctionName.read(input);
         retType = ColumnType.read(input);
@@ -692,9 +711,18 @@ public class Function implements Writable {
         if (hasChecksum) {
             checksum = Text.readString(input);
         }
+        if (Env.getCurrentEnvJournalVersion() >= FeMetaVersion.VERSION_126) {
+            nullableMode = NullableMode.valueOf(input.readUTF());
+        }
+        if (Env.getCurrentEnvJournalVersion() >= FeMetaVersion.VERSION_131) {
+            isUDTFunction = input.readBoolean();
+        }
     }
 
     public static Function read(DataInput input) throws IOException {
+        if (Env.getCurrentEnvJournalVersion() >= FeMetaVersion.VERSION_136) {
+            return GsonUtils.GSON.fromJson(Text.readString(input), Function.class);
+        }
         Function function;
         FunctionType functionType = FunctionType.read(input);
         switch (functionType) {
@@ -728,7 +756,11 @@ public class Function implements Writable {
             // function type
             // intermediate type
             if (this instanceof ScalarFunction) {
-                row.add("Scalar");
+                if (isUDTFunction()) {
+                    row.add("TABLES");
+                } else {
+                    row.add("Scalar");
+                }
                 row.add("NULL");
             } else if (this instanceof AliasFunction) {
                 row.add("Alias");
@@ -751,16 +783,36 @@ public class Function implements Writable {
         return row;
     }
 
-    boolean isVectorized() {
-        return vectorized;
-    }
-
     public void setNullableMode(NullableMode nullableMode) {
         this.nullableMode = nullableMode;
     }
 
     public NullableMode getNullableMode() {
         return nullableMode;
+    }
+
+    public void setUDTFunction(boolean isUDTFunction) {
+        this.isUDTFunction = isUDTFunction;
+    }
+
+    public boolean isUDTFunction() {
+        return this.isUDTFunction;
+    }
+
+    public void setStaticLoad(boolean isStaticLoad) {
+        this.isStaticLoad = isStaticLoad;
+    }
+
+    public boolean isStaticLoad() {
+        return this.isStaticLoad;
+    }
+
+    public void setExpirationTime(long expirationTime) {
+        this.expirationTime = expirationTime;
+    }
+
+    public long getExpirationTime() {
+        return this.expirationTime;
     }
 
     // Try to serialize this function and write to nowhere.
@@ -835,14 +887,49 @@ public class Function implements Writable {
     public static FunctionCallExpr convertToStateCombinator(FunctionCallExpr fnCall) {
         Function aggFunction = fnCall.getFn();
         List<Type> arguments = Arrays.asList(aggFunction.getArgs());
-        ScalarFunction fn = new org.apache.doris.catalog.ScalarFunction(
-                new FunctionName(aggFunction.getFunctionName().getFunction() + Expr.AGG_STATE_SUFFIX),
-                arguments,
-                new ScalarType(arguments, fnCall.getChildren().stream().map(expr -> {
-                    return expr.isNullable();
-                }).collect(Collectors.toList())), aggFunction.hasVarArgs(), aggFunction.isUserVisible());
+        ScalarFunction fn = new ScalarFunction(
+                new FunctionName(aggFunction.getFunctionName().getFunction() + Expr.AGG_STATE_SUFFIX), arguments,
+                Expr.createAggStateType(aggFunction.getFunctionName().getFunction(),
+                        fnCall.getChildren().stream().map(expr -> {
+                            return expr.getType();
+                        }).collect(Collectors.toList()), fnCall.getChildren().stream().map(expr -> {
+                            return expr.isNullable();
+                        }).collect(Collectors.toList())),
+                aggFunction.hasVarArgs(), aggFunction.isUserVisible());
         fn.setNullableMode(NullableMode.ALWAYS_NOT_NULLABLE);
         fn.setBinaryType(TFunctionBinaryType.AGG_STATE);
-        return new FunctionCallExpr(fn, fnCall.getParams());
+        return new FunctionCallExpr(fn, new FunctionParams(fnCall.getChildren()));
+    }
+
+    public static FunctionCallExpr convertToMergeCombinator(FunctionCallExpr fnCall) {
+        Function aggFunction = fnCall.getFn();
+        aggFunction.setName(new FunctionName(aggFunction.getFunctionName().getFunction() + Expr.AGG_MERGE_SUFFIX));
+        aggFunction.setArgs(Arrays.asList(fnCall.getChildren().get(0).getType()));
+        aggFunction.setBinaryType(TFunctionBinaryType.AGG_STATE);
+        return fnCall;
+    }
+
+    public static FunctionCallExpr convertToUnionCombinator(FunctionCallExpr fnCall) {
+        Function aggFunction = fnCall.getFn();
+        aggFunction.setName(new FunctionName(aggFunction.getFunctionName().getFunction() + Expr.AGG_UNION_SUFFIX));
+        aggFunction.setArgs(Arrays.asList(fnCall.getChildren().get(0).getType()));
+        aggFunction.setBinaryType(TFunctionBinaryType.AGG_STATE);
+        aggFunction.setNullableMode(NullableMode.ALWAYS_NOT_NULLABLE);
+        aggFunction.setReturnType(fnCall.getChildren().get(0).getType());
+        fnCall.setType(fnCall.getChildren().get(0).getType());
+        return fnCall;
+    }
+
+    public static FunctionCallExpr convertForEachCombinator(FunctionCallExpr fnCall) {
+        Function aggFunction = fnCall.getFn();
+        aggFunction.setName(new FunctionName(aggFunction.getFunctionName().getFunction() + Expr.AGG_FOREACH_SUFFIX));
+        List<Type> argTypes = new ArrayList();
+        for (Type type : aggFunction.argTypes) {
+            argTypes.add(new ArrayType(type));
+        }
+        aggFunction.setArgs(argTypes);
+        aggFunction.setReturnType(new ArrayType(aggFunction.getReturnType(), fnCall.isNullable()));
+        aggFunction.setNullableMode(NullableMode.ALWAYS_NULLABLE);
+        return fnCall;
     }
 }

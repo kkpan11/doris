@@ -19,21 +19,27 @@ package org.apache.doris.datasource.property;
 
 import org.apache.doris.datasource.property.constants.CosProperties;
 import org.apache.doris.datasource.property.constants.GCSProperties;
+import org.apache.doris.datasource.property.constants.MinioProperties;
 import org.apache.doris.datasource.property.constants.ObsProperties;
 import org.apache.doris.datasource.property.constants.OssProperties;
 import org.apache.doris.datasource.property.constants.S3Properties;
+import org.apache.doris.datasource.property.constants.S3Properties.Env;
 
 import java.util.HashMap;
 import java.util.Map;
 
 public class S3ClientBEProperties {
-
     /**
      *  convert FE properties to BE S3 client properties
      *  On BE, should use properties like AWS_XXX.
      */
     public static Map<String, String> getBeFSProperties(Map<String, String> properties) {
-        if (properties.containsKey(S3Properties.ENDPOINT)) {
+        if (properties.containsKey(MinioProperties.ENDPOINT)) {
+            if (!properties.containsKey(MinioProperties.REGION)) {
+                properties.put(MinioProperties.REGION, MinioProperties.DEFAULT_REGION);
+            }
+            return getBeAWSPropertiesFromS3(S3Properties.prefixToS3(properties));
+        } else if (properties.containsKey(S3Properties.ENDPOINT)) {
             // s3,oss,cos,obs use this.
             return getBeAWSPropertiesFromS3(properties);
         } else if (properties.containsKey(ObsProperties.ENDPOINT)
@@ -49,7 +55,8 @@ public class S3ClientBEProperties {
         Map<String, String> beProperties = new HashMap<>();
         String endpoint = properties.get(S3Properties.ENDPOINT);
         beProperties.put(S3Properties.Env.ENDPOINT, endpoint);
-        String region = S3Properties.getRegionOfEndpoint(endpoint);
+        String region = PropertyConverter.checkRegion(endpoint, properties.get(S3Properties.Env.REGION),
+                S3Properties.Env.REGION);
         beProperties.put(S3Properties.Env.REGION, properties.getOrDefault(S3Properties.REGION, region));
         if (properties.containsKey(S3Properties.ACCESS_KEY)) {
             beProperties.put(S3Properties.Env.ACCESS_KEY, properties.get(S3Properties.ACCESS_KEY));
@@ -65,6 +72,21 @@ public class S3ClientBEProperties {
         }
         if (properties.containsKey(S3Properties.BUCKET)) {
             beProperties.put(S3Properties.Env.BUCKET, properties.get(S3Properties.BUCKET));
+        }
+        if (properties.containsKey(S3Properties.MAX_CONNECTIONS)) {
+            beProperties.put(Env.MAX_CONNECTIONS, properties.get(S3Properties.MAX_CONNECTIONS));
+        }
+        if (properties.containsKey(S3Properties.REQUEST_TIMEOUT_MS)) {
+            beProperties.put(Env.REQUEST_TIMEOUT_MS, properties.get(S3Properties.REQUEST_TIMEOUT_MS));
+        }
+        if (properties.containsKey(S3Properties.CONNECTION_TIMEOUT_MS)) {
+            beProperties.put(Env.CONNECTION_TIMEOUT_MS, properties.get(S3Properties.CONNECTION_TIMEOUT_MS));
+        }
+        if (properties.containsKey(PropertyConverter.USE_PATH_STYLE)) {
+            beProperties.put(PropertyConverter.USE_PATH_STYLE, properties.get(PropertyConverter.USE_PATH_STYLE));
+        }
+        if (properties.containsKey(S3Properties.PROVIDER)) {
+            beProperties.put(S3Properties.PROVIDER, properties.get(S3Properties.PROVIDER));
         }
         return beProperties;
     }

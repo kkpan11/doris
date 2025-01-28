@@ -209,4 +209,20 @@ public class SqlModeHelper {
         return combineModeSet;
     }
 
+    public static boolean hasNoBackSlashEscapes() {
+        SessionVariable sessionVariable = ConnectContext.get() == null
+                ? VariableMgr.newSessionVariable()
+                : ConnectContext.get().getSessionVariable();
+        return ((sessionVariable.getSqlMode() & MODE_ALLOWED_MASK)
+                & MODE_NO_BACKSLASH_ESCAPES) != 0;
+    }
+
+    public static boolean hasPipeAsConcat() {
+        SessionVariable sessionVariable = ConnectContext.get() == null
+                ? VariableMgr.newSessionVariable()
+                : ConnectContext.get().getSessionVariable();
+        return ((sessionVariable.getSqlMode() & MODE_ALLOWED_MASK)
+                & MODE_PIPES_AS_CONCAT) != 0;
+    }
+
 }

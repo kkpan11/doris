@@ -19,6 +19,7 @@ package org.apache.doris.common;
 
 import org.apache.doris.alter.SchemaChangeHandler;
 import org.apache.doris.analysis.CreateMaterializedViewStmt;
+import org.apache.doris.analysis.ResourceTypeEnum;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.mysql.privilege.Role;
 import org.apache.doris.mysql.privilege.RoleManager;
@@ -28,16 +29,22 @@ import org.apache.doris.qe.VariableMgr;
 import com.google.common.base.Strings;
 
 public class FeNameFormat {
-    private static final String LABEL_REGEX = "^[-_A-Za-z0-9:]{1,128}$";
-    private static final String COMMON_NAME_REGEX = "^[a-zA-Z][a-zA-Z0-9_]{0,63}$";
-    private static final String TABLE_NAME_REGEX = "^[a-zA-Z][a-zA-Z0-9_]*$";
-    private static final String COLUMN_NAME_REGEX = "^[_a-zA-Z@0-9][.a-zA-Z0-9_+-/><?@#$%^&*]{0,255}$";
+    private static final String LABEL_REGEX = "^[-_A-Za-z0-9:]{1," + Config.label_regex_length + "}$";
+    // if modify the matching length of a regular expression,
+    // please modify error msg when FeNameFormat.checkCommonName throw exception in CreateRoutineLoadStmt
+    private static final String COMMON_NAME_REGEX = "^[a-zA-Z][a-zA-Z0-9-_]{0,63}$";
+    private static final String UNDERSCORE_COMMON_NAME_REGEX = "^[_a-zA-Z][a-zA-Z0-9-_]{0,63}$";
+    private static final String TABLE_NAME_REGEX = "^[a-zA-Z][a-zA-Z0-9-_]*$";
+    private static final String USER_NAME_REGEX = "^[a-zA-Z][a-zA-Z0-9.-_]*$";
+    private static final String COLUMN_NAME_REGEX = "^[_a-zA-Z@0-9\\s/][.a-zA-Z0-9_+-/?@#$%^&*\"\\s,:]{0,255}$";
 
     private static final String UNICODE_LABEL_REGEX = "^[-_A-Za-z0-9:\\p{L}]{1,128}$";
-    private static final String UNICODE_COMMON_NAME_REGEX = "^[a-zA-Z\\p{L}][a-zA-Z0-9_\\p{L}]{0,63}$";
-    private static final String UNICODE_TABLE_NAME_REGEX = "^[a-zA-Z\\p{L}][a-zA-Z0-9_\\p{L}]*$";
+    private static final String UNICODE_COMMON_NAME_REGEX = "^[a-zA-Z\\p{L}][a-zA-Z0-9-_\\p{L}]{0,63}$";
+    private static final String UNICODE_UNDERSCORE_COMMON_NAME_REGEX = "^[_a-zA-Z\\p{L}][a-zA-Z0-9-_\\p{L}]{0,63}$";
+    private static final String UNICODE_TABLE_NAME_REGEX = "^[a-zA-Z\\p{L}][a-zA-Z0-9-_\\p{L}]*$";
+    private static final String UNICODE_USER_NAME_REGEX = "^[a-zA-Z\\p{L}][a-zA-Z0-9.-_\\p{L}]*$";
     private static final String UNICODE_COLUMN_NAME_REGEX
-            = "^[_a-zA-Z@0-9\\p{L}][.a-zA-Z0-9_+-/><?@#$%^&*\\p{L}]{0,255}$";
+            = "^[_a-zA-Z@0-9\\p{L}][.a-zA-Z0-9_+-/?@#$%^&*\\p{L}]{0,255}$";
 
     public static final String FORBIDDEN_PARTITION_NAME = "placeholder_";
 
@@ -85,13 +92,10 @@ public class FeNameFormat {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_WRONG_COLUMN_NAME,
                     columnName, getColumnNameRegex());
         }
-        if (columnName.startsWith(CreateMaterializedViewStmt.MATERIALIZED_VIEW_NAME_PREFIX)) {
-            ErrorReport.reportAnalysisException(ErrorCode.ERR_WRONG_COLUMN_NAME,
-                    columnName, FeNameFormat.COLUMN_NAME_REGEX);
-        }
-        if (columnName.startsWith(CreateMaterializedViewStmt.MATERIALIZED_VIEW_AGGREGATE_NAME_PREFIX)) {
-            ErrorReport.reportAnalysisException(ErrorCode.ERR_WRONG_COLUMN_NAME,
-                    columnName, FeNameFormat.COLUMN_NAME_REGEX);
+        if (columnName.startsWith(CreateMaterializedViewStmt.MATERIALIZED_VIEW_NAME_PREFIX)
+                || columnName.startsWith(CreateMaterializedViewStmt.MATERIALIZED_VIEW_AGGREGATE_NAME_PREFIX)) {
+            throw new AnalysisException(
+                    "Incorrect column name " + columnName + ", column name can't start with 'mv_'/'mva_'");
         }
     }
 
@@ -102,7 +106,7 @@ public class FeNameFormat {
     }
 
     public static void checkUserName(String userName) throws AnalysisException {
-        if (Strings.isNullOrEmpty(userName) || !userName.matches(getCommonNameRegex())) {
+        if (Strings.isNullOrEmpty(userName) || !userName.matches(getUserNameRegex())) {
             throw new AnalysisException("invalid user name: " + userName);
         }
     }
@@ -125,17 +129,37 @@ public class FeNameFormat {
         }
     }
 
-    public static void checkResourceName(String resourceName) throws AnalysisException {
-        checkCommonName("resource", resourceName);
+    public static void checkResourceName(String resourceName, ResourceTypeEnum type) throws AnalysisException {
+        if (type == ResourceTypeEnum.GENERAL) {
+            checkCommonName("resource", resourceName);
+        } else {
+            checkCommonName("clusterName", resourceName);
+        }
+    }
+
+    public static void checkStorageVaultName(String vaultName) throws AnalysisException {
+        checkCommonName("vault", vaultName);
     }
 
     public static void checkWorkloadGroupName(String workloadGroupName) throws AnalysisException {
         checkCommonName("workload group", workloadGroupName);
     }
 
+    public static void checkWorkloadSchedPolicyName(String policyName) throws AnalysisException {
+        checkCommonName("workload schedule policy", policyName);
+    }
+
     public static void checkCommonName(String type, String name) throws AnalysisException {
-        if (Strings.isNullOrEmpty(name) || !name.matches(getCommonNameRegex())) {
-            ErrorReport.reportAnalysisException(ErrorCode.ERR_WRONG_NAME_FORMAT, type, name);
+        final String regex = getCommonNameRegex();
+        if (Strings.isNullOrEmpty(name) || !name.matches(regex)) {
+            ErrorReport.reportAnalysisException(ErrorCode.ERR_WRONG_NAME_FORMAT, type, name, regex);
+        }
+    }
+
+    public static void checkOutfileSuccessFileName(String type, String name) throws AnalysisException {
+        final String regex = getOutfileSuccessFileNameRegex();
+        if (Strings.isNullOrEmpty(name) || !name.matches(regex)) {
+            ErrorReport.reportAnalysisException(ErrorCode.ERR_WRONG_NAME_FORMAT, type, name, regex);
         }
     }
 
@@ -165,6 +189,14 @@ public class FeNameFormat {
         }
     }
 
+    public static String getUserNameRegex() {
+        if (FeNameFormat.isEnableUnicodeNameSupport()) {
+            return UNICODE_USER_NAME_REGEX;
+        } else {
+            return USER_NAME_REGEX;
+        }
+    }
+
     public static String getLabelRegex() {
         if (FeNameFormat.isEnableUnicodeNameSupport()) {
             return UNICODE_LABEL_REGEX;
@@ -178,6 +210,14 @@ public class FeNameFormat {
             return UNICODE_COMMON_NAME_REGEX;
         } else {
             return COMMON_NAME_REGEX;
+        }
+    }
+
+    public static String getOutfileSuccessFileNameRegex() {
+        if (FeNameFormat.isEnableUnicodeNameSupport()) {
+            return UNICODE_UNDERSCORE_COMMON_NAME_REGEX;
+        } else {
+            return UNDERSCORE_COMMON_NAME_REGEX;
         }
     }
 }

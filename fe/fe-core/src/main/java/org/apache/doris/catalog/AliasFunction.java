@@ -35,11 +35,11 @@ import org.apache.doris.thrift.TFunctionBinaryType;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.gson.Gson;
+import com.google.gson.annotations.SerializedName;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.io.StringReader;
 import java.util.ArrayList;
@@ -59,7 +59,9 @@ public class AliasFunction extends Function {
 
     private static final String DIGITAL_MASKING = "digital_masking";
 
+    @SerializedName("of")
     private Expr originFunction;
+    @SerializedName("pm")
     private List<String> parameters = new ArrayList<>();
     private List<String> typeDefParams = new ArrayList<>();
 
@@ -136,7 +138,6 @@ public class AliasFunction extends Function {
         aliasFunction.setUserVisible(userVisible);
         aliasFunction.originFunction = originFunction;
         aliasFunction.parameters = parameters;
-        aliasFunction.vectorized = isVectorized;
         return aliasFunction;
     }
 
@@ -174,6 +175,7 @@ public class AliasFunction extends Function {
                     case DECIMAL32:
                     case DECIMAL64:
                     case DECIMAL128:
+                    case DECIMAL256:
                     case DECIMALV2:
                         if (!Strings.isNullOrEmpty(scalarType.getScalarPrecisionStr())) {
                             typeDefParams.add(scalarType.getScalarPrecisionStr());
@@ -211,8 +213,9 @@ public class AliasFunction extends Function {
                 existFlag |= typeDefParam.equals(str);
             }
             if (!existFlag) {
-                throw new AnalysisException(
-                        "Alias function [" + functionName() + "]  do not contain parameter [" + str + "].");
+                throw new AnalysisException("Alias function [" + functionName() + "]  do not contain parameter [" + str
+                        + "]. typeDefParams="
+                        + typeDefParams.stream().map(String::toString).collect(Collectors.joining(", ")));
             }
         }
     }
@@ -251,21 +254,6 @@ public class AliasFunction extends Function {
                 .append(originFunction.toSql())
                 .append(";");
         return sb.toString();
-    }
-
-    @Override
-    public void write(DataOutput output) throws IOException {
-        // 1. type
-        FunctionType.ALIAS.write(output);
-        // 2. parent
-        super.writeFields(output);
-        // 3. parameter
-        output.writeInt(parameters.size());
-        for (String p : parameters) {
-            Text.writeString(output, p);
-        }
-        // 4. expr
-        Expr.writeTo(originFunction, output);
     }
 
     @Override

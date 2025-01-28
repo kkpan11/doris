@@ -16,8 +16,8 @@
 // under the License.
 
 suite("test_right_join") {
-    sql """set enable_nereids_planner=false"""
-    sql """set parallel_fragment_exec_instance_num=1"""
+    sql """set disable_join_reorder=true"""
+    sql """set parallel_pipeline_task_num=1"""
     sql "use regression_test_tpcds_sf1_p1"
 
     qt_sql_right_outer_join_with_other_conjuncts """

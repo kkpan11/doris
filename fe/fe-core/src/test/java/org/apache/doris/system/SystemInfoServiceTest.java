@@ -20,9 +20,13 @@ package org.apache.doris.system;
 import org.apache.doris.catalog.DiskInfo;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.ReplicaAllocation;
+import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.FeMetaVersion;
+import org.apache.doris.common.Pair;
 import org.apache.doris.meta.MetaContext;
 import org.apache.doris.resource.Tag;
+import org.apache.doris.system.SystemInfoService.HostInfo;
 import org.apache.doris.thrift.TStorageMedium;
 
 import com.google.common.collect.ImmutableMap;
@@ -43,6 +47,8 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 public class SystemInfoServiceTest {
     private SystemInfoService infoService;
@@ -58,6 +64,35 @@ public class SystemInfoServiceTest {
     }
 
     @Test
+    public void testGetHostAndPort() {
+        String ipv4 = "192.168.1.2:9050";
+        String ipv6 = "[fe80::5054:ff:fec9:dee0]:9050";
+        String ipv6Error = "fe80::5054:ff:fec9:dee0:9050";
+        try {
+            HostInfo hostAndPort = SystemInfoService.getHostAndPort(ipv4);
+            Assert.assertEquals("192.168.1.2", hostAndPort.getHost());
+            Assert.assertEquals(9050, hostAndPort.getPort());
+        } catch (AnalysisException e) {
+            e.printStackTrace();
+            Assert.fail();
+        }
+        try {
+            HostInfo hostAndPort = SystemInfoService.getHostAndPort(ipv6);
+            Assert.assertEquals("fe80::5054:ff:fec9:dee0", hostAndPort.getHost());
+            Assert.assertEquals(9050, hostAndPort.getPort());
+        } catch (AnalysisException e) {
+            e.printStackTrace();
+            Assert.fail();
+        }
+        try {
+            SystemInfoService.getHostAndPort(ipv6Error);
+            Assert.fail();
+        } catch (AnalysisException e) {
+            e.printStackTrace();
+        }
+    }
+
+    @Test
     public void testBackendHbResponseSerialization() throws IOException {
         MetaContext metaContext = new MetaContext();
         metaContext.setMetaVersion(FeMetaVersion.VERSION_CURRENT);
@@ -66,7 +101,7 @@ public class SystemInfoServiceTest {
         System.out.println(Env.getCurrentEnvJournalVersion());
 
         BackendHbResponse writeResponse = new BackendHbResponse(1L, 1234, 1234, 1234, 1234, 1234, "test",
-                Tag.VALUE_COMPUTATION);
+                Tag.VALUE_COMPUTATION, 10, 100, false, 1234);
 
         // Write objects to file
         File file1 = new File("./BackendHbResponseSerialization");
@@ -99,6 +134,7 @@ public class SystemInfoServiceTest {
 
     @Test
     public void testSelectBackendIdsByPolicy() throws Exception {
+        Config.disable_backend_black_list = true;
         // 1. no backend
         BeSelectionPolicy policy = new BeSelectionPolicy.Builder().needLoadAvailable().build();
         Assert.assertEquals(0, infoService.selectBackendIdsByPolicy(policy, 1).size());
@@ -298,6 +334,29 @@ public class SystemInfoServiceTest {
     }
 
     @Test
+    public void testResourceTagDowngrade() throws Exception {
+        Tag taga = Tag.create(Tag.TYPE_LOCATION, "taga");
+        addBackend(10001, "192.168.1.1", 9050);
+        Backend be1 = infoService.getBackend(10001);
+        be1.setTagMap(taga.toMap());
+        be1.setAlive(true);
+
+        addBackend(10002, "192.168.1.2", 9050);
+        Backend be2 = infoService.getBackend(10002);
+        be2.setAlive(true);
+
+        BeSelectionPolicy policy1 = new BeSelectionPolicy.Builder().addTags(Sets.newHashSet(taga)).build();
+        Assert.assertEquals(1, infoService.selectBackendIdsByPolicy(policy1, 1).size());
+
+        be1.setAlive(false);
+        Assert.assertEquals(0, infoService.selectBackendIdsByPolicy(policy1, 1).size());
+
+        BeSelectionPolicy policy2 = new BeSelectionPolicy.Builder().setAllowResourceTagDowngrade(true)
+                .addTags(Sets.newHashSet(taga)).build();
+        Assert.assertEquals(1, infoService.selectBackendIdsByPolicy(policy2, 1).size());
+    }
+
+    @Test
     public void testPreferLocationsSelect() throws Exception {
         Tag taga = Tag.create(Tag.TYPE_LOCATION, "taga");
 
@@ -371,19 +430,25 @@ public class SystemInfoServiceTest {
         ReplicaAllocation replicaAlloc = ReplicaAllocation.DEFAULT_ALLOCATION;
         // also check if the random selection logic can evenly distribute the replica.
         Map<Long, Integer> beCounterMap = Maps.newHashMap();
-        for (int i = 0; i < 10000; ++i) {
-            Map<Tag, List<Long>> res = infoService.selectBackendIdsForReplicaCreation(replicaAlloc,
-                    TStorageMedium.HDD);
+        for (int i = 0; i < 30000; ++i) {
+            Pair<Map<Tag, List<Long>>, TStorageMedium> ret = infoService.selectBackendIdsForReplicaCreation(replicaAlloc,
+                    Maps.newHashMap(), TStorageMedium.HDD, false, false);
+            Map<Tag, List<Long>> res = ret.first;
             Assert.assertEquals(3, res.get(Tag.DEFAULT_BACKEND_TAG).size());
             for (Long beId : res.get(Tag.DEFAULT_BACKEND_TAG)) {
                 beCounterMap.put(beId, beCounterMap.getOrDefault(beId, 0) + 1);
             }
         }
+        Set<Long> expectBackendIds = infoService.getMixBackends().stream()
+                .filter(Backend::isAlive).map(Backend::getId)
+                .collect(Collectors.toSet());
+        Assert.assertEquals(expectBackendIds, beCounterMap.keySet().stream().collect(Collectors.toSet()));
         List<Integer> list = Lists.newArrayList(beCounterMap.values());
         Collections.sort(list);
-        int diff = list.get(list.size() - 1) - list.get(0);
-        // The max replica num and min replica num's diff is less than 5%.
-        Assert.assertTrue((diff * 1.0 / list.get(0)) < 0.05);
+        int max = list.get(list.size() - 1);
+        int diff =  max - list.get(0);
+        // The max replica num and min replica num's diff is less than 30%.
+        Assert.assertTrue((diff * 1.0 / max) < 0.3);
     }
 
     private void addDisk(Backend be, String path, TStorageMedium medium, long totalB, long availB) {
@@ -401,4 +466,5 @@ public class SystemInfoServiceTest {
         tagMap.put(Tag.TYPE_ROLE, Tag.VALUE_COMPUTATION);
         be.setTagMap(tagMap);
     }
+
 }

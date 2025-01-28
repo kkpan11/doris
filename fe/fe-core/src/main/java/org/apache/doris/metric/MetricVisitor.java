@@ -31,16 +31,24 @@ public abstract class MetricVisitor {
     // for system metrics
     public static final String SYS_PREFIX = "system_";
 
+    protected StringBuilder sb = new StringBuilder();
+
     public MetricVisitor() {
     }
 
-    public abstract void setMetricNumber(int metricNumber);
+    public abstract void visitJvm(JvmStats jvmStats);
 
-    public abstract void visitJvm(StringBuilder sb, JvmStats jvmStats);
+    public abstract void visit(String prefix, Metric metric);
 
-    public abstract void visit(StringBuilder sb, String prefix, Metric metric);
+    public abstract void visitHistogram(String prefix, String name, Histogram histogram);
 
-    public abstract void visitHistogram(StringBuilder sb, String prefix, String name, Histogram histogram);
+    public abstract void visitNodeInfo();
 
-    public abstract void getNodeInfo(StringBuilder sb);
+    public abstract void visitCloudTableStats();
+
+    public abstract void visitWorkloadGroup();
+
+    public String finish() {
+        return sb.toString();
+    }
 }

@@ -23,6 +23,7 @@ import java.util.EnumSet;
 import java.util.Map;
 
 // MySQL protocol text command
+// Reused by arrow flight protocol
 public enum MysqlCommand {
     COM_SLEEP("Sleep", 0),
     COM_QUIT("Quit", 1),
@@ -47,6 +48,8 @@ public enum MysqlCommand {
     COM_STMT_SEND_LONG_DATA("COM_STMT_SEND_LONG_DATA", 24),
     COM_STMT_CLOSE("COM_STMT_CLOSE", 25),
     COM_STMT_RESET("COM_STMT_RESET", 26),
+    COM_SET_OPTION("COM_SET_OPTION", 27),
+    COM_STMT_FETCH("COM_STMT_FETCH", 28),
     COM_DAEMON("COM_DAEMON", 29),
     COM_RESET_CONNECTION("COM_RESET_CONNECTION", 31);
 

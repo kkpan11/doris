@@ -27,13 +27,19 @@ import org.apache.doris.analysis.SlotRef;
 import org.apache.doris.analysis.StatementBase;
 import org.apache.doris.analysis.TupleDescriptor;
 import org.apache.doris.common.TreeNode;
+import org.apache.doris.nereids.trees.plans.distribute.NereidsSpecifyInstances;
+import org.apache.doris.nereids.trees.plans.distribute.worker.job.ScanSource;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.thrift.TExplainLevel;
 import org.apache.doris.thrift.TPartitionType;
 import org.apache.doris.thrift.TPlanFragment;
+import org.apache.doris.thrift.TQueryCacheParam;
+import org.apache.doris.thrift.TResultSinkType;
 
 import com.google.common.base.Preconditions;
+import com.google.common.base.Suppliers;
 import com.google.common.collect.Lists;
+import org.apache.commons.codec.binary.Hex;
 import org.apache.commons.collections.CollectionUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -41,7 +47,10 @@ import org.apache.logging.log4j.Logger;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 /**
@@ -142,10 +151,18 @@ public class PlanFragment extends TreeNode<PlanFragment> {
     // The runtime filter id that is expected to be used
     private Set<RuntimeFilterId> targetRuntimeFilterIds;
 
-    // has colocate plan node
-    private boolean hasColocatePlanNode = false;
+    private int bucketNum;
 
-    private boolean isRightChildOfBroadcastHashJoin = false;
+    // has colocate plan node
+    protected boolean hasColocatePlanNode = false;
+    protected final Supplier<Boolean> hasBucketShuffleJoin;
+
+    private TResultSinkType resultSinkType = TResultSinkType.MYSQL_PROTOCAL;
+
+    public Optional<NereidsSpecifyInstances<ScanSource>> specifyInstances = Optional.empty();
+
+    public TQueryCacheParam queryCacheParam;
+    private int numBackends = 0;
 
     /**
      * C'tor for fragment with specific partition; the output is by default broadcast.
@@ -158,6 +175,7 @@ public class PlanFragment extends TreeNode<PlanFragment> {
         this.transferQueryStatisticsWithEveryBatch = false;
         this.builderRuntimeFilterIds = new HashSet<>();
         this.targetRuntimeFilterIds = new HashSet<>();
+        this.hasBucketShuffleJoin = buildHasBucketShuffleJoin();
         setParallelExecNumIfExists();
         setFragmentInPlanTree(planRoot);
     }
@@ -165,6 +183,25 @@ public class PlanFragment extends TreeNode<PlanFragment> {
     public PlanFragment(PlanFragmentId id, PlanNode root, DataPartition partition, DataPartition partitionForThrift) {
         this(id, root, partition);
         this.dataPartitionForThrift = partitionForThrift;
+    }
+
+    public PlanFragment(PlanFragmentId id, PlanNode root, DataPartition partition,
+            Set<RuntimeFilterId> builderRuntimeFilterIds, Set<RuntimeFilterId> targetRuntimeFilterIds) {
+        this(id, root, partition);
+        this.builderRuntimeFilterIds = new HashSet<>(builderRuntimeFilterIds);
+        this.targetRuntimeFilterIds = new HashSet<>(targetRuntimeFilterIds);
+    }
+
+    private Supplier<Boolean> buildHasBucketShuffleJoin() {
+        return Suppliers.memoize(() -> {
+            List<HashJoinNode> hashJoinNodes = getPlanRoot().collectInCurrentFragment(HashJoinNode.class::isInstance);
+            for (HashJoinNode hashJoinNode : hashJoinNodes) {
+                if (hashJoinNode.isBucketShuffle()) {
+                    return true;
+                }
+            }
+            return false;
+        });
     }
 
     /**
@@ -229,12 +266,16 @@ public class PlanFragment extends TreeNode<PlanFragment> {
         this.hasColocatePlanNode = hasColocatePlanNode;
     }
 
-    public boolean hasColocatePlanNode() {
-        return hasColocatePlanNode;
+    public boolean hasBucketShuffleJoin() {
+        return hasBucketShuffleJoin.get();
     }
 
-    public void setDataPartition(DataPartition dataPartition) {
-        this.dataPartition = dataPartition;
+    public void setResultSinkType(TResultSinkType resultSinkType) {
+        this.resultSinkType = resultSinkType;
+    }
+
+    public boolean hasColocatePlanNode() {
+        return hasColocatePlanNode;
     }
 
     /**
@@ -248,7 +289,7 @@ public class PlanFragment extends TreeNode<PlanFragment> {
             Preconditions.checkState(sink == null);
             // we're streaming to an exchange node
             DataStreamSink streamSink = new DataStreamSink(destNode.getId());
-            streamSink.setPartition(outputPartition);
+            streamSink.setOutputPartition(outputPartition);
             streamSink.setFragment(this);
             sink = streamSink;
         } else {
@@ -264,7 +305,7 @@ public class PlanFragment extends TreeNode<PlanFragment> {
             } else {
                 // add ResultSink
                 // we're streaming to an result sink
-                sink = new ResultSink(planRoot.getId());
+                sink = new ResultSink(planRoot.getId(), resultSinkType);
             }
         }
     }
@@ -313,6 +354,15 @@ public class PlanFragment extends TreeNode<PlanFragment> {
         }
         str.append("\n");
         str.append("  PARTITION: " + dataPartition.getExplainString(explainLevel) + "\n");
+        str.append("  HAS_COLO_PLAN_NODE: " + hasColocatePlanNode + "\n");
+        if (queryCacheParam != null) {
+            str.append("\n");
+            str.append("  QUERY_CACHE:\n");
+            str.append("    CACHE_NODE_ID: " + queryCacheParam.getNodeId() + "\n");
+            str.append("    DIGEST: " + Hex.encodeHexString(queryCacheParam.getDigest()) + "\n");
+        }
+
+        str.append("\n");
         if (sink != null) {
             str.append(sink.getExplainString("  ", explainLevel) + "\n");
         }
@@ -320,6 +370,13 @@ public class PlanFragment extends TreeNode<PlanFragment> {
             str.append(planRoot.getExplainString("  ", "  ", explainLevel));
         }
         return str.toString();
+    }
+
+    public void getExplainStringMap(Map<Integer, String> planNodeMap) {
+        org.apache.doris.thrift.TExplainLevel explainLevel = org.apache.doris.thrift.TExplainLevel.NORMAL;
+        if (planRoot != null) {
+            planRoot.getExplainStringMap(explainLevel, planNodeMap);
+        }
     }
 
     /**
@@ -338,6 +395,10 @@ public class PlanFragment extends TreeNode<PlanFragment> {
 
     public PlanFragmentId getId() {
         return fragmentId;
+    }
+
+    public ExchangeNode getDestNode() {
+        return destNode;
     }
 
     public PlanFragment getDestFragment() {
@@ -427,23 +488,40 @@ public class PlanFragment extends TreeNode<PlanFragment> {
         return transferQueryStatisticsWithEveryBatch;
     }
 
-    public boolean isRightChildOfBroadcastHashJoin() {
-        return isRightChildOfBroadcastHashJoin;
-    }
-
-    public void setRightChildOfBroadcastHashJoin(boolean value) {
-        isRightChildOfBroadcastHashJoin = value;
-    }
-
     public int getFragmentSequenceNum() {
-        if (ConnectContext.get().getSessionVariable().isEnableNereidsPlanner()) {
-            return fragmentSequenceNum;
-        } else {
-            return fragmentId.asInt();
-        }
+        return fragmentSequenceNum;
     }
 
     public void setFragmentSequenceNum(int seq) {
         fragmentSequenceNum = seq;
+    }
+
+    public int getBucketNum() {
+        return bucketNum;
+    }
+
+    public void setBucketNum(int bucketNum) {
+        this.bucketNum = bucketNum;
+    }
+
+    public boolean hasNullAwareLeftAntiJoin() {
+        return planRoot.isNullAwareLeftAntiJoin();
+    }
+
+    public boolean useSerialSource(ConnectContext context) {
+        return context != null
+                && context.getSessionVariable().isIgnoreStorageDataDistribution()
+                && queryCacheParam == null
+                && !hasNullAwareLeftAntiJoin()
+                // If planRoot is not a serial operator and has serial children, we can use serial source and improve
+                // parallelism of non-serial operators.
+                // For bucket shuffle / colocate join fragment, always use serial source if the bucket scan nodes are
+                // serial.
+                && (hasSerialScanNode() || (sink instanceof DataStreamSink && !planRoot.isSerialOperator()
+                && planRoot.hasSerialChildren()));
+    }
+
+    public boolean hasSerialScanNode() {
+        return planRoot.hasSerialScanChildren();
     }
 }

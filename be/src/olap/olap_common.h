@@ -20,6 +20,8 @@
 #include <gen_cpp/Types_types.h>
 #include <netinet/in.h>
 
+#include <atomic>
+#include <charconv>
 #include <cstdint>
 #include <functional>
 #include <list>
@@ -31,10 +33,15 @@
 #include <typeinfo>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
+#include "common/config.h"
+#include "common/exception.h"
 #include "io/io_common.h"
 #include "olap/olap_define.h"
+#include "olap/rowset/rowset_fwd.h"
 #include "util/hash_util.hpp"
+#include "util/time.h"
 #include "util/uid_util.h"
 
 namespace doris {
@@ -48,7 +55,13 @@ using uint128_t = unsigned __int128;
 
 using TabletUid = UniqueId;
 
-enum CompactionType { BASE_COMPACTION = 1, CUMULATIVE_COMPACTION = 2 };
+enum CompactionType { BASE_COMPACTION = 1, CUMULATIVE_COMPACTION = 2, FULL_COMPACTION = 3 };
+
+enum DataDirType {
+    SPILL_DISK_DIR,
+    OLAP_DATA_DIR,
+    DATA_CACHE_DIR,
+};
 
 struct DataDirInfo {
     std::string path;
@@ -57,8 +70,11 @@ struct DataDirInfo {
     int64_t available = 0;     // available space, in bytes unit
     int64_t local_used_capacity = 0;
     int64_t remote_used_capacity = 0;
+    int64_t trash_used_capacity = 0;
     bool is_used = false;                                      // whether available mark
     TStorageMedium::type storage_medium = TStorageMedium::HDD; // Storage medium type: SSD|HDD
+    DataDirType data_dir_type = DataDirType::OLAP_DATA_DIR;
+    std::string metric_name;
 };
 struct PredicateFilterInfo {
     int type = 0;
@@ -73,14 +89,12 @@ struct DataDirInfoLessAvailability {
 };
 
 struct TabletInfo {
-    TabletInfo(TTabletId in_tablet_id, TSchemaHash in_schema_hash, UniqueId in_uid)
-            : tablet_id(in_tablet_id), schema_hash(in_schema_hash), tablet_uid(in_uid) {}
+    TabletInfo(TTabletId in_tablet_id, UniqueId in_uid)
+            : tablet_id(in_tablet_id), tablet_uid(in_uid) {}
 
     bool operator<(const TabletInfo& right) const {
         if (tablet_id != right.tablet_id) {
             return tablet_id < right.tablet_id;
-        } else if (schema_hash != right.schema_hash) {
-            return schema_hash < right.schema_hash;
         } else {
             return tablet_uid < right.tablet_uid;
         }
@@ -88,21 +102,19 @@ struct TabletInfo {
 
     std::string to_string() const {
         std::stringstream ss;
-        ss << tablet_id << "." << schema_hash << "." << tablet_uid.to_string();
+        ss << tablet_id << "." << tablet_uid.to_string();
         return ss.str();
     }
 
     TTabletId tablet_id;
-    TSchemaHash schema_hash;
     UniqueId tablet_uid;
 };
 
 struct TabletSize {
-    TabletSize(TTabletId in_tablet_id, TSchemaHash in_schema_hash, size_t in_tablet_size)
-            : tablet_id(in_tablet_id), schema_hash(in_schema_hash), tablet_size(in_tablet_size) {}
+    TabletSize(TTabletId in_tablet_id, size_t in_tablet_size)
+            : tablet_id(in_tablet_id), tablet_size(in_tablet_size) {}
 
     TTabletId tablet_id;
-    TSchemaHash schema_hash;
     size_t tablet_size;
 };
 
@@ -146,7 +158,10 @@ enum class FieldType {
     OLAP_FIELD_TYPE_DECIMAL128I = 33,
     OLAP_FIELD_TYPE_JSONB = 34,
     OLAP_FIELD_TYPE_VARIANT = 35,
-    OLAP_FIELD_TYPE_AGG_STATE = 36
+    OLAP_FIELD_TYPE_AGG_STATE = 36,
+    OLAP_FIELD_TYPE_DECIMAL256 = 37,
+    OLAP_FIELD_TYPE_IPV4 = 38,
+    OLAP_FIELD_TYPE_IPV6 = 39,
 };
 
 // Define all aggregation methods supported by Field
@@ -200,7 +215,10 @@ constexpr bool field_is_numeric_type(const FieldType& field_type) {
            field_type == FieldType::OLAP_FIELD_TYPE_DECIMAL32 ||
            field_type == FieldType::OLAP_FIELD_TYPE_DECIMAL64 ||
            field_type == FieldType::OLAP_FIELD_TYPE_DECIMAL128I ||
-           field_type == FieldType::OLAP_FIELD_TYPE_BOOL;
+           field_type == FieldType::OLAP_FIELD_TYPE_DECIMAL256 ||
+           field_type == FieldType::OLAP_FIELD_TYPE_BOOL ||
+           field_type == FieldType::OLAP_FIELD_TYPE_IPV4 ||
+           field_type == FieldType::OLAP_FIELD_TYPE_IPV6;
 }
 
 // <start_version_id, end_version_id>, such as <100, 110>
@@ -289,30 +307,30 @@ struct OlapReaderStatistics {
     // block_load_ns
     //      block_init_ns
     //          block_init_seek_ns
-    //          block_conditions_filtered_ns
-    //      first_read_ns
-    //          block_first_read_seek_ns
+    //          generate_row_ranges_ns
+    //      predicate_column_read_ns
+    //          predicate_column_read_seek_ns
     //      lazy_read_ns
     //          block_lazy_read_seek_ns
     int64_t block_init_ns = 0;
     int64_t block_init_seek_num = 0;
     int64_t block_init_seek_ns = 0;
-    int64_t first_read_ns = 0;
-    int64_t second_read_ns = 0;
-    int64_t block_first_read_seek_num = 0;
-    int64_t block_first_read_seek_ns = 0;
+    int64_t predicate_column_read_ns = 0;
+    int64_t non_predicate_read_ns = 0;
+    int64_t predicate_column_read_seek_num = 0;
+    int64_t predicate_column_read_seek_ns = 0;
     int64_t lazy_read_ns = 0;
     int64_t block_lazy_read_seek_num = 0;
     int64_t block_lazy_read_seek_ns = 0;
-
-    int64_t block_convert_ns = 0;
 
     int64_t raw_rows_read = 0;
 
     int64_t rows_vec_cond_filtered = 0;
     int64_t rows_short_circuit_cond_filtered = 0;
+    int64_t rows_expr_cond_filtered = 0;
     int64_t vec_cond_input_rows = 0;
     int64_t short_circuit_cond_input_rows = 0;
+    int64_t expr_cond_input_rows = 0;
     int64_t rows_vec_del_cond_filtered = 0;
     int64_t vec_cond_ns = 0;
     int64_t short_cond_ns = 0;
@@ -323,7 +341,9 @@ struct OlapReaderStatistics {
 
     int64_t rows_key_range_filtered = 0;
     int64_t rows_stats_filtered = 0;
+    int64_t rows_stats_rp_filtered = 0;
     int64_t rows_bf_filtered = 0;
+    int64_t rows_dict_filtered = 0;
     // Including the number of rows filtered out according to the Delete information in the Tablet,
     // and the number of rows filtered for marked deleted rows under the unique key model.
     // This metric is mainly used to record the number of rows filtered by the delete condition in Segment V1,
@@ -333,7 +353,10 @@ struct OlapReaderStatistics {
     int64_t rows_del_by_bitmap = 0;
     // the number of rows filtered by various column indexes.
     int64_t rows_conditions_filtered = 0;
-    int64_t block_conditions_filtered_ns = 0;
+    int64_t generate_row_ranges_ns = 0;
+    int64_t generate_row_ranges_by_bf_ns = 0;
+    int64_t generate_row_ranges_by_zonemap_ns = 0;
+    int64_t generate_row_ranges_by_dict_ns = 0;
 
     int64_t index_load_ns = 0;
 
@@ -348,10 +371,13 @@ struct OlapReaderStatistics {
     int64_t inverted_index_query_timer = 0;
     int64_t inverted_index_query_cache_hit = 0;
     int64_t inverted_index_query_cache_miss = 0;
+    int64_t inverted_index_query_null_bitmap_timer = 0;
     int64_t inverted_index_query_bitmap_copy_timer = 0;
-    int64_t inverted_index_query_bitmap_op_timer = 0;
     int64_t inverted_index_searcher_open_timer = 0;
     int64_t inverted_index_searcher_search_timer = 0;
+    int64_t inverted_index_searcher_cache_hit = 0;
+    int64_t inverted_index_searcher_cache_miss = 0;
+    int64_t inverted_index_downgrade_count = 0;
 
     int64_t output_index_result_column_timer = 0;
     // number of segment filtered by column stat when creating seg iterator
@@ -361,6 +387,34 @@ struct OlapReaderStatistics {
 
     io::FileCacheStatistics file_cache_stats;
     int64_t load_segments_timer = 0;
+
+    int64_t collect_iterator_merge_next_timer = 0;
+    int64_t collect_iterator_normal_next_timer = 0;
+    int64_t delete_bitmap_get_agg_ns = 0;
+
+    int64_t tablet_reader_init_timer_ns = 0;
+    int64_t tablet_reader_capture_rs_readers_timer_ns = 0;
+    int64_t tablet_reader_init_return_columns_timer_ns = 0;
+    int64_t tablet_reader_init_keys_param_timer_ns = 0;
+    int64_t tablet_reader_init_orderby_keys_param_timer_ns = 0;
+    int64_t tablet_reader_init_conditions_param_timer_ns = 0;
+    int64_t tablet_reader_init_delete_condition_param_timer_ns = 0;
+    int64_t block_reader_vcollect_iter_init_timer_ns = 0;
+    int64_t block_reader_rs_readers_init_timer_ns = 0;
+    int64_t block_reader_build_heap_init_timer_ns = 0;
+
+    int64_t rowset_reader_get_segment_iterators_timer_ns = 0;
+    int64_t rowset_reader_create_iterators_timer_ns = 0;
+    int64_t rowset_reader_init_iterators_timer_ns = 0;
+    int64_t rowset_reader_load_segments_timer_ns = 0;
+
+    int64_t segment_iterator_init_timer_ns = 0;
+    int64_t segment_iterator_init_return_column_iterators_timer_ns = 0;
+    int64_t segment_iterator_init_bitmap_index_iterators_timer_ns = 0;
+    int64_t segment_iterator_init_inverted_index_iterators_timer_ns = 0;
+
+    int64_t segment_create_column_readers_timer_ns = 0;
+    int64_t segment_load_index_timer_ns = 0;
 };
 
 using ColumnId = uint32_t;
@@ -378,11 +432,22 @@ struct RowsetId {
     int64_t mi = 0;
     int64_t lo = 0;
 
-    void init(const std::string& rowset_id_str) {
+    void init(std::string_view rowset_id_str) {
         // for new rowsetid its a 48 hex string
         // if the len < 48, then it is an old format rowset id
-        if (rowset_id_str.length() < 48) {
-            int64_t high = std::stol(rowset_id_str, nullptr, 10);
+        if (rowset_id_str.length() < 48) [[unlikely]] {
+            int64_t high;
+            auto [_, ec] = std::from_chars(rowset_id_str.data(),
+                                           rowset_id_str.data() + rowset_id_str.length(), high);
+            if (ec != std::errc {}) [[unlikely]] {
+                if (config::force_regenerate_rowsetid_on_start_error) {
+                    LOG(WARNING) << "failed to init rowset id: " << rowset_id_str;
+                    high = MAX_ROWSET_ID - 1;
+                } else {
+                    throw Exception(
+                            Status::FatalError("failed to init rowset id: {}", rowset_id_str));
+                }
+            }
             init(1, high, 0, 0);
         } else {
             int64_t high = 0;
@@ -401,7 +466,7 @@ struct RowsetId {
     void init(int64_t id_version, int64_t high, int64_t middle, int64_t low) {
         version = id_version;
         if (UNLIKELY(high >= MAX_ROWSET_ID)) {
-            LOG(FATAL) << "inc rowsetid is too large:" << high;
+            throw Exception(Status::FatalError("inc rowsetid is too large:{}", high));
         }
         hi = (id_version << 56) + (high & LOW_56_BITS);
         mi = middle;
@@ -445,36 +510,81 @@ struct RowsetId {
     }
 };
 
-// used for hash-struct of hash_map<RowsetId, Rowset*>.
-struct HashOfRowsetId {
-    size_t operator()(const RowsetId& rowset_id) const {
-        size_t seed = 0;
-        seed = HashUtil::hash64(&rowset_id.hi, sizeof(rowset_id.hi), seed);
-        seed = HashUtil::hash64(&rowset_id.mi, sizeof(rowset_id.mi), seed);
-        seed = HashUtil::hash64(&rowset_id.lo, sizeof(rowset_id.lo), seed);
-        return seed;
-    }
-};
+using RowsetIdUnorderedSet = std::unordered_set<RowsetId>;
 
-using RowsetIdUnorderedSet = std::unordered_set<RowsetId, HashOfRowsetId>;
+// Extract rowset id from filename, return uninitialized rowset id if filename is invalid
+inline RowsetId extract_rowset_id(std::string_view filename) {
+    RowsetId rowset_id;
+    if (filename.ends_with(".dat")) {
+        // filename format: {rowset_id}_{segment_num}.dat
+        auto end = filename.find('_');
+        if (end == std::string::npos) {
+            return rowset_id;
+        }
+        rowset_id.init(filename.substr(0, end));
+        return rowset_id;
+    }
+    if (filename.ends_with(".idx")) {
+        // filename format: {rowset_id}_{segment_num}_{index_id}.idx
+        auto end = filename.find('_');
+        if (end == std::string::npos) {
+            return rowset_id;
+        }
+        rowset_id.init(filename.substr(0, end));
+        return rowset_id;
+    }
+    return rowset_id;
+}
 
 class DeleteBitmap;
 // merge on write context
 struct MowContext {
-    MowContext(int64_t version, const RowsetIdUnorderedSet& ids, std::shared_ptr<DeleteBitmap> db)
-            : max_version(version), rowset_ids(ids), delete_bitmap(db) {}
+    MowContext(int64_t version, int64_t txnid, const RowsetIdUnorderedSet& ids,
+               std::vector<RowsetSharedPtr> rowset_ptrs, std::shared_ptr<DeleteBitmap> db)
+            : max_version(version),
+              txn_id(txnid),
+              rowset_ids(ids),
+              rowset_ptrs(std::move(rowset_ptrs)),
+              delete_bitmap(std::move(db)) {}
     int64_t max_version;
+    int64_t txn_id;
     const RowsetIdUnorderedSet& rowset_ids;
+    std::vector<RowsetSharedPtr> rowset_ptrs;
     std::shared_ptr<DeleteBitmap> delete_bitmap;
 };
 
-// used in mow partial update
-struct RidAndPos {
-    uint32_t rid;
-    // pos in block
-    size_t pos;
+// used for controll compaction
+struct VersionWithTime {
+    std::atomic<int64_t> version;
+    int64_t update_ts;
+
+    VersionWithTime() : version(0), update_ts(MonotonicMillis()) {}
+
+    void update_version_monoto(int64_t new_version) {
+        int64_t cur_version = version.load(std::memory_order_relaxed);
+        while (cur_version < new_version) {
+            if (version.compare_exchange_strong(cur_version, new_version, std::memory_order_relaxed,
+                                                std::memory_order_relaxed)) {
+                update_ts = MonotonicMillis();
+                break;
+            }
+        }
+    }
 };
 
-using PartialUpdateReadPlan = std::map<RowsetId, std::map<uint32_t, std::vector<RidAndPos>>>;
-
 } // namespace doris
+
+// This intended to be a "good" hash function.  It may change from time to time.
+template <>
+struct std::hash<doris::RowsetId> {
+    size_t operator()(const doris::RowsetId& rowset_id) const {
+        size_t seed = 0;
+        seed = doris::HashUtil::xxHash64WithSeed((const char*)&rowset_id.hi, sizeof(rowset_id.hi),
+                                                 seed);
+        seed = doris::HashUtil::xxHash64WithSeed((const char*)&rowset_id.mi, sizeof(rowset_id.mi),
+                                                 seed);
+        seed = doris::HashUtil::xxHash64WithSeed((const char*)&rowset_id.lo, sizeof(rowset_id.lo),
+                                                 seed);
+        return seed;
+    }
+};

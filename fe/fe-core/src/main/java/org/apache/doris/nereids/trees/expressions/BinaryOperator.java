@@ -19,12 +19,11 @@ package org.apache.doris.nereids.trees.expressions;
 
 import org.apache.doris.nereids.trees.expressions.shape.BinaryExpression;
 import org.apache.doris.nereids.trees.expressions.typecoercion.ExpectsInputTypes;
-import org.apache.doris.nereids.types.coercion.AbstractDataType;
+import org.apache.doris.nereids.types.DataType;
 
 import com.google.common.collect.ImmutableList;
 
 import java.util.List;
-import java.util.Objects;
 
 /**
  * Abstract for all binary operator, include binary arithmetic, compound predicate, comparison predicate.
@@ -33,20 +32,24 @@ public abstract class BinaryOperator extends Expression implements BinaryExpress
 
     protected final String symbol;
 
-    public BinaryOperator(Expression left, Expression right, String symbol) {
-        super(left, right);
+    public BinaryOperator(List<Expression> children, String symbol) {
+        this(children, symbol, false);
+    }
+
+    public BinaryOperator(List<Expression> children, String symbol, boolean inferred) {
+        super(children, inferred);
         this.symbol = symbol;
     }
 
-    public abstract AbstractDataType inputType();
+    public abstract DataType inputType();
 
     @Override
-    public List<AbstractDataType> expectedInputTypes() {
+    public List<DataType> expectedInputTypes() {
         return ImmutableList.of(inputType(), inputType());
     }
 
     @Override
-    public String toSql() {
+    public String computeToSql() {
         return "(" + left().toSql() + " " + symbol + " " + right().toSql() + ")";
     }
 
@@ -58,22 +61,5 @@ public abstract class BinaryOperator extends Expression implements BinaryExpress
     @Override
     public String shapeInfo() {
         return "(" + left().shapeInfo() + " " + symbol + " " + right().shapeInfo() + ")";
-    }
-
-    @Override
-    public int hashCode() {
-        return Objects.hash(symbol, left(), right());
-    }
-
-    @Override
-    public boolean equals(Object o) {
-        if (this == o) {
-            return true;
-        }
-        if (o == null || getClass() != o.getClass()) {
-            return false;
-        }
-        BinaryOperator other = (BinaryOperator) o;
-        return Objects.equals(left(), other.left()) && Objects.equals(right(), other.right());
     }
 }

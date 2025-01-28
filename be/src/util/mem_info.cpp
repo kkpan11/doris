@@ -20,10 +20,13 @@
 
 #include "mem_info.h"
 
+#include "gutil/strings/split.h"
+
 #ifdef __APPLE__
 #include <sys/sysctl.h>
 #endif
 
+#include <bvar/bvar.h>
 #include <fmt/format.h>
 #include <gen_cpp/Metrics_types.h>
 #include <gen_cpp/segment_v2.pb.h>
@@ -33,272 +36,131 @@
 #include <boost/algorithm/string/trim.hpp>
 #include <fstream>
 #include <unordered_map>
-#include <vector>
 
+#include "common/cgroup_memory_ctl.h"
 #include "common/config.h"
 #include "common/status.h"
-#include "gutil/strings/split.h"
-#include "olap/page_cache.h"
-#include "olap/rowset/segment_v2/inverted_index_cache.h"
-#include "olap/segment_loader.h"
-#include "runtime/memory/chunk_allocator.h"
-#include "runtime/memory/mem_tracker_limiter.h"
-#include "runtime/task_group/task_group.h"
-#include "runtime/task_group/task_group_manager.h"
+#include "runtime/memory/global_memory_arbitrator.h"
 #include "util/cgroup_util.h"
-#include "util/defer_op.h"
 #include "util/parse_util.h"
 #include "util/pretty_printer.h"
-#include "util/stopwatch.hpp"
 #include "util/string_parser.hpp"
 
 namespace doris {
 
-bool MemInfo::_s_initialized = false;
-int64_t MemInfo::_s_physical_mem = -1;
-int64_t MemInfo::_s_mem_limit = -1;
-std::string MemInfo::_s_mem_limit_str = "";
-int64_t MemInfo::_s_soft_mem_limit = -1;
-std::string MemInfo::_s_soft_mem_limit_str = "";
+static bvar::Adder<int64_t> memory_jemalloc_cache_bytes("memory_jemalloc_cache_bytes");
+static bvar::Adder<int64_t> memory_jemalloc_dirty_pages_bytes("memory_jemalloc_dirty_pages_bytes");
+static bvar::Adder<int64_t> memory_jemalloc_metadata_bytes("memory_jemalloc_metadata_bytes");
+static bvar::Adder<int64_t> memory_jemalloc_virtual_bytes("memory_jemalloc_virtual_bytes");
+static bvar::Adder<int64_t> memory_cgroup_usage_bytes("memory_cgroup_usage_bytes");
+static bvar::Adder<int64_t> memory_sys_available_bytes("memory_sys_available_bytes");
+static bvar::Adder<int64_t> memory_arbitrator_sys_available_bytes(
+        "memory_arbitrator_sys_available_bytes");
+static bvar::Adder<int64_t> memory_arbitrator_process_usage_bytes(
+        "memory_arbitrator_process_usage_bytes");
+static bvar::Adder<int64_t> memory_arbitrator_reserve_memory_bytes(
+        "memory_arbitrator_reserve_memory_bytes");
+static bvar::Adder<int64_t> memory_arbitrator_refresh_interval_growth_bytes(
+        "memory_arbitrator_refresh_interval_growth_bytes");
 
-int64_t MemInfo::_s_allocator_cache_mem = 0;
-std::string MemInfo::_s_allocator_cache_mem_str = "";
-int64_t MemInfo::_s_virtual_memory_used = 0;
-int64_t MemInfo::_s_proc_mem_no_allocator_cache = -1;
-std::atomic<int64_t> MemInfo::refresh_interval_memory_growth = 0;
+bool MemInfo::_s_initialized = false;
+std::atomic<int64_t> MemInfo::_s_physical_mem = std::numeric_limits<int64_t>::max();
+std::atomic<int64_t> MemInfo::_s_mem_limit = std::numeric_limits<int64_t>::max();
+std::atomic<int64_t> MemInfo::_s_soft_mem_limit = std::numeric_limits<int64_t>::max();
+
+std::atomic<int64_t> MemInfo::_s_allocator_cache_mem = 0;
+std::atomic<int64_t> MemInfo::_s_allocator_metadata_mem = 0;
+std::atomic<int64_t> MemInfo::_s_je_dirty_pages_mem = std::numeric_limits<int64_t>::min();
+std::atomic<int64_t> MemInfo::_s_virtual_memory_used = 0;
+
+std::atomic<int64_t> MemInfo::_s_cgroup_mem_limit = std::numeric_limits<int64_t>::max();
+std::atomic<int64_t> MemInfo::_s_cgroup_mem_usage = std::numeric_limits<int64_t>::min();
+std::atomic<bool> MemInfo::_s_cgroup_mem_refresh_state = false;
+int64_t MemInfo::_s_cgroup_mem_refresh_wait_times = 0;
 
 static std::unordered_map<std::string, int64_t> _mem_info_bytes;
-int64_t MemInfo::_s_sys_mem_available = -1;
-std::string MemInfo::_s_sys_mem_available_str = "";
-int64_t MemInfo::_s_sys_mem_available_low_water_mark = -1;
-int64_t MemInfo::_s_sys_mem_available_warning_water_mark = -1;
-int64_t MemInfo::_s_process_minor_gc_size = -1;
-int64_t MemInfo::_s_process_full_gc_size = -1;
+std::atomic<int64_t> MemInfo::_s_sys_mem_available = -1;
+int64_t MemInfo::_s_sys_mem_available_low_water_mark = std::numeric_limits<int64_t>::min();
+int64_t MemInfo::_s_sys_mem_available_warning_water_mark = std::numeric_limits<int64_t>::min();
+std::atomic<int64_t> MemInfo::_s_process_minor_gc_size = -1;
+std::atomic<int64_t> MemInfo::_s_process_full_gc_size = -1;
+std::mutex MemInfo::je_purge_dirty_pages_lock;
+std::atomic<bool> MemInfo::je_purge_dirty_pages_notify {false};
+std::mutex MemInfo::je_reset_dirty_decay_lock;
+std::atomic<bool> MemInfo::je_enable_dirty_page {true};
+std::condition_variable MemInfo::je_reset_dirty_decay_cv;
+std::atomic<bool> MemInfo::je_reset_dirty_decay_notify {false};
 
 void MemInfo::refresh_allocator_mem() {
 #if defined(ADDRESS_SANITIZER) || defined(LEAK_SANITIZER) || defined(THREAD_SANITIZER)
-    LOG(INFO) << "Memory tracking is not available with address sanitizer builds.";
 #elif defined(USE_JEMALLOC)
+    // jemalloc mallctl refer to : https://jemalloc.net/jemalloc.3.html
+    // https://www.bookstack.cn/read/aliyun-rds-core/4a0cdf677f62feb3.md
+    //  Check the Doris BE web page `http://ip:webserver_port/memory` to get the Jemalloc Profile.
+
+    // 'epoch' is a special mallctl -- it updates the statistics. Without it, all
+    // the following calls will return stale values. It increments and returns
+    // the current epoch number, which might be useful to log as a sanity check.
     uint64_t epoch = 0;
     size_t sz = sizeof(epoch);
     jemallctl("epoch", &epoch, &sz, &epoch, sz);
 
-    // https://jemalloc.net/jemalloc.3.html
-    _s_allocator_cache_mem =
-            get_je_metrics(fmt::format("stats.arenas.{}.tcache_bytes", MALLCTL_ARENAS_ALL)) +
-            get_je_metrics("stats.metadata");
-    _s_allocator_cache_mem_str =
-            PrettyPrinter::print(static_cast<uint64_t>(_s_allocator_cache_mem), TUnit::BYTES);
-    _s_virtual_memory_used = get_je_metrics("stats.mapped");
+    // Number of extents of the given type in this arena in the bucket corresponding to page size index.
+    // Large size class starts at 16384, the extents have three sizes before 16384: 4096, 8192, and 12288, so + 3
+    int64_t dirty_pages_bytes = 0;
+    for (unsigned i = 0; i < get_jemallctl_value<unsigned>("arenas.nlextents") + 3; i++) {
+        dirty_pages_bytes += get_je_all_arena_extents_metrics(i, "dirty_bytes");
+    }
+    _s_je_dirty_pages_mem.store(dirty_pages_bytes, std::memory_order_relaxed);
+
+    // Doris uses Jemalloc as default Allocator, Jemalloc Cache consists of two parts:
+    // - Thread Cache, cache a specified number of Pages in Thread Cache.
+    // - Dirty Page, memory Page that can be reused in all Arenas.
+    _s_allocator_cache_mem.store(get_je_all_arena_metrics("tcache_bytes") + dirty_pages_bytes,
+                                 std::memory_order_relaxed);
+    // Total number of bytes dedicated to metadata, which comprise base allocations used
+    // for bootstrap-sensitive allocator metadata structures.
+    _s_allocator_metadata_mem.store(get_jemallctl_value<int64_t>("stats.metadata"),
+                                    std::memory_order_relaxed);
+    _s_virtual_memory_used.store(get_jemallctl_value<int64_t>("stats.mapped"),
+                                 std::memory_order_relaxed);
 #else
-    _s_allocator_cache_mem = get_tc_metrics("tcmalloc.pageheap_free_bytes") +
-                             get_tc_metrics("tcmalloc.central_cache_free_bytes") +
-                             get_tc_metrics("tcmalloc.transfer_cache_free_bytes") +
-                             get_tc_metrics("tcmalloc.thread_cache_free_bytes");
-    _s_allocator_cache_mem_str =
-            PrettyPrinter::print(static_cast<uint64_t>(_s_allocator_cache_mem), TUnit::BYTES);
-    _s_virtual_memory_used = get_tc_metrics("generic.total_physical_bytes") +
-                             get_tc_metrics("tcmalloc.pageheap_unmapped_bytes");
+    _s_allocator_cache_mem.store(get_tc_metrics("tcmalloc.pageheap_free_bytes") +
+                                         get_tc_metrics("tcmalloc.central_cache_free_bytes") +
+                                         get_tc_metrics("tcmalloc.transfer_cache_free_bytes") +
+                                         get_tc_metrics("tcmalloc.thread_cache_free_bytes"),
+                                 std::memory_order_relaxed);
+    _s_virtual_memory_used.store(get_tc_metrics("generic.total_physical_bytes") +
+                                         get_tc_metrics("tcmalloc.pageheap_unmapped_bytes"),
+                                 std::memory_order_relaxed);
 #endif
 }
 
-void MemInfo::process_cache_gc(int64_t& freed_mem) {
-    // TODO, free more cache, and should free a certain percentage of capacity, not all.
-    int32_t min_free_size = 33554432; // 32M
-    if (ChunkAllocator::instance()->mem_consumption() > min_free_size) {
-        freed_mem += ChunkAllocator::instance()->mem_consumption();
-        ChunkAllocator::instance()->clear();
-    }
+void MemInfo::refresh_memory_bvar() {
+    memory_jemalloc_cache_bytes << MemInfo::allocator_cache_mem() -
+                                           memory_jemalloc_cache_bytes.get_value();
+    memory_jemalloc_dirty_pages_bytes
+            << MemInfo::je_dirty_pages_mem() - memory_jemalloc_dirty_pages_bytes.get_value();
+    memory_jemalloc_metadata_bytes
+            << MemInfo::allocator_metadata_mem() - memory_jemalloc_metadata_bytes.get_value();
+    memory_jemalloc_virtual_bytes << MemInfo::allocator_virtual_mem() -
+                                             memory_jemalloc_virtual_bytes.get_value();
 
-    if (StoragePageCache::instance()->get_page_cache_mem_consumption(segment_v2::DATA_PAGE) >
-        min_free_size) {
-        freed_mem +=
-                StoragePageCache::instance()->get_page_cache_mem_consumption(segment_v2::DATA_PAGE);
-        StoragePageCache::instance()->prune(segment_v2::DATA_PAGE);
-    }
+    memory_cgroup_usage_bytes << _s_cgroup_mem_usage - memory_cgroup_usage_bytes.get_value();
+    memory_sys_available_bytes << _s_sys_mem_available - memory_sys_available_bytes.get_value();
 
-    if (segment_v2::InvertedIndexSearcherCache::instance()->mem_consumption() > min_free_size) {
-        freed_mem += segment_v2::InvertedIndexSearcherCache::instance()->prune();
-    }
-
-    if (segment_v2::InvertedIndexQueryCache::instance()->mem_consumption() > min_free_size) {
-        freed_mem += segment_v2::InvertedIndexQueryCache::instance()->prune();
-    }
-
-    if (StoragePageCache::instance()->get_page_cache_mem_consumption(
-                segment_v2::PRIMARY_KEY_INDEX_PAGE) > min_free_size) {
-        freed_mem += StoragePageCache::instance()->get_page_cache_mem_consumption(
-                segment_v2::PRIMARY_KEY_INDEX_PAGE);
-        StoragePageCache::instance()->prune(segment_v2::PRIMARY_KEY_INDEX_PAGE);
-    }
-}
-
-// step1: free all cache
-// step2: free resource groups memory that enable overcommit
-// step3: free global top overcommit query, if enable query memory overcommit
-// TODO Now, the meaning is different from java minor gc + full gc, more like small gc + large gc.
-bool MemInfo::process_minor_gc() {
-    MonotonicStopWatch watch;
-    watch.start();
-    int64_t freed_mem = 0;
-    std::string vm_rss_str = PerfCounters::get_vm_rss_str();
-    std::string mem_available_str = MemInfo::sys_mem_available_str();
-
-    Defer defer {[&]() {
-        LOG(INFO) << fmt::format("Process Minor GC Free Memory {} Bytes. cost(us): {}", freed_mem,
-                                 watch.elapsed_time() / 1000);
-    }};
-
-    MemInfo::process_cache_gc(freed_mem);
-    if (freed_mem > _s_process_minor_gc_size) {
-        return true;
-    }
-
-    // TODO add freed_mem
-    SegmentLoader::instance()->prune();
-
-    freed_mem += tg_soft_memory_limit_gc(_s_process_minor_gc_size - freed_mem);
-    if (freed_mem > _s_process_minor_gc_size) {
-        return true;
-    }
-
-    VLOG_NOTICE << MemTrackerLimiter::type_detail_usage(
-            "Before free top memory overcommit query in Minor GC", MemTrackerLimiter::Type::QUERY);
-    if (config::enable_query_memory_overcommit) {
-        freed_mem += MemTrackerLimiter::free_top_overcommit_query(
-                _s_process_minor_gc_size - freed_mem, vm_rss_str, mem_available_str);
-    }
-    if (freed_mem > _s_process_minor_gc_size) {
-        return true;
-    }
-    return false;
-}
-
-// step1: free all cache
-// step2: free resource groups memory that enable overcommit
-// step3: free global top memory query
-// step4: free top overcommit load, load retries are more expensive, So cancel at the end.
-// step5: free top memory load
-bool MemInfo::process_full_gc() {
-    MonotonicStopWatch watch;
-    watch.start();
-    int64_t freed_mem = 0;
-    std::string vm_rss_str = PerfCounters::get_vm_rss_str();
-    std::string mem_available_str = MemInfo::sys_mem_available_str();
-
-    Defer defer {[&]() {
-        LOG(INFO) << fmt::format("Process Full GC Free Memory {} Bytes. cost(us): {}", freed_mem,
-                                 watch.elapsed_time() / 1000);
-    }};
-
-    MemInfo::process_cache_gc(freed_mem);
-    if (freed_mem > _s_process_full_gc_size) {
-        return true;
-    }
-
-    if (SegmentLoader::instance()->segment_cache_get_usage_ratio() > 0.1) {
-        freed_mem += SegmentLoader::instance()->segment_cache_mem_consumption();
-        LOG(INFO) << "prune all " << SegmentLoader::instance()->segment_cache_get_usage()
-                  << " entries in segment cache.";
-        SegmentLoader::instance()->prune_all();
-        if (freed_mem > _s_process_full_gc_size) {
-            return true;
-        }
-    }
-
-    freed_mem += tg_soft_memory_limit_gc(_s_process_full_gc_size - freed_mem);
-    if (freed_mem > _s_process_full_gc_size) {
-        return true;
-    }
-
-    VLOG_NOTICE << MemTrackerLimiter::type_detail_usage("Before free top memory query in Full GC",
-                                                        MemTrackerLimiter::Type::QUERY);
-    freed_mem += MemTrackerLimiter::free_top_memory_query(_s_process_full_gc_size - freed_mem,
-                                                          vm_rss_str, mem_available_str);
-    if (freed_mem > _s_process_full_gc_size) {
-        return true;
-    }
-
-    VLOG_NOTICE << MemTrackerLimiter::type_detail_usage(
-            "Before free top memory overcommit load in Full GC", MemTrackerLimiter::Type::LOAD);
-    if (config::enable_query_memory_overcommit) {
-        freed_mem += MemTrackerLimiter::free_top_overcommit_load(
-                _s_process_full_gc_size - freed_mem, vm_rss_str, mem_available_str);
-        if (freed_mem > _s_process_full_gc_size) {
-            return true;
-        }
-    }
-
-    VLOG_NOTICE << MemTrackerLimiter::type_detail_usage("Before free top memory load in Full GC",
-                                                        MemTrackerLimiter::Type::LOAD);
-    freed_mem += MemTrackerLimiter::free_top_memory_load(_s_process_full_gc_size - freed_mem,
-                                                         vm_rss_str, mem_available_str);
-    if (freed_mem > _s_process_full_gc_size) {
-        return true;
-    }
-    return false;
-}
-
-int64_t MemInfo::tg_hard_memory_limit_gc() {
-    std::vector<taskgroup::TaskGroupPtr> task_groups;
-    taskgroup::TaskGroupManager::instance()->get_resource_groups(
-            [](const taskgroup::TaskGroupPtr& task_group) {
-                return !task_group->enable_memory_overcommit();
-            },
-            &task_groups);
-
-    int64_t total_free_memory = 0;
-    for (const auto& task_group : task_groups) {
-        taskgroup::TaskGroupInfo tg_info;
-        task_group->task_group_info(&tg_info);
-        auto used = task_group->memory_used();
-        total_free_memory += MemTrackerLimiter::tg_memory_limit_gc(
-                used - tg_info.memory_limit, used, tg_info.id, tg_info.name, tg_info.memory_limit,
-                task_group->mem_tracker_limiter_pool());
-    }
-    return total_free_memory;
-}
-
-int64_t MemInfo::tg_soft_memory_limit_gc(int64_t request_free_memory) {
-    std::vector<taskgroup::TaskGroupPtr> task_groups;
-    taskgroup::TaskGroupManager::instance()->get_resource_groups(
-            [](const taskgroup::TaskGroupPtr& task_group) {
-                return task_group->enable_memory_overcommit();
-            },
-            &task_groups);
-
-    int64_t total_exceeded_memory = 0;
-    std::vector<int64_t> used_memorys;
-    std::vector<int64_t> exceeded_memorys;
-    for (const auto& task_group : task_groups) {
-        auto used_memory = task_group->memory_used();
-        auto exceeded = used_memory - task_group->memory_limit();
-        auto exceeded_memory = exceeded > 0 ? exceeded : 0;
-        total_exceeded_memory += exceeded_memory;
-        used_memorys.emplace_back(used_memory);
-        exceeded_memorys.emplace_back(exceeded_memory);
-    }
-
-    int64_t total_free_memory = 0;
-    bool gc_all_exceeded = request_free_memory >= total_exceeded_memory;
-    for (int i = 0; i < task_groups.size(); ++i) {
-        if (exceeded_memorys[i] == 0) {
-            continue;
-        }
-
-        // todo: GC according to resource group priority
-        int64_t tg_need_free_memory =
-                gc_all_exceeded ? exceeded_memorys[i]
-                                : static_cast<double>(exceeded_memorys[i]) / total_exceeded_memory *
-                                          request_free_memory /* exceeded memory as a weight */;
-        auto task_group = task_groups[i];
-        taskgroup::TaskGroupInfo tg_info;
-        task_group->task_group_info(&tg_info);
-        total_free_memory += MemTrackerLimiter::tg_memory_limit_gc(
-                tg_need_free_memory, used_memorys[i], tg_info.id, tg_info.name,
-                tg_info.memory_limit, task_group->mem_tracker_limiter_pool());
-    }
-    return total_free_memory;
+    memory_arbitrator_sys_available_bytes
+            << GlobalMemoryArbitrator::sys_mem_available() -
+                       memory_arbitrator_sys_available_bytes.get_value();
+    memory_arbitrator_process_usage_bytes
+            << GlobalMemoryArbitrator::process_memory_usage() -
+                       memory_arbitrator_process_usage_bytes.get_value();
+    memory_arbitrator_reserve_memory_bytes
+            << GlobalMemoryArbitrator::process_reserved_memory() -
+                       memory_arbitrator_reserve_memory_bytes.get_value();
+    memory_arbitrator_refresh_interval_growth_bytes
+            << GlobalMemoryArbitrator::refresh_interval_memory_growth -
+                       memory_arbitrator_refresh_interval_growth_bytes.get_value();
 }
 
 #ifndef __APPLE__
@@ -309,63 +171,145 @@ void MemInfo::refresh_proc_meminfo() {
     while (meminfo.good() && !meminfo.eof()) {
         getline(meminfo, line);
         std::vector<std::string> fields = strings::Split(line, " ", strings::SkipWhitespace());
-        if (fields.size() < 2) continue;
+        if (fields.size() < 2) {
+            continue;
+        }
         std::string key = fields[0].substr(0, fields[0].size() - 1);
 
         StringParser::ParseResult result;
-        int64_t mem_value =
+        auto mem_value =
                 StringParser::string_to_int<int64_t>(fields[1].data(), fields[1].size(), &result);
 
         if (result == StringParser::PARSE_SUCCESS) {
             if (fields.size() == 2) {
                 _mem_info_bytes[key] = mem_value;
-            } else if (fields[2].compare("kB") == 0) {
+            } else if (fields[2] == "kB") {
                 _mem_info_bytes[key] = mem_value * 1024L;
             }
         }
     }
-    if (meminfo.is_open()) meminfo.close();
+    if (meminfo.is_open()) {
+        meminfo.close();
+    }
 
+    // refresh cgroup memory
+    if (config::enable_use_cgroup_memory_info) {
+        if (_s_cgroup_mem_refresh_wait_times >= 0) {
+            int64_t cgroup_mem_limit;
+            auto status = CGroupMemoryCtl::find_cgroup_mem_limit(&cgroup_mem_limit);
+            if (!status.ok()) {
+                _s_cgroup_mem_limit = std::numeric_limits<int64_t>::max();
+                // find cgroup limit failed, wait 300s, 1000 * 100ms.
+                _s_cgroup_mem_refresh_wait_times = -3000;
+                LOG(WARNING)
+                        << "Refresh cgroup memory limit failed, refresh again after 300s, cgroup "
+                           "mem limit: "
+                        << _s_cgroup_mem_limit << ", " << status;
+            } else {
+                _s_cgroup_mem_limit = cgroup_mem_limit;
+                // wait 10s, 100 * 100ms, avoid too frequently.
+                _s_cgroup_mem_refresh_wait_times = -100;
+            }
+        } else {
+            _s_cgroup_mem_refresh_wait_times++;
+        }
+
+        // cgroup mem limit is refreshed every 10 seconds,
+        // cgroup mem usage is refreshed together with memInfo every time, which is very frequent.
+        if (_s_cgroup_mem_limit != std::numeric_limits<int64_t>::max()) {
+            int64_t cgroup_mem_usage;
+            auto status = CGroupMemoryCtl::find_cgroup_mem_usage(&cgroup_mem_usage);
+            if (!status.ok()) {
+                _s_cgroup_mem_usage = std::numeric_limits<int64_t>::min();
+                _s_cgroup_mem_refresh_state = false;
+                LOG_EVERY_N(WARNING, 500)
+                        << "Refresh cgroup memory usage failed, cgroup mem limit: "
+                        << _s_cgroup_mem_limit << ", " << status;
+            } else {
+                _s_cgroup_mem_usage = cgroup_mem_usage;
+                _s_cgroup_mem_refresh_state = true;
+            }
+        } else {
+            _s_cgroup_mem_refresh_state = false;
+        }
+    } else {
+        _s_cgroup_mem_refresh_state = false;
+    }
+
+    // 1. calculate physical_mem
+    int64_t physical_mem = -1;
+
+    physical_mem = _mem_info_bytes["MemTotal"];
+    if (_s_cgroup_mem_refresh_state) {
+        // In theory, always cgroup_mem_limit < physical_mem
+        if (physical_mem < 0) {
+            physical_mem = _s_cgroup_mem_limit;
+        } else {
+            physical_mem =
+                    std::min(physical_mem, _s_cgroup_mem_limit.load(std::memory_order_relaxed));
+        }
+    }
+
+    if (physical_mem <= 0) {
+        LOG(WARNING)
+                << "Could not determine amount of physical memory on this machine, physical_mem: "
+                << physical_mem;
+    }
+
+    // 2. if physical_mem changed, refresh mem limit and gc size.
+    if (physical_mem > 0 && _s_physical_mem.load(std::memory_order_relaxed) != physical_mem) {
+        _s_physical_mem.store(physical_mem);
+
+        bool is_percent = true;
+        _s_mem_limit.store(
+                ParseUtil::parse_mem_spec(config::mem_limit, -1, _s_physical_mem, &is_percent));
+        if (_s_mem_limit <= 0) {
+            LOG(WARNING) << "Failed to parse mem limit from '" + config::mem_limit + "'.";
+        }
+        if (_s_mem_limit > _s_physical_mem) {
+            LOG(WARNING) << "Memory limit " << PrettyPrinter::print(_s_mem_limit, TUnit::BYTES)
+                         << " exceeds physical memory of "
+                         << PrettyPrinter::print(_s_physical_mem, TUnit::BYTES)
+                         << ". Using physical memory instead";
+            _s_mem_limit.store(_s_physical_mem);
+        }
+        _s_soft_mem_limit.store(int64_t(_s_mem_limit * config::soft_mem_limit_frac));
+
+        _s_process_minor_gc_size.store(ParseUtil::parse_mem_spec(config::process_minor_gc_size, -1,
+                                                                 _s_mem_limit, &is_percent));
+        _s_process_full_gc_size.store(ParseUtil::parse_mem_spec(config::process_full_gc_size, -1,
+                                                                _s_mem_limit, &is_percent));
+    }
+
+    // 3. refresh process available memory
+    int64_t mem_available = -1;
     if (_mem_info_bytes.find("MemAvailable") != _mem_info_bytes.end()) {
-        _s_sys_mem_available = _mem_info_bytes["MemAvailable"];
-        _s_sys_mem_available_str = PrettyPrinter::print(_s_sys_mem_available, TUnit::BYTES);
+        mem_available = _mem_info_bytes["MemAvailable"];
+    }
+    if (_s_cgroup_mem_refresh_state) {
+        // Note, CgroupV2 MemAvailable is usually a little smaller than Process MemAvailable.
+        // Process `MemAvailable = MemFree - LowWaterMark + (PageCache - min(PageCache / 2, LowWaterMark))`,
+        // from `MemAvailable` in `/proc/meminfo`, calculated by OS.
+        // CgroupV2 `MemAvailable = cgroup_mem_limit - cgroup_mem_usage`,
+        // `cgroup_mem_usage = memory.current - inactive_file - slab_reclaimable`, in fact,
+        // there seems to be some memory that can be reused in `cgroup_mem_usage`.
+        if (mem_available < 0) {
+            mem_available = _s_cgroup_mem_limit - _s_cgroup_mem_usage;
+        } else {
+            mem_available = std::min(mem_available, _s_cgroup_mem_limit - _s_cgroup_mem_usage);
+        }
+    }
+    if (mem_available < 0) {
+        LOG(WARNING) << "Failed to get available memory, set MAX_INT.";
+        mem_available = std::numeric_limits<int64_t>::max();
+    }
+    if (_s_sys_mem_available.load(std::memory_order_relaxed) != mem_available) {
+        _s_sys_mem_available.store(mem_available);
     }
 }
 
 void MemInfo::init() {
     refresh_proc_meminfo();
-    _s_physical_mem = _mem_info_bytes["MemTotal"];
-
-    int64_t cgroup_mem_limit = 0;
-    Status status = CGroupUtil::find_cgroup_mem_limit(&cgroup_mem_limit);
-    if (status.ok() && cgroup_mem_limit > 0) {
-        _s_physical_mem = std::min(_s_physical_mem, cgroup_mem_limit);
-    }
-
-    if (_s_physical_mem == -1) {
-        LOG(WARNING) << "Could not determine amount of physical memory on this machine.";
-    }
-
-    bool is_percent = true;
-    _s_mem_limit = ParseUtil::parse_mem_spec(config::mem_limit, -1, _s_physical_mem, &is_percent);
-    if (_s_mem_limit <= 0) {
-        LOG(WARNING) << "Failed to parse mem limit from '" + config::mem_limit + "'.";
-    }
-    if (_s_mem_limit > _s_physical_mem) {
-        LOG(WARNING) << "Memory limit " << PrettyPrinter::print(_s_mem_limit, TUnit::BYTES)
-                     << " exceeds physical memory of "
-                     << PrettyPrinter::print(_s_physical_mem, TUnit::BYTES)
-                     << ". Using physical memory instead";
-        _s_mem_limit = _s_physical_mem;
-    }
-    _s_mem_limit_str = PrettyPrinter::print(_s_mem_limit, TUnit::BYTES);
-    _s_soft_mem_limit = _s_mem_limit * config::soft_mem_limit_frac;
-    _s_soft_mem_limit_str = PrettyPrinter::print(_s_soft_mem_limit, TUnit::BYTES);
-
-    _s_process_minor_gc_size =
-            ParseUtil::parse_mem_spec(config::process_minor_gc_size, -1, _s_mem_limit, &is_percent);
-    _s_process_full_gc_size =
-            ParseUtil::parse_mem_spec(config::process_full_gc_size, -1, _s_mem_limit, &is_percent);
 
     std::string line;
     int64_t _s_vm_min_free_kbytes = 0;
@@ -374,13 +318,15 @@ void MemInfo::init() {
         getline(vminfo, line);
         boost::algorithm::trim(line);
         StringParser::ParseResult result;
-        int64_t mem_value = StringParser::string_to_int<int64_t>(line.data(), line.size(), &result);
+        auto mem_value = StringParser::string_to_int<int64_t>(line.data(), line.size(), &result);
 
         if (result == StringParser::PARSE_SUCCESS) {
             _s_vm_min_free_kbytes = mem_value * 1024L;
         }
     }
-    if (vminfo.is_open()) vminfo.close();
+    if (vminfo.is_open()) {
+        vminfo.close();
+    }
 
     // Redhat 4.x OS, `/proc/meminfo` has no `MemAvailable`.
     if (_mem_info_bytes.find("MemAvailable") != _mem_info_bytes.end()) {
@@ -390,16 +336,29 @@ void MemInfo::init() {
         // https://serverfault.com/questions/940196/why-is-memavailable-a-lot-less-than-memfreebufferscached
         // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=34e431b0ae398fc54ea69ff85ec700722c9da773
         //
-        // available_low_water_mark = p1 - p2
-        // p1: upper sys_mem_available_low_water_mark, avoid wasting too much memory.
-        // p2: vm/min_free_kbytes is usually 0.4% - 5% of the total memory, some cloud machines vm/min_free_kbytes is 5%,
-        //     in order to avoid wasting too much memory, available_low_water_mark minus 1% at most.
-        int64_t p1 = std::min<int64_t>(
-                std::min<int64_t>(_s_physical_mem - _s_mem_limit, _s_physical_mem * 0.1),
-                config::max_sys_mem_available_low_water_mark_bytes);
-        int64_t p2 = std::max<int64_t>(_s_vm_min_free_kbytes - _s_physical_mem * 0.01, 0);
-        _s_sys_mem_available_low_water_mark = std::max<int64_t>(p1 - p2, 0);
-        _s_sys_mem_available_warning_water_mark = _s_sys_mem_available_low_water_mark + p1;
+        // smaller sys_mem_available_low_water_mark can avoid wasting too much memory.
+        _s_sys_mem_available_low_water_mark =
+                config::max_sys_mem_available_low_water_mark_bytes != -1
+                        ? config::max_sys_mem_available_low_water_mark_bytes
+                        : std::min<int64_t>(_s_physical_mem - _s_mem_limit,
+                                            int64_t(_s_physical_mem * 0.05));
+        _s_sys_mem_available_warning_water_mark = _s_sys_mem_available_low_water_mark * 2;
+    }
+
+    std::ifstream sys_transparent_hugepage("/sys/kernel/mm/transparent_hugepage/enabled",
+                                           std::ios::in);
+    std::string hugepage_enable;
+    // If file not exist, getline returns an empty string.
+    getline(sys_transparent_hugepage, hugepage_enable);
+    if (sys_transparent_hugepage.is_open()) {
+        sys_transparent_hugepage.close();
+    }
+    if (hugepage_enable == "[always] madvise never") {
+        std::cout << "[WARNING!] /sys/kernel/mm/transparent_hugepage/enabled: " << hugepage_enable
+                  << ", Doris not recommend turning on THP, which may cause the BE process to use "
+                     "more memory and cannot be freed in time. Turn off THP: `echo madvise | sudo "
+                     "tee /sys/kernel/mm/transparent_hugepage/enabled`"
+                  << std::endl;
     }
 
     // Expect vm overcommit memory value to be 1, system will no longer throw bad_alloc, memory alloc are always accepted,
@@ -408,16 +367,20 @@ void MemInfo::init() {
     std::ifstream sys_vm("/proc/sys/vm/overcommit_memory", std::ios::in);
     std::string vm_overcommit;
     getline(sys_vm, vm_overcommit);
-    if (sys_vm.is_open()) sys_vm.close();
-    if (std::stoi(vm_overcommit) == 2) {
-        std::cout << "/proc/sys/vm/overcommit_memory: " << vm_overcommit
+    if (sys_vm.is_open()) {
+        sys_vm.close();
+    }
+    if (!vm_overcommit.empty() && std::stoi(vm_overcommit) == 2) {
+        std::cout << "[WARNING!] /proc/sys/vm/overcommit_memory: " << vm_overcommit
                   << ", expect is 1, memory limit check is handed over to Doris Allocator, "
                      "otherwise BE may crash even with remaining memory"
                   << std::endl;
     }
 
-    LOG(INFO) << "Physical Memory: " << PrettyPrinter::print(_s_physical_mem, TUnit::BYTES)
-              << ", Mem Limit: " << _s_mem_limit_str
+    LOG(INFO) << "Physical Memory: " << _mem_info_bytes["MemTotal"]
+              << ", BE Available Physical Memory(consider cgroup): "
+              << PrettyPrinter::print(_s_physical_mem, TUnit::BYTES) << ", Mem Limit: "
+              << PrettyPrinter::print(_s_mem_limit.load(std::memory_order_relaxed), TUnit::BYTES)
               << ", origin config value: " << config::mem_limit
               << ", System Mem Available Min Reserve: "
               << PrettyPrinter::print(_s_sys_mem_available_low_water_mark, TUnit::BYTES)
@@ -438,9 +401,7 @@ void MemInfo::init() {
 
     bool is_percent = true;
     _s_mem_limit = ParseUtil::parse_mem_spec(config::mem_limit, -1, _s_physical_mem, &is_percent);
-    _s_mem_limit_str = PrettyPrinter::print(_s_mem_limit, TUnit::BYTES);
-    _s_soft_mem_limit = _s_mem_limit * config::soft_mem_limit_frac;
-    _s_soft_mem_limit_str = PrettyPrinter::print(_s_soft_mem_limit, TUnit::BYTES);
+    _s_soft_mem_limit = static_cast<int64_t>(_s_mem_limit * config::soft_mem_limit_frac);
 
     LOG(INFO) << "Physical Memory: " << PrettyPrinter::print(_s_physical_mem, TUnit::BYTES);
     _s_initialized = true;
@@ -449,12 +410,11 @@ void MemInfo::init() {
 
 std::string MemInfo::debug_string() {
     DCHECK(_s_initialized);
-    CGroupUtil util;
     std::stringstream stream;
     stream << "Physical Memory: " << PrettyPrinter::print(_s_physical_mem, TUnit::BYTES)
            << std::endl;
     stream << "Memory Limt: " << PrettyPrinter::print(_s_mem_limit, TUnit::BYTES) << std::endl;
-    stream << "CGroup Info: " << util.debug_string() << std::endl;
+    stream << "CGroup Info: " << doris::CGroupMemoryCtl::debug_string() << std::endl;
     return stream.str();
 }
 

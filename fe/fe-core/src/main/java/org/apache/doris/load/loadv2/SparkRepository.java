@@ -54,6 +54,7 @@ import java.util.Optional;
  *   * __archive_3_2_0/
  *     * ...
  */
+@Deprecated
 public class SparkRepository {
     private static final Logger LOG = LogManager.getLogger(SparkRepository.class);
 
@@ -166,7 +167,7 @@ public class SparkRepository {
         try {
             String remoteArchivePath = getRemoteArchivePath(currentDppVersion);
             if (isReplace) {
-                BrokerUtil.deletePath(remoteArchivePath, brokerDesc);
+                BrokerUtil.deletePathWithBroker(remoteArchivePath, brokerDesc);
                 currentArchive.libraries.clear();
             }
             String srcFilePath = null;
@@ -252,11 +253,13 @@ public class SparkRepository {
 
     public String getMd5String(String filePath) throws LoadException {
         File file = new File(filePath);
-        String md5sum = null;
-        try {
-            md5sum = DigestUtils.md5Hex(new FileInputStream(file));
+        String md5sum;
+        try (FileInputStream fis = new FileInputStream(file)) {
+            md5sum = DigestUtils.md5Hex(fis);
             Preconditions.checkNotNull(md5sum);
-            LOG.debug("get md5sum from file {}, md5sum={}", filePath, md5sum);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("get md5sum from file {}, md5sum={}", filePath, md5sum);
+            }
             return md5sum;
         } catch (FileNotFoundException e) {
             throw new LoadException("file " + filePath + " does not exist");

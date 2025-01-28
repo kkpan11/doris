@@ -25,6 +25,7 @@ import org.apache.doris.common.FeNameFormat;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.persist.gson.GsonUtils;
+import org.apache.doris.qe.ConnectContext;
 
 import com.google.common.base.Strings;
 import com.google.gson.annotations.SerializedName;
@@ -34,6 +35,7 @@ import org.apache.logging.log4j.Logger;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
+import java.util.List;
 import java.util.Objects;
 
 public class EncryptKeyName implements Writable {
@@ -52,6 +54,19 @@ public class EncryptKeyName implements Writable {
         }
     }
 
+    /**
+     * EncryptKeyName
+     * @param parts like [db1,keyName] or [keyName]
+     */
+    public EncryptKeyName(List<String> parts) {
+        int size = parts.size();
+        keyName = parts.get(size - 1);
+        keyName = keyName.toLowerCase();
+        if (size >= 2) {
+            db = parts.get(size - 2);
+        }
+    }
+
     public EncryptKeyName(String keyName) {
         this.db = null;
         this.keyName = keyName.toLowerCase();
@@ -64,11 +79,16 @@ public class EncryptKeyName implements Writable {
             if (Strings.isNullOrEmpty(db)) {
                 ErrorReport.reportAnalysisException(ErrorCode.ERR_NO_DB_ERROR);
             }
-        } else {
-            if (Strings.isNullOrEmpty(analyzer.getClusterName())) {
-                ErrorReport.reportAnalysisException(ErrorCode.ERR_CLUSTER_NAME_NULL);
+        }
+    }
+
+    public void analyze(ConnectContext ctx) throws AnalysisException {
+        FeNameFormat.checkCommonName("EncryptKey", keyName);
+        if (db == null) {
+            db = ctx.getDatabase();
+            if (Strings.isNullOrEmpty(db)) {
+                ErrorReport.reportAnalysisException(ErrorCode.ERR_NO_DB_ERROR);
             }
-            db = ClusterNamespace.getFullName(analyzer.getClusterName(), db);
         }
     }
 

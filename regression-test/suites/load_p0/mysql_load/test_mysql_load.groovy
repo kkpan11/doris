@@ -36,7 +36,9 @@ suite("test_mysql_load", "p0") {
             `v9` date REPLACE_IF_NOT_NULL NULL,
             `v10` char(10) REPLACE_IF_NOT_NULL NULL,
             `v11` varchar(6) REPLACE_IF_NOT_NULL NULL,
-            `v12` decimal(27, 9) REPLACE_IF_NOT_NULL NULL
+            `v12` decimal(27, 9) REPLACE_IF_NOT_NULL NULL,
+            INDEX idx_k1 (`k1`) USING INVERTED,
+            INDEX idx_k2 (`k2`) USING INVERTED
         ) ENGINE=OLAP
         AGGREGATE KEY(`k1`, `k2`)
         COMMENT 'OLAP'
@@ -114,7 +116,7 @@ suite("test_mysql_load", "p0") {
     """
 
     sql "sync"
-    rowCount = sql "select count(1) from ${tableName}"
+    def rowCount = sql "select count(1) from ${tableName}"
     assertEquals(3, rowCount[0][0])
 
 
@@ -153,7 +155,8 @@ suite("test_mysql_load", "p0") {
         (col)
         SET (k1=year(col),k2=month(col),k3=month(col),k4=day(col),k5=7.7,k6="a",k10=date(col),k11=FROM_UNIXTIME(2019,"%Y-%m-%dT%H:%i:%s"),k7="k7",k8=month(col),k9=day(col));
     """
-
+    
+    sql "sync"
     order_qt_sql1 " SELECT * FROM ${tableName2}"
 
 }

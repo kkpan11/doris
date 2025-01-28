@@ -18,15 +18,23 @@
 package org.apache.doris.nereids.trees.plans.physical;
 
 import org.apache.doris.nereids.memo.GroupExpression;
+import org.apache.doris.nereids.properties.DataTrait;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.properties.PhysicalProperties;
+import org.apache.doris.nereids.trees.expressions.NamedExpression;
+import org.apache.doris.nereids.trees.expressions.Slot;
+import org.apache.doris.nereids.trees.expressions.SlotReference;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.PlanType;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.nereids.util.Utils;
 import org.apache.doris.statistics.Statistics;
 
+import com.google.common.collect.ImmutableSet;
+
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -35,24 +43,30 @@ import java.util.Optional;
 public class PhysicalIntersect extends PhysicalSetOperation {
 
     public PhysicalIntersect(Qualifier qualifier,
-                          LogicalProperties logicalProperties,
-                          List<Plan> inputs) {
-        super(PlanType.PHYSICAL_INTERSECT, qualifier, logicalProperties, inputs);
+            List<NamedExpression> outputs,
+            List<List<SlotReference>> childrenOutputs,
+            LogicalProperties logicalProperties,
+            List<Plan> children) {
+        super(PlanType.PHYSICAL_INTERSECT, qualifier, outputs, childrenOutputs, logicalProperties, children);
     }
 
     public PhysicalIntersect(Qualifier qualifier,
-                             Optional<GroupExpression> groupExpression,
-                             LogicalProperties logicalProperties,
-                             List<Plan> inputs) {
-        super(PlanType.PHYSICAL_INTERSECT, qualifier, groupExpression, logicalProperties, inputs);
+            List<NamedExpression> outputs,
+            List<List<SlotReference>> childrenOutputs,
+            Optional<GroupExpression> groupExpression,
+            LogicalProperties logicalProperties,
+            List<Plan> children) {
+        super(PlanType.PHYSICAL_INTERSECT, qualifier, outputs, childrenOutputs,
+                groupExpression, logicalProperties, children);
     }
 
-    public PhysicalIntersect(Qualifier qualifier,
-                             Optional<GroupExpression> groupExpression, LogicalProperties logicalProperties,
-                             PhysicalProperties physicalProperties, Statistics statistics,
-                             List<Plan> inputs) {
-        super(PlanType.PHYSICAL_INTERSECT, qualifier,
-                groupExpression, logicalProperties, physicalProperties, statistics, inputs);
+    public PhysicalIntersect(Qualifier qualifier, List<NamedExpression> outputs,
+            List<List<SlotReference>> childrenOutputs,
+            Optional<GroupExpression> groupExpression, LogicalProperties logicalProperties,
+            PhysicalProperties physicalProperties, Statistics statistics,
+            List<Plan> children) {
+        super(PlanType.PHYSICAL_INTERSECT, qualifier, outputs, childrenOutputs,
+                groupExpression, logicalProperties, physicalProperties, statistics, children);
     }
 
     @Override
@@ -64,30 +78,92 @@ public class PhysicalIntersect extends PhysicalSetOperation {
     public String toString() {
         return Utils.toSqlString("PhysicalIntersect",
                 "qualifier", qualifier,
+                "outputs", outputs,
+                "regularChildrenOutputs", regularChildrenOutputs,
                 "stats", statistics);
     }
 
     @Override
     public PhysicalIntersect withChildren(List<Plan> children) {
-        return new PhysicalIntersect(qualifier, getLogicalProperties(), children);
+        return new PhysicalIntersect(qualifier, outputs, regularChildrenOutputs, getLogicalProperties(), children);
     }
 
     @Override
     public PhysicalIntersect withGroupExpression(
             Optional<GroupExpression> groupExpression) {
-        return new PhysicalIntersect(qualifier, groupExpression, getLogicalProperties(), children);
+        return new PhysicalIntersect(qualifier, outputs, regularChildrenOutputs,
+                groupExpression, getLogicalProperties(), children);
     }
 
     @Override
-    public PhysicalIntersect withLogicalProperties(
-            Optional<LogicalProperties> logicalProperties) {
-        return new PhysicalIntersect(qualifier, Optional.empty(), logicalProperties.get(), children);
+    public Plan withGroupExprLogicalPropChildren(Optional<GroupExpression> groupExpression,
+            Optional<LogicalProperties> logicalProperties, List<Plan> children) {
+        return new PhysicalIntersect(qualifier, outputs, regularChildrenOutputs,
+                groupExpression, logicalProperties.get(), children);
     }
 
     @Override
     public PhysicalIntersect withPhysicalPropertiesAndStats(
             PhysicalProperties physicalProperties, Statistics statistics) {
-        return new PhysicalIntersect(qualifier,
+        return new PhysicalIntersect(qualifier, outputs, regularChildrenOutputs,
                 Optional.empty(), getLogicalProperties(), physicalProperties, statistics, children);
+    }
+
+    @Override
+    public PhysicalIntersect resetLogicalProperties() {
+        return new PhysicalIntersect(qualifier, outputs, regularChildrenOutputs,
+                Optional.empty(), null, physicalProperties, statistics, children);
+    }
+
+    Map<Slot, Slot> constructReplaceMap() {
+        Map<Slot, Slot> replaceMap = new HashMap<>();
+        for (int i = 0; i < children.size(); i++) {
+            List<? extends Slot> originOutputs = this.regularChildrenOutputs.size() == children.size()
+                    ? child(i).getOutput()
+                    : regularChildrenOutputs.get(i);
+            for (int j = 0; j < originOutputs.size(); j++) {
+                replaceMap.put(originOutputs.get(j), getOutput().get(j));
+            }
+        }
+        return replaceMap;
+    }
+
+    @Override
+    public void computeUnique(DataTrait.Builder builder) {
+        for (Plan child : children) {
+            builder.addUniqueSlot(
+                    child.getLogicalProperties().getTrait());
+        }
+        builder.replaceUniqueBy(constructReplaceMap());
+        if (qualifier == Qualifier.DISTINCT) {
+            builder.addUniqueSlot(ImmutableSet.copyOf(getOutput()));
+        }
+    }
+
+    @Override
+    public void computeUniform(DataTrait.Builder builder) {
+        for (Plan child : children) {
+            builder.addUniformSlot(
+                    child.getLogicalProperties().getTrait());
+        }
+        builder.replaceUniformBy(constructReplaceMap());
+    }
+
+    @Override
+    public void computeEqualSet(DataTrait.Builder builder) {
+        for (Plan child : children) {
+            builder.addEqualSet(
+                    child.getLogicalProperties().getTrait());
+        }
+        builder.replaceEqualSetBy(constructReplaceMap());
+    }
+
+    @Override
+    public void computeFd(DataTrait.Builder builder) {
+        for (Plan child : children) {
+            builder.addFuncDepsDG(
+                    child.getLogicalProperties().getTrait());
+        }
+        builder.replaceFuncDepsBy(constructReplaceMap());
     }
 }

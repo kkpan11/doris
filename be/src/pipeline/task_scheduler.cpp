@@ -23,349 +23,180 @@
 #include <glog/logging.h>
 #include <sched.h>
 
-#include <algorithm>
 // IWYU pragma: no_include <bits/chrono.h>
 #include <chrono> // IWYU pragma: keep
 #include <functional>
 #include <ostream>
 #include <string>
 #include <thread>
+#include <utility>
 
-#include "common/signal_handler.h"
+#include "common/logging.h"
 #include "pipeline/pipeline_task.h"
-#include "pipeline/task_queue.h"
 #include "pipeline_fragment_context.h"
+#include "runtime/exec_env.h"
 #include "runtime/query_context.h"
-#include "util/sse_util.hpp"
 #include "util/thread.h"
 #include "util/threadpool.h"
+#include "util/time.h"
 #include "util/uid_util.h"
 #include "vec/runtime/vdatetime_value.h"
 
 namespace doris::pipeline {
-
-BlockedTaskScheduler::BlockedTaskScheduler(std::shared_ptr<TaskQueue> task_queue)
-        : _task_queue(std::move(task_queue)), _started(false), _shutdown(false) {}
-
-Status BlockedTaskScheduler::start() {
-    LOG(INFO) << "BlockedTaskScheduler start";
-    RETURN_IF_ERROR(Thread::create(
-            "BlockedTaskScheduler", "schedule_blocked_pipeline", [this]() { this->_schedule(); },
-            &_thread));
-    while (!this->_started.load()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
-    LOG(INFO) << "BlockedTaskScheduler started";
-    return Status::OK();
-}
-
-void BlockedTaskScheduler::shutdown() {
-    LOG(INFO) << "Start shutdown BlockedTaskScheduler";
-    if (!this->_shutdown) {
-        this->_shutdown = true;
-        if (_thread) {
-            _task_cond.notify_one();
-            _thread->join();
-        }
-    }
-}
-
-Status BlockedTaskScheduler::add_blocked_task(PipelineTask* task) {
-    if (this->_shutdown) {
-        return Status::InternalError("BlockedTaskScheduler shutdown");
-    }
-    std::unique_lock<std::mutex> lock(_task_mutex);
-    _blocked_tasks.push_back(task);
-    _task_cond.notify_one();
-    return Status::OK();
-}
-
-void BlockedTaskScheduler::_schedule() {
-    _started.store(true);
-    std::list<PipelineTask*> local_blocked_tasks;
-    int empty_times = 0;
-    std::vector<PipelineTask*> ready_tasks;
-
-    while (!_shutdown) {
-        {
-            std::unique_lock<std::mutex> lock(this->_task_mutex);
-            local_blocked_tasks.splice(local_blocked_tasks.end(), _blocked_tasks);
-            if (local_blocked_tasks.empty()) {
-                while (!_shutdown.load() && _blocked_tasks.empty()) {
-                    _task_cond.wait_for(lock, std::chrono::milliseconds(10));
-                }
-
-                if (_shutdown.load()) {
-                    break;
-                }
-
-                DCHECK(!_blocked_tasks.empty());
-                local_blocked_tasks.splice(local_blocked_tasks.end(), _blocked_tasks);
-            }
-        }
-
-        auto iter = local_blocked_tasks.begin();
-        vectorized::VecDateTimeValue now = vectorized::VecDateTimeValue::local_time();
-        while (iter != local_blocked_tasks.end()) {
-            auto* task = *iter;
-            auto state = task->get_state();
-            if (state == PipelineTaskState::PENDING_FINISH) {
-                // should cancel or should finish
-                if (task->is_pending_finish()) {
-                    iter++;
-                } else {
-                    _make_task_run(local_blocked_tasks, iter, ready_tasks,
-                                   PipelineTaskState::PENDING_FINISH);
-                }
-            } else if (task->fragment_context()->is_canceled()) {
-                std::string task_ds;
-#ifndef NDEBUG
-                task_ds = task->debug_string();
-#endif
-                LOG(WARNING) << "Canceled, query_id=" << print_id(task->query_context()->query_id)
-                             << ", instance_id="
-                             << print_id(task->fragment_context()->get_fragment_instance_id())
-                             << (task_ds.empty() ? "" : task_ds);
-
-                if (task->is_pending_finish()) {
-                    task->set_state(PipelineTaskState::PENDING_FINISH);
-                    iter++;
-                } else {
-                    _make_task_run(local_blocked_tasks, iter, ready_tasks);
-                }
-            } else if (task->query_context()->is_timeout(now)) {
-                LOG(WARNING) << "Timeout, query_id=" << print_id(task->query_context()->query_id)
-                             << ", instance_id="
-                             << print_id(task->fragment_context()->get_fragment_instance_id());
-
-                task->fragment_context()->cancel(PPlanFragmentCancelReason::TIMEOUT);
-
-                if (task->is_pending_finish()) {
-                    task->set_state(PipelineTaskState::PENDING_FINISH);
-                    iter++;
-                } else {
-                    _make_task_run(local_blocked_tasks, iter, ready_tasks);
-                }
-            } else if (state == PipelineTaskState::BLOCKED_FOR_DEPENDENCY) {
-                if (task->has_dependency()) {
-                    iter++;
-                } else {
-                    _make_task_run(local_blocked_tasks, iter, ready_tasks);
-                }
-            } else if (state == PipelineTaskState::BLOCKED_FOR_SOURCE) {
-                if (task->source_can_read()) {
-                    _make_task_run(local_blocked_tasks, iter, ready_tasks);
-                } else {
-                    iter++;
-                }
-            } else if (state == PipelineTaskState::BLOCKED_FOR_RF) {
-                if (task->runtime_filters_are_ready_or_timeout()) {
-                    _make_task_run(local_blocked_tasks, iter, ready_tasks);
-                } else {
-                    iter++;
-                }
-            } else if (state == PipelineTaskState::BLOCKED_FOR_SINK) {
-                if (task->sink_can_write()) {
-                    _make_task_run(local_blocked_tasks, iter, ready_tasks);
-                } else {
-                    iter++;
-                }
-            } else {
-                // TODO: DCHECK the state
-                _make_task_run(local_blocked_tasks, iter, ready_tasks);
-            }
-        }
-
-        if (ready_tasks.empty()) {
-            empty_times += 1;
-        } else {
-            empty_times = 0;
-            for (auto& task : ready_tasks) {
-                task->stop_schedule_watcher();
-                _task_queue->push_back(task);
-            }
-            ready_tasks.clear();
-        }
-
-        if (empty_times != 0 && (empty_times & (EMPTY_TIMES_TO_YIELD - 1)) == 0) {
-#ifdef __x86_64__
-            _mm_pause();
-#else
-            sched_yield();
-#endif
-        }
-        if (empty_times == EMPTY_TIMES_TO_YIELD * 10) {
-            empty_times = 0;
-            sched_yield();
-        }
-    }
-    LOG(INFO) << "BlockedTaskScheduler schedule thread stop";
-}
-
-void BlockedTaskScheduler::_make_task_run(std::list<PipelineTask*>& local_tasks,
-                                          std::list<PipelineTask*>::iterator& task_itr,
-                                          std::vector<PipelineTask*>& ready_tasks,
-                                          PipelineTaskState t_state) {
-    auto task = *task_itr;
-    task->start_schedule_watcher();
-    task->set_state(t_state);
-    local_tasks.erase(task_itr++);
-    ready_tasks.emplace_back(task);
-}
-
-/////////////////////////  TaskScheduler  ///////////////////////////////////////////////////////////////////////////
-
+#include "common/compile_check_begin.h"
 TaskScheduler::~TaskScheduler() {
-    shutdown();
+    stop();
+    LOG(INFO) << "Task scheduler " << _name << " shutdown";
 }
 
 Status TaskScheduler::start() {
-    int cores = _task_queue->cores();
-    // Must be mutil number of cpu cores
-    ThreadPoolBuilder("TaskSchedulerThreadPool")
-            .set_min_threads(cores)
-            .set_max_threads(cores)
-            .set_max_queue_size(0)
-            .build(&_fix_thread_pool);
-    _markers.reserve(cores);
-    for (size_t i = 0; i < cores; ++i) {
-        _markers.push_back(std::make_unique<std::atomic<bool>>(true));
-        RETURN_IF_ERROR(
-                _fix_thread_pool->submit_func(std::bind(&TaskScheduler::_do_work, this, i)));
+    int cores = _task_queue.cores();
+    RETURN_IF_ERROR(ThreadPoolBuilder(_name)
+                            .set_min_threads(cores)
+                            .set_max_threads(cores)
+                            .set_max_queue_size(0)
+                            .set_cgroup_cpu_ctl(_cgroup_cpu_ctl)
+                            .build(&_fix_thread_pool));
+    LOG_INFO("TaskScheduler set cores").tag("size", cores);
+    _markers.resize(cores, true);
+    for (int i = 0; i < cores; ++i) {
+        RETURN_IF_ERROR(_fix_thread_pool->submit_func([this, i] { _do_work(i); }));
     }
-    return _blocked_task_scheduler->start();
+    return Status::OK();
 }
 
 Status TaskScheduler::schedule_task(PipelineTask* task) {
-    return _task_queue->push_back(task);
-    // TODO control num of task
+    return _task_queue.push_back(task);
 }
 
-void TaskScheduler::_do_work(size_t index) {
-    const auto& marker = _markers[index];
-    while (*marker) {
-        auto* task = _task_queue->take(index);
+// after _close_task, task maybe destructed.
+void _close_task(PipelineTask* task, Status exec_status) {
+    // Has to attach memory tracker here, because the close task will also release some memory.
+    // Should count the memory to the query or the query's memory will not decrease when part of
+    // task finished.
+    SCOPED_ATTACH_TASK(task->runtime_state());
+    if (task->is_finalized()) {
+        task->set_running(false);
+        return;
+    }
+    // close_a_pipeline may delete fragment context and will core in some defer
+    // code, because the defer code will access fragment context it self.
+    auto lock_for_context = task->fragment_context()->shared_from_this();
+    // is_pending_finish does not check status, so has to check status in close API.
+    // For example, in async writer, the writer may failed during dealing with eos_block
+    // but it does not return error status. Has to check the error status in close API.
+    // We have already refactor all source and sink api, the close API does not need waiting
+    // for pending finish now. So that could call close directly.
+    Status status = task->close(exec_status);
+    if (!status.ok()) {
+        task->fragment_context()->cancel(status);
+    }
+    task->finalize();
+    task->set_running(false);
+    task->fragment_context()->close_a_pipeline(task->pipeline_id());
+}
+
+void TaskScheduler::_do_work(int index) {
+    while (_markers[index]) {
+        auto* task = _task_queue.take(index);
         if (!task) {
             continue;
         }
-        task->set_task_queue(_task_queue.get());
-        auto* fragment_ctx = task->fragment_context();
-        doris::signal::query_id_hi = fragment_ctx->get_query_id().hi;
-        doris::signal::query_id_lo = fragment_ctx->get_query_id().lo;
-        bool canceled = fragment_ctx->is_canceled();
-
-        auto check_state = task->get_state();
-        if (check_state == PipelineTaskState::PENDING_FINISH) {
-            DCHECK(!task->is_pending_finish()) << "must not pending close " << task->debug_string();
-            _try_close_task(task,
-                            canceled ? PipelineTaskState::CANCELED : PipelineTaskState::FINISHED);
+        // The task is already running, maybe block in now dependency wake up by other thread
+        // but the block thread still hold the task, so put it back to the queue, until the hold
+        // thread set task->set_running(false)
+        if (task->is_running()) {
+            static_cast<void>(_task_queue.push_back(task, index));
             continue;
         }
-        DCHECK(check_state != PipelineTaskState::FINISHED &&
-               check_state != PipelineTaskState::CANCELED)
-                << "task already finish";
+        task->log_detail_if_need();
+        task->set_running(true);
+        task->set_task_queue(&_task_queue);
+        auto* fragment_ctx = task->fragment_context();
+        bool canceled = fragment_ctx->is_canceled();
 
+        // If the state is PENDING_FINISH, then the task is come from blocked queue, its is_pending_finish
+        // has to return false. The task is finished and need to close now.
         if (canceled) {
             // may change from pending FINISH，should called cancel
             // also may change form BLOCK, other task called cancel
-            _try_close_task(task, PipelineTaskState::CANCELED);
+
+            // If pipeline is canceled, it will report after pipeline closed, and will propagate
+            // errors to downstream through exchange. So, here we needn't send_report.
+            // fragment_ctx->send_report(true);
+            _close_task(task, fragment_ctx->get_query_ctx()->exec_status());
             continue;
         }
 
-        DCHECK(check_state == PipelineTaskState::RUNNABLE);
         // task exec
         bool eos = false;
-        auto status = task->execute(&eos);
-        task->set_previous_core_id(index);
+        auto status = Status::OK();
+        task->set_core_id(index);
+
+        ASSIGN_STATUS_IF_CATCH_EXCEPTION(
+                //TODO: use a better enclose to abstracting these
+                if (ExecEnv::GetInstance()->pipeline_tracer_context()->enabled()) {
+                    TUniqueId query_id = task->query_context()->query_id();
+                    std::string task_name = task->task_name();
+
+                    std::thread::id tid = std::this_thread::get_id();
+                    uint64_t thread_id = *reinterpret_cast<uint64_t*>(&tid);
+                    uint64_t start_time = MonotonicMicros();
+
+                    status = task->execute(&eos);
+
+                    uint64_t end_time = MonotonicMicros();
+                    ExecEnv::GetInstance()->pipeline_tracer_context()->record(
+                            {query_id, task_name, static_cast<uint32_t>(index), thread_id,
+                             start_time, end_time});
+                } else { status = task->execute(&eos); },
+                status);
+
         if (!status.ok()) {
-            LOG(WARNING) << fmt::format("Pipeline task [{}] failed: {}", task->debug_string(),
-                                        status.to_string());
+            // Print detail informations below when you debugging here.
+            //
+            // LOG(WARNING)<< "task:\n"<<task->debug_string();
+
             // exec failed，cancel all fragment instance
-            fragment_ctx->cancel(PPlanFragmentCancelReason::INTERNAL_ERROR, status.to_string());
-            fragment_ctx->send_report(true);
-            _try_close_task(task, PipelineTaskState::CANCELED);
+            fragment_ctx->cancel(status);
+            LOG(WARNING) << fmt::format("Pipeline task failed. query_id: {} reason: {}",
+                                        print_id(task->query_context()->query_id()),
+                                        status.to_string());
+            _close_task(task, status);
             continue;
         }
+        fragment_ctx->trigger_report_if_necessary();
 
         if (eos) {
-            // TODO: pipeline parallel need to wait the last task finish to call finalize
-            //  and find_p_dependency
-            status = task->finalize();
-            if (!status.ok()) {
-                // execute failed，cancel all fragment
-                fragment_ctx->cancel(PPlanFragmentCancelReason::INTERNAL_ERROR,
-                                     "finalize fail:" + status.to_string());
-                _try_close_task(task, PipelineTaskState::CANCELED);
-            } else {
-                task->finish_p_dependency();
-                _try_close_task(task, PipelineTaskState::FINISHED);
+            // is pending finish will add the task to dependency's blocking queue, and then the task will be
+            // added to running queue when dependency is ready.
+            if (!task->is_pending_finish()) {
+                Status exec_status = fragment_ctx->get_query_ctx()->exec_status();
+                _close_task(task, exec_status);
+                continue;
             }
-            continue;
         }
 
-        auto pipeline_state = task->get_state();
-        switch (pipeline_state) {
-        case PipelineTaskState::BLOCKED_FOR_SOURCE:
-        case PipelineTaskState::BLOCKED_FOR_SINK:
-        case PipelineTaskState::BLOCKED_FOR_RF:
-        case PipelineTaskState::BLOCKED_FOR_DEPENDENCY:
-            _blocked_task_scheduler->add_blocked_task(task);
-            break;
-        case PipelineTaskState::RUNNABLE:
-            _task_queue->push_back(task, index);
-            break;
-        default:
-            DCHECK(false) << "error state after run task, " << get_state_name(pipeline_state);
-            break;
-        }
+        task->set_running(false);
     }
 }
 
-void TaskScheduler::_try_close_task(PipelineTask* task, PipelineTaskState state) {
-    // state only should be CANCELED or FINISHED
-    task->try_close();
-    if (task->is_pending_finish()) {
-        task->set_state(PipelineTaskState::PENDING_FINISH);
-        _blocked_task_scheduler->add_blocked_task(task);
-    } else {
-        auto status = task->close();
-        if (!status.ok()) {
-            // TODO: LOG warning
-        }
-        if (task->is_pending_finish()) {
-            task->set_state(PipelineTaskState::PENDING_FINISH);
-            _blocked_task_scheduler->add_blocked_task(task);
-            return;
-        }
-        task->set_state(state);
-        // TODO: rethink the logic
-        if (state == PipelineTaskState::CANCELED) {
-            task->finish_p_dependency();
-        }
-        task->fragment_context()->close_a_pipeline();
-    }
-}
-
-void TaskScheduler::shutdown() {
-    if (!this->_shutdown.load()) {
-        this->_shutdown.store(true);
-        _blocked_task_scheduler->shutdown();
-        if (_task_queue) {
-            _task_queue->close();
-        }
+void TaskScheduler::stop() {
+    if (!_shutdown) {
+        _task_queue.close();
         if (_fix_thread_pool) {
-            for (const auto& marker : _markers) {
-                marker->store(false);
+            for (size_t i = 0; i < _markers.size(); ++i) {
+                _markers[i] = false;
             }
             _fix_thread_pool->shutdown();
             _fix_thread_pool->wait();
         }
+        // Should set at the ending of the stop to ensure that the
+        // pool is stopped. For example, if there are 2 threads call stop
+        // then if one thread set shutdown = false, then another thread will
+        // not check it and will free task scheduler.
+        _shutdown = true;
     }
-}
-
-void TaskScheduler::update_tg_cpu_share(const taskgroup::TaskGroupInfo& task_group_info,
-                                        taskgroup::TaskGroupPtr task_group) {
-    _task_queue->update_tg_cpu_share(task_group_info, task_group);
 }
 
 } // namespace doris::pipeline

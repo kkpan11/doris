@@ -39,13 +39,15 @@ enum class CompactionActionType {
 const std::string PARAM_COMPACTION_TYPE = "compact_type";
 const std::string PARAM_COMPACTION_BASE = "base";
 const std::string PARAM_COMPACTION_CUMULATIVE = "cumulative";
+const std::string PARAM_COMPACTION_FULL = "full";
+const std::string PARAM_COMPACTION_REMOTE = "remote";
 
 /// This action is used for viewing the compaction status.
 /// See compaction-action.md for details.
 class CompactionAction : public HttpHandlerWithAuth {
 public:
-    CompactionAction(CompactionActionType ctype, ExecEnv* exec_env, TPrivilegeHier::type hier,
-                     TPrivilegeType::type ptype);
+    CompactionAction(CompactionActionType ctype, ExecEnv* exec_env, StorageEngine& engine,
+                     TPrivilegeHier::type hier, TPrivilegeType::type ptype);
 
     ~CompactionAction() override = default;
 
@@ -59,16 +61,15 @@ private:
     Status _handle_run_compaction(HttpRequest* req, std::string* json_result);
 
     /// thread callback function for the tablet to do compaction
-    Status _execute_compaction_callback(TabletSharedPtr tablet, const std::string& compaction_type);
+    Status _execute_compaction_callback(TabletSharedPtr tablet, const std::string& compaction_type,
+                                        bool fethch_from_remote);
 
     /// fetch compaction running status
     Status _handle_run_status_compaction(HttpRequest* req, std::string* json_result);
 
-    /// check param and fetch tablet_id from req
-    Status _check_param(HttpRequest* req, uint64_t* tablet_id);
-
 private:
-    CompactionActionType _type;
+    StorageEngine& _engine;
+    CompactionActionType _compaction_type;
 };
 
 } // end namespace doris

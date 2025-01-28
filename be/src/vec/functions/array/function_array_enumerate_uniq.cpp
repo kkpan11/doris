@@ -38,8 +38,7 @@
 #include "vec/common/assert_cast.h"
 #include "vec/common/columns_hashing.h"
 #include "vec/common/hash_table/hash.h"
-#include "vec/common/hash_table/hash_map.h"
-#include "vec/common/hash_table/hash_table.h"
+#include "vec/common/hash_table/hash_map_context.h"
 #include "vec/common/hash_table/hash_table_allocator.h"
 #include "vec/common/pod_array_fwd.h"
 #include "vec/common/string_ref.h"
@@ -75,38 +74,48 @@ public:
     String get_name() const override { return name; }
     bool is_variadic() const override { return true; }
     size_t get_number_of_arguments() const override { return 1; }
-    bool use_default_implementation_for_nulls() const override { return false; }
 
     DataTypePtr get_return_type_impl(const DataTypes& arguments) const override {
         if (arguments.empty()) {
-            LOG(FATAL) << "Incorrect number of arguments for array_enumerate_uniq function";
+            throw doris::Exception(
+                    ErrorCode::INVALID_ARGUMENT,
+                    "Incorrect number of arguments for array_enumerate_uniq function");
+            __builtin_unreachable();
         }
         bool is_nested_nullable = false;
         for (size_t i = 0; i < arguments.size(); ++i) {
             const DataTypeArray* array_type =
                     check_and_get_data_type<DataTypeArray>(remove_nullable(arguments[i]).get());
             if (!array_type) {
-                LOG(FATAL) << "The " << i
-                           << "-th argument for function " + get_name() +
-                                      " must be an array but it has type " +
-                                      arguments[i]->get_name() + ".";
+                throw doris::Exception(
+                        ErrorCode::INVALID_ARGUMENT,
+                        "The {} -th argument for function: {} .must be an array but it type is {}",
+                        i, get_name(), arguments[i]->get_name());
             }
-            if (i == 0) {
-                is_nested_nullable = array_type->get_nested_type()->is_nullable();
-            }
+            is_nested_nullable = is_nested_nullable || array_type->get_nested_type()->is_nullable();
         }
 
         auto return_nested_type = std::make_shared<DataTypeInt64>();
         DataTypePtr return_type = std::make_shared<DataTypeArray>(
                 is_nested_nullable ? make_nullable(return_nested_type) : return_nested_type);
-        if (arguments.size() == 1 && arguments[0]->is_nullable()) {
+        if (arguments[0]->is_nullable()) {
             return_type = make_nullable(return_type);
         }
         return return_type;
     }
 
+// When compiling `FunctionArrayEnumerateUniq::_execute_by_hash`, `AllocatorWithStackMemory::free(buf)`
+// will be called when `delete HashMapContainer`. the gcc compiler will think that `size > N` and `buf` is not heap memory,
+// and report an error `' void free(void*)' called on unallocated object 'hash_map'`
+// This only fails on doris docker + gcc 11.1, no problem on doris docker + clang 16.0.1,
+// no problem on ldb_toolchanin gcc 11.1 and clang 16.0.1.
+#ifdef __GNUC__
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfree-nonheap-object"
+#endif // __GNUC__
+
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t input_rows_count) override {
+                        uint32_t result, size_t input_rows_count) const override {
         ColumnRawPtrs data_columns(arguments.size());
         const ColumnArray::Offsets64* offsets = nullptr;
         ColumnPtr src_offsets;
@@ -119,7 +128,7 @@ public:
                     block.get_by_position(arguments[i]).column->convert_to_full_column_if_const());
             ColumnPtr& cur_column = src_columns[i];
             const ColumnArray* array =
-                    check_and_get_column<ColumnArray>(remove_nullable(cur_column->get_ptr()));
+                    check_and_get_column<ColumnArray>(remove_nullable(cur_column->get_ptr()).get());
             if (!array) {
                 return Status::RuntimeError(
                         fmt::format("Illegal column {}, of first argument of function {}",
@@ -133,7 +142,7 @@ public:
                 src_offsets = array->get_offsets_ptr();
             } else if (*offsets != cur_offsets) {
                 return Status::RuntimeError(fmt::format(
-                        "lengths of all arrays of fucntion {} must be equal.", get_name()));
+                        "lengths of all arrays of function {} must be equal.", get_name()));
             }
             const auto* array_data = &array->get_data();
             data_columns[i] = array_data;
@@ -142,7 +151,7 @@ public:
         const NullMapType* null_map = nullptr;
         if (arguments.size() == 1 && data_columns[0]->is_nullable()) {
             const ColumnNullable* nullable = check_and_get_column<ColumnNullable>(*data_columns[0]);
-            data_columns[0] = nullable->get_nested_column_ptr();
+            data_columns[0] = nullable->get_nested_column_ptr().get();
             null_map = &nullable->get_null_map_column().get_data();
         }
 
@@ -185,21 +194,20 @@ public:
                 _execute_number<ColumnDecimal32>(data_columns, *offsets, null_map, dst_values);
             } else if (which.is_decimal64()) {
                 _execute_number<ColumnDecimal64>(data_columns, *offsets, null_map, dst_values);
-            } else if (which.is_decimal128i()) {
-                _execute_number<ColumnDecimal128I>(data_columns, *offsets, null_map, dst_values);
+            } else if (which.is_decimal128v3()) {
+                _execute_number<ColumnDecimal128V3>(data_columns, *offsets, null_map, dst_values);
+            } else if (which.is_decimal256()) {
+                _execute_number<ColumnDecimal256>(data_columns, *offsets, null_map, dst_values);
             } else if (which.is_date_time_v2()) {
                 _execute_number<ColumnDateTimeV2>(data_columns, *offsets, null_map, dst_values);
-            } else if (which.is_decimal128()) {
-                _execute_number<ColumnDecimal128>(data_columns, *offsets, null_map, dst_values);
+            } else if (which.is_decimal128v2()) {
+                _execute_number<ColumnDecimal128V2>(data_columns, *offsets, null_map, dst_values);
             } else if (which.is_string()) {
                 _execute_string(data_columns, *offsets, null_map, dst_values);
             }
         } else {
-            using HashMapContainer =
-                    HashMapWithStackMemory<UInt128, Int64, UInt128TrivialHash, INITIAL_SIZE_DEGREE>;
-            using HashMethod = ColumnsHashing::HashMethodHashed<DataTypeUInt64, Int64, false>;
-            _execute_by_hash<HashMapContainer, HashMethod, false>(data_columns, *offsets, nullptr,
-                                                                  dst_values);
+            _execute_by_hash<MethodSerialized<PHHashMap<StringRef, Int64>>, false>(
+                    data_columns, *offsets, nullptr, dst_values);
         }
 
         ColumnPtr nested_column = dst_nested_column->get_ptr();
@@ -211,7 +219,8 @@ public:
         if (arguments.size() == 1 && block.get_by_position(arguments[0]).column->is_nullable()) {
             auto left_column =
                     block.get_by_position(arguments[0]).column->convert_to_full_column_if_const();
-            const ColumnNullable* nullable = check_and_get_column<ColumnNullable>(left_column);
+            const ColumnNullable* nullable =
+                    check_and_get_column<ColumnNullable>(left_column.get());
             res_column = ColumnNullable::create(
                     res_column, nullable->get_null_map_column().clone_resized(nullable->size()));
         }
@@ -221,18 +230,23 @@ public:
     }
 
 private:
-    template <typename HashMapContainer, typename HashMethod, bool is_nullable>
+    template <typename HashTableContext, bool is_nullable>
     void _execute_by_hash(const ColumnRawPtrs& columns, const ColumnArray::Offsets64& offsets,
                           [[maybe_unused]] const NullMap* null_map,
-                          ColumnInt64::Container& dst_values) {
-        HashMapContainer hash_map;
-        HashMethod hash_method(columns, {}, nullptr);
+                          ColumnInt64::Container& dst_values) const {
+        HashTableContext ctx;
+        ctx.init_serialized_keys(columns, columns[0]->size(),
+                                 null_map ? null_map->data() : nullptr);
+
+        using KeyGetter = typename HashTableContext::State;
+        KeyGetter key_getter(columns);
+
+        auto creator = [&](const auto& ctor, auto& key, auto& origin) { ctor(key, 0); };
+        auto creator_for_null_key = [&](auto& mapped) { mapped = 0; };
 
         ColumnArray::Offset64 prev_off = 0;
-        Arena pool;
-
         for (size_t off : offsets) {
-            hash_map.clear();
+            ctx.hash_table->clear_and_shrink();
             Int64 null_count = 0;
             for (ColumnArray::Offset64 j = prev_off; j < off; ++j) {
                 if constexpr (is_nullable) {
@@ -241,10 +255,9 @@ private:
                         continue;
                     }
                 }
-                auto result = hash_method.emplace_key(hash_map, j, pool);
-                auto idx = result.get_mapped() + 1;
-                result.set_mapped(idx);
-                dst_values[j] = idx;
+                auto& mapped = *ctx.lazy_emplace(key_getter, j, creator, creator_for_null_key);
+                mapped++;
+                dst_values[j] = mapped;
             }
             prev_off = off;
         }
@@ -252,38 +265,33 @@ private:
 
     template <typename ColumnType>
     void _execute_number(const ColumnRawPtrs& columns, const ColumnArray::Offsets64& offsets,
-                         const NullMapType* null_map, ColumnInt64::Container& dst_values) {
+                         const NullMapType* null_map, ColumnInt64::Container& dst_values) const {
         using NestType = typename ColumnType::value_type;
         using ElementNativeType = typename NativeType<NestType>::Type;
-
-        using HashMapContainer =
-                HashMapWithStackMemory<ElementNativeType, Int64, DefaultHash<ElementNativeType>,
-                                       INITIAL_SIZE_DEGREE>;
         using HashMethod =
-                ColumnsHashing::HashMethodOneNumber<UInt64, Int64, ElementNativeType, false>;
+                MethodOneNumber<ElementNativeType,
+                                PHHashMap<ElementNativeType, Int64, HashCRC32<ElementNativeType>>>;
         if (null_map != nullptr) {
-            _execute_by_hash<HashMapContainer, HashMethod, false>(columns, offsets, null_map,
-                                                                  dst_values);
+            _execute_by_hash<HashMethod, true>(columns, offsets, null_map, dst_values);
         } else {
-            _execute_by_hash<HashMapContainer, HashMethod, true>(columns, offsets, nullptr,
-                                                                 dst_values);
+            _execute_by_hash<HashMethod, false>(columns, offsets, nullptr, dst_values);
         }
     }
 
     void _execute_string(const ColumnRawPtrs& columns, const ColumnArray::Offsets64& offsets,
-                         const NullMapType* null_map, ColumnInt64::Container& dst_values) {
-        using HashMapContainer = HashMapWithStackMemory<StringRef, Int64, DefaultHash<StringRef>,
-                                                        INITIAL_SIZE_DEGREE>;
-        using HashMethod = ColumnsHashing::HashMethodString<UInt64, Int64, false, false>;
+                         const NullMapType* null_map, ColumnInt64::Container& dst_values) const {
+        using HashMethod = MethodStringNoCache<PHHashMap<StringRef, Int64>>;
         if (null_map != nullptr) {
-            _execute_by_hash<HashMapContainer, HashMethod, false>(columns, offsets, nullptr,
-                                                                  dst_values);
+            _execute_by_hash<HashMethod, true>(columns, offsets, null_map, dst_values);
         } else {
-            _execute_by_hash<HashMapContainer, HashMethod, true>(columns, offsets, nullptr,
-                                                                 dst_values);
+            _execute_by_hash<HashMethod, false>(columns, offsets, nullptr, dst_values);
         }
     }
 };
+
+#ifdef __GNUC__
+#pragma GCC diagnostic pop
+#endif // __GNUC__
 
 void register_function_array_enumerate_uniq(SimpleFunctionFactory& factory) {
     factory.register_function<FunctionArrayEnumerateUniq>();

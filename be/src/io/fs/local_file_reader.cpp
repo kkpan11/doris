@@ -19,6 +19,7 @@
 
 #include <bthread/bthread.h>
 // IWYU pragma: no_include <bthread/errno.h>
+#include <bvar/bvar.h>
 #include <errno.h> // IWYU pragma: keep
 #include <fmt/format.h>
 #include <glog/logging.h>
@@ -30,19 +31,77 @@
 #include <string>
 #include <utility>
 
-// IWYU pragma: no_include <opentelemetry/common/threadlocal.h>
 #include "common/compiler_util.h" // IWYU pragma: keep
+#include "cpp/sync_point.h"
 #include "io/fs/err_utils.h"
+#include "olap/data_dir.h"
+#include "olap/olap_common.h"
+#include "olap/options.h"
+#include "runtime/thread_context.h"
+#include "runtime/workload_management/io_throttle.h"
 #include "util/async_io.h"
+#include "util/debug_points.h"
 #include "util/doris_metrics.h"
 
 namespace doris {
 namespace io {
-class IOContext;
 
-LocalFileReader::LocalFileReader(Path path, size_t file_size, int fd,
-                                 std::shared_ptr<LocalFileSystem> fs)
-        : _fd(fd), _path(std::move(path)), _file_size(file_size), _fs(std::move(fs)) {
+std::vector<doris::DataDirInfo> BeConfDataDirReader::be_config_data_dir_list;
+
+void BeConfDataDirReader::get_data_dir_by_file_path(io::Path* file_path,
+                                                    std::string* data_dir_arg) {
+    for (const auto& data_dir_info : be_config_data_dir_list) {
+        if (data_dir_info.path.size() >= file_path->string().size()) {
+            continue;
+        }
+        if (file_path->string().compare(0, data_dir_info.path.size(), data_dir_info.path) == 0) {
+            *data_dir_arg = data_dir_info.path;
+            break;
+        }
+    }
+}
+
+void BeConfDataDirReader::init_be_conf_data_dir(
+        const std::vector<doris::StorePath>& store_paths,
+        const std::vector<doris::StorePath>& spill_store_paths,
+        const std::vector<doris::CachePath>& cache_paths) {
+    for (int i = 0; i < store_paths.size(); i++) {
+        DataDirInfo data_dir_info;
+        data_dir_info.path = store_paths[i].path;
+        data_dir_info.storage_medium = store_paths[i].storage_medium;
+        data_dir_info.data_dir_type = DataDirType::OLAP_DATA_DIR;
+        data_dir_info.metric_name = "local_data_dir_" + std::to_string(i);
+        be_config_data_dir_list.push_back(data_dir_info);
+    }
+
+    for (int i = 0; i < spill_store_paths.size(); i++) {
+        doris::DataDirInfo data_dir_info;
+        data_dir_info.path = spill_store_paths[i].path;
+        data_dir_info.storage_medium = spill_store_paths[i].storage_medium;
+        data_dir_info.data_dir_type = doris::DataDirType::SPILL_DISK_DIR;
+        data_dir_info.metric_name = "spill_data_dir_" + std::to_string(i);
+        be_config_data_dir_list.push_back(data_dir_info);
+    }
+
+    for (int i = 0; i < cache_paths.size(); i++) {
+        doris::DataDirInfo data_dir_info;
+        data_dir_info.path = cache_paths[i].path;
+        data_dir_info.storage_medium = TStorageMedium::REMOTE_CACHE;
+        data_dir_info.data_dir_type = doris::DataDirType::DATA_CACHE_DIR;
+        data_dir_info.metric_name = "local_cache_dir_" + std::to_string(i);
+        be_config_data_dir_list.push_back(data_dir_info);
+    }
+
+    std::sort(be_config_data_dir_list.begin(), be_config_data_dir_list.end(),
+              [](const DataDirInfo& a, const DataDirInfo& b) {
+                  return a.path.length() > b.path.length();
+              });
+}
+
+LocalFileReader::LocalFileReader(Path path, size_t file_size, int fd)
+        : _fd(fd), _path(std::move(path)), _file_size(file_size) {
+    _data_dir_path = "";
+    BeConfDataDirReader::get_data_dir_by_file_path(&_path, &_data_dir_path);
     DorisMetrics::instance()->local_file_open_reading->increment(1);
     DorisMetrics::instance()->local_file_reader_total->increment(1);
 }
@@ -55,22 +114,10 @@ Status LocalFileReader::close() {
     bool expected = false;
     if (_closed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
         DorisMetrics::instance()->local_file_open_reading->increment(-1);
-        int res = -1;
-#if !defined(USE_BTHREAD_SCANNER)
         DCHECK(bthread_self() == 0);
-        res = ::close(_fd);
-#else
-        if (bthread_self() == 0) {
-            res = ::close(_fd);
-        } else {
-            auto task = [&] { res = ::close(_fd); };
-            AsyncIO::run_task(task, io::FileSystemType::LOCAL);
-        }
-#endif
-        if (-1 == res) {
+        if (-1 == ::close(_fd)) {
             std::string err = errno_to_str();
-            LOG(WARNING) << fmt::format("failed to close {}: {}", _path.native(), err);
-            return Status::IOError("failed to close {}: {}", _path.native(), err);
+            return localfs_error(errno, fmt::format("failed to close {}", _path.native()));
         }
         _fd = -1;
     }
@@ -79,23 +126,41 @@ Status LocalFileReader::close() {
 
 Status LocalFileReader::read_at_impl(size_t offset, Slice result, size_t* bytes_read,
                                      const IOContext* /*io_ctx*/) {
-    DCHECK(!closed());
+    TEST_SYNC_POINT_RETURN_WITH_VALUE("LocalFileReader::read_at_impl",
+                                      Status::IOError("inject io error"));
+    if (closed()) [[unlikely]] {
+        return Status::InternalError("read closed file: ", _path.native());
+    }
+
     if (offset > _file_size) {
-        return Status::IOError("offset exceeds file size(offset: {}, file size: {}, path: {})",
-                               offset, _file_size, _path.native());
+        return Status::InternalError(
+                "offset exceeds file size(offset: {}, file size: {}, path: {})", offset, _file_size,
+                _path.native());
     }
     size_t bytes_req = result.size;
     char* to = result.data;
     bytes_req = std::min(bytes_req, _file_size - offset);
     *bytes_read = 0;
 
+    LIMIT_LOCAL_SCAN_IO(get_data_dir_path(), bytes_read);
+
     while (bytes_req != 0) {
-        auto res = ::pread(_fd, to, bytes_req, offset);
+        auto res = SYNC_POINT_HOOK_RETURN_VALUE(::pread(_fd, to, bytes_req, offset),
+                                                "LocalFileReader::pread", _fd, to);
+        DBUG_EXECUTE_IF("LocalFileReader::read_at_impl.io_error", {
+            auto sub_path = dp->param<std::string>("sub_path", "");
+            if ((sub_path.empty() && _path.filename().compare(kTestFilePath)) ||
+                (!sub_path.empty() && _path.native().find(sub_path) != std::string::npos)) {
+                res = -1;
+                errno = EIO;
+                LOG(WARNING) << Status::IOError("debug read io error: {}", _path.native());
+            }
+        });
         if (UNLIKELY(-1 == res && errno != EINTR)) {
-            return Status::IOError("cannot read from {}: {}", _path.native(), std::strerror(errno));
+            return localfs_error(errno, fmt::format("failed to read {}", _path.native()));
         }
         if (UNLIKELY(res == 0)) {
-            return Status::IOError("cannot read from {}: unexpected EOF", _path.native());
+            return Status::InternalError("cannot read from {}: unexpected EOF", _path.native());
         }
         if (res > 0) {
             to += res;

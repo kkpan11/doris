@@ -110,10 +110,17 @@ suite("load") {
         }
     }
 
+    Thread.sleep(70000) // wait for row count report of the tables just loaded
+    for (String tableName in tables) {
+        sql """ ANALYZE TABLE $tableName WITH SYNC """
+    }
+
     def table = "revenue1"
     sql new File("""${context.file.parent}/ddl/${table}_delete.sql""").text
     sql new File("""${context.file.parent}/ddl/${table}.sql""").text
     // We need wait to make sure BE could pass the stats info to FE so that
     // avoid unnessary inconsistent generated plan which would cause the regression test fail
     sleep(60000)
+
+    sql """ sync """
 }

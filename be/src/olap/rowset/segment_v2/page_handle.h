@@ -23,6 +23,10 @@
 #include "util/slice.h" // for Slice
 
 namespace doris {
+
+// After disable page cache, sometimes we need to know the percentage of data pages in query memory.
+inline bvar::Adder<int64_t> g_page_no_cache_mem_bytes("doris_page_no_cache_mem_bytes");
+
 namespace segment_v2 {
 
 // When a column page is read into memory, we use this to store it.
@@ -36,7 +40,9 @@ public:
 
     // This class will take the ownership of input data's memory. It will
     // free it when deconstructs.
-    PageHandle(DataPage* data) : _is_data_owner(true), _data(data) {}
+    PageHandle(DataPage* data) : _is_data_owner(true), _data(data) {
+        g_page_no_cache_mem_bytes << _data->capacity();
+    }
 
     // This class will take the content of cache data, and will make input
     // cache_data to a invalid cache handle.
@@ -59,6 +65,7 @@ public:
 
     ~PageHandle() {
         if (_is_data_owner) {
+            g_page_no_cache_mem_bytes << -_data->capacity();
             delete _data;
         } else {
             DCHECK(_data == nullptr);

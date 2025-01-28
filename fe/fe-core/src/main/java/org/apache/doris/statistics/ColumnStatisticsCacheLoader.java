@@ -17,50 +17,49 @@
 
 package org.apache.doris.statistics;
 
-import org.apache.doris.common.FeConstants;
-import org.apache.doris.statistics.util.InternalQueryResult.ResultRow;
+import org.apache.doris.catalog.TableIf;
 import org.apache.doris.statistics.util.StatisticsUtil;
 
-import org.apache.commons.collections.CollectionUtils;
-import org.apache.commons.text.StringSubstitutor;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.CompletionException;
 
-public class ColumnStatisticsCacheLoader extends StatisticsCacheLoader<Optional<ColumnStatistic>> {
+public class ColumnStatisticsCacheLoader extends BasicAsyncCacheLoader<StatisticsCacheKey, Optional<ColumnStatistic>> {
 
     private static final Logger LOG = LogManager.getLogger(ColumnStatisticsCacheLoader.class);
 
-    private static final String QUERY_COLUMN_STATISTICS = "SELECT * FROM " + FeConstants.INTERNAL_DB_NAME
-            + "." + StatisticConstants.STATISTIC_TBL_NAME + " WHERE "
-            + "id = CONCAT('${tblId}', '-', ${idxId}, '-', '${colId}')";
-
     @Override
     protected Optional<ColumnStatistic> doLoad(StatisticsCacheKey key) {
-        Map<String, String> params = new HashMap<>();
-        params.put("tblId", String.valueOf(key.tableId));
-        params.put("idxId", String.valueOf(key.idxId));
-        params.put("colId", String.valueOf(key.colName));
-
-        List<ColumnStatistic> columnStatistics;
-        List<ResultRow> columnResult =
-                StatisticsUtil.execStatisticQuery(new StringSubstitutor(params)
-                        .replace(QUERY_COLUMN_STATISTICS));
+        Optional<ColumnStatistic> columnStatistic;
         try {
-            columnStatistics = StatisticsUtil.deserializeToColumnStatistics(columnResult);
-        } catch (Exception e) {
-            LOG.warn("Failed to deserialize column statistics", e);
-            throw new CompletionException(e);
+            // Load from statistics table.
+            columnStatistic = loadFromStatsTable(key);
+            if (!columnStatistic.isPresent()) {
+                // Load from data source metadata
+                TableIf table = StatisticsUtil.findTable(key.catalogId, key.dbId, key.tableId);
+                columnStatistic = table.getColumnStatistic(key.colName);
+            }
+        } catch (Throwable t) {
+            LOG.info("Failed to load stats for column [Catalog:{}, DB:{}, Table:{}, Column:{}], Reason: {}",
+                    key.catalogId, key.dbId, key.tableId, key.colName, t.getMessage());
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(t);
+            }
+            return null;
         }
-        if (CollectionUtils.isEmpty(columnStatistics)) {
+        return columnStatistic;
+    }
+
+    private Optional<ColumnStatistic> loadFromStatsTable(StatisticsCacheKey key) {
+        List<ResultRow> columnResults
+                = StatisticsRepository.loadColStats(key.catalogId, key.dbId, key.tableId, key.idxId, key.colName);
+        ColumnStatistic columnStatistics = StatisticsUtil.deserializeToColumnStatistics(columnResults);
+        if (columnStatistics == null) {
             return Optional.empty();
         } else {
-            return Optional.of(columnStatistics.get(0));
+            return Optional.of(columnStatistics);
         }
     }
 }

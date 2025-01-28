@@ -21,29 +21,41 @@
 
 #include "common/status.h"
 #include "operator.h"
-#include "vec/exec/vanalytic_eval_node.h"
 
 namespace doris {
-class ExecNode;
 class RuntimeState;
 
 namespace pipeline {
+#include "common/compile_check_begin.h"
 
-class AnalyticSourceOperatorBuilder final : public OperatorBuilder<vectorized::VAnalyticEvalNode> {
+class AnalyticSourceOperatorX;
+class AnalyticLocalState final : public PipelineXLocalState<AnalyticSharedState> {
 public:
-    AnalyticSourceOperatorBuilder(int32_t, ExecNode*);
+    ENABLE_FACTORY_CREATOR(AnalyticLocalState);
+    AnalyticLocalState(RuntimeState* state, OperatorXBase* parent);
+    Status init(RuntimeState* state, LocalStateInfo& info) override;
+
+private:
+    friend class AnalyticSourceOperatorX;
+    RuntimeProfile::Counter* _get_next_timer = nullptr;
+    RuntimeProfile::Counter* _filtered_rows_counter = nullptr;
+};
+
+class AnalyticSourceOperatorX final : public OperatorX<AnalyticLocalState> {
+public:
+    AnalyticSourceOperatorX(ObjectPool* pool, const TPlanNode& tnode, int operator_id,
+                            const DescriptorTbl& descs);
+
+    Status get_block(RuntimeState* state, vectorized::Block* block, bool* eos) override;
 
     bool is_source() const override { return true; }
 
-    OperatorPtr build_operator() override;
-};
+    Status open(RuntimeState* state) override;
 
-class AnalyticSourceOperator final : public SourceOperator<AnalyticSourceOperatorBuilder> {
-public:
-    AnalyticSourceOperator(OperatorBuilderBase*, ExecNode*);
-
-    Status open(RuntimeState*) override { return Status::OK(); }
+private:
+    friend class AnalyticLocalState;
 };
 
 } // namespace pipeline
 } // namespace doris
+#include "common/compile_check_end.h"

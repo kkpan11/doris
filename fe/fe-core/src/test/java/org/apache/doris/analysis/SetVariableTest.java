@@ -52,13 +52,13 @@ public class SetVariableTest {
         Assert.assertEquals("STRICT_TRANS_TABLES",
                 SqlModeHelper.decode(connectContext.getSessionVariable().getSqlMode()));
 
-        String selectStr = "explain select @@sql_mode;";
+        String selectStr = "explain select /*+ SET_VAR(enable_nereids_planner=false) */ @@sql_mode;";
         connectContext.getState().reset();
         stmtExecutor = new StmtExecutor(connectContext, selectStr);
         stmtExecutor.execute();
         Expr expr = stmtExecutor.getParsedStmt().getResultExprs().get(0);
         Assert.assertTrue(expr instanceof SlotRef);
-        Assert.assertSame(expr.getType(), Type.VARCHAR);
+        Assert.assertSame(Type.STRING, expr.getType());
     }
 
     @Test

@@ -19,7 +19,7 @@ package org.apache.doris.nereids.rules.exploration;
 
 import org.apache.doris.nereids.rules.Rule;
 import org.apache.doris.nereids.rules.RuleType;
-import org.apache.doris.nereids.rules.rewrite.logical.TransposeSemiJoinAgg;
+import org.apache.doris.nereids.rules.rewrite.TransposeSemiJoinAgg;
 import org.apache.doris.nereids.trees.plans.GroupPlan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalJoin;
 
@@ -31,8 +31,8 @@ public class TransposeAggSemiJoin extends OneExplorationRuleFactory {
 
     @Override
     public Rule build() {
-        return logicalAggregate(logicalJoin())
-                .when(agg -> agg.child().getJoinType().isLeftSemiOrAntiJoin())
+        return logicalAggregate(
+                logicalJoin().when(join -> join.getJoinType().isLeftSemiOrAntiJoin() && !join.isMarkJoin()))
                 .then(agg -> {
                     LogicalJoin<GroupPlan, GroupPlan> join = agg.child();
                     if (!TransposeSemiJoinAgg.canTranspose(agg, join)) {

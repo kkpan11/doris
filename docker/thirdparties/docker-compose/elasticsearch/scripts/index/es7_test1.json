@@ -6,14 +6,15 @@
   "mappings": {
     "properties": {
       "test1": {
-        "type": "keyword"
+        "type": "keyword",
+        "ignore_above": 10
       },
       "test2": {
         "type": "text",
         "fields": {
           "keyword": {
             "type": "keyword",
-            "ignore_above": 256
+            "ignore_above": 10
           }
         }
       },
@@ -36,6 +37,12 @@
         "format": "yyyy-MM-dd HH:mm:ss || epoch_millis"
       },
       "test8": {
+        "type": "date"
+      },
+      "test9": {
+        "type": "long"
+      },
+      "test10": {
         "type": "date"
       },
       "c_bool": {
@@ -95,6 +102,25 @@
             "type": "integer"
           }
         }
+      },
+      "message": {
+        "type": "text",
+        "fields": {
+          "keyword": {
+            "type": "keyword",
+            "ignore_above": 256
+          }
+        }
+      },
+      "my_wildcard": {
+        "type": "wildcard"
+      },
+      "level": {
+        "type": "constant_keyword",
+        "value": "debug"
+      },
+      "c_user": {
+        "type": "nested"
       }
     }
   }

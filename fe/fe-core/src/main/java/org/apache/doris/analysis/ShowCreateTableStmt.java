@@ -19,7 +19,10 @@ package org.apache.doris.analysis;
 
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.MTMV;
 import org.apache.doris.catalog.ScalarType;
+import org.apache.doris.catalog.TableIf;
+import org.apache.doris.catalog.View;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
@@ -28,7 +31,7 @@ import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.ShowResultSetMetaData;
 
 // SHOW CREATE TABLE statement.
-public class ShowCreateTableStmt extends ShowStmt {
+public class ShowCreateTableStmt extends ShowStmt implements NotFallbackInParser {
     private static final ShowResultSetMetaData META_DATA =
             ShowResultSetMetaData.builder()
                     .addColumn(new Column("Table", ScalarType.createVarchar(20)))
@@ -103,8 +106,24 @@ public class ShowCreateTableStmt extends ShowStmt {
         }
         tbl.analyze(analyzer);
 
+        TableIf tableIf = Env.getCurrentEnv().getCatalogMgr()
+                .getCatalogOrAnalysisException(tbl.getCtl())
+                .getDbOrAnalysisException(tbl.getDb()).getTableOrAnalysisException(tbl.getTbl());
+
+        if (tableIf instanceof MTMV) {
+            ErrorReport.reportAnalysisException("not support async materialized view, "
+                    + "please use `show create materialized view`");
+        }
+
+        PrivPredicate wanted;
+        if (tableIf instanceof View) {
+            wanted = PrivPredicate.SHOW_VIEW;
+        } else {
+            wanted = PrivPredicate.SHOW;
+        }
+
         if (!Env.getCurrentEnv().getAccessManager().checkTblPriv(ConnectContext.get(), tbl.getCtl(), tbl.getDb(),
-                tbl.getTbl(), PrivPredicate.SHOW)) {
+                tbl.getTbl(), wanted)) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "SHOW CREATE TABLE",
                                                 ConnectContext.get().getQualifiedUser(),
                                                 ConnectContext.get().getRemoteIP(),

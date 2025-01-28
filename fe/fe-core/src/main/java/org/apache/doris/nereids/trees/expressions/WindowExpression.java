@@ -52,7 +52,7 @@ public class WindowExpression extends Expression {
                 .add(function)
                 .addAll(partitionKeys)
                 .addAll(orderKeys)
-                .build().toArray(new Expression[0]));
+                .build());
         this.function = function;
         this.partitionKeys = ImmutableList.copyOf(partitionKeys);
         this.orderKeys = ImmutableList.copyOf(orderKeys);
@@ -66,8 +66,7 @@ public class WindowExpression extends Expression {
                 .add(function)
                 .addAll(partitionKeys)
                 .addAll(orderKeys)
-                .add(windowFrame)
-                .build().toArray(new Expression[0]));
+                .build());
         this.function = function;
         this.partitionKeys = ImmutableList.copyOf(partitionKeys);
         this.orderKeys = ImmutableList.copyOf(orderKeys);
@@ -108,12 +107,24 @@ public class WindowExpression extends Expression {
         return new WindowExpression(function, partitionKeys, orderKeys, windowFrame);
     }
 
-    public WindowExpression withOrderKeyList(List<OrderExpression> orderKeyList) {
-        return windowFrame.map(frame -> new WindowExpression(function, partitionKeys, orderKeyList, frame))
-                .orElseGet(() -> new WindowExpression(function, partitionKeys, orderKeyList));
+    public WindowExpression withOrderKeys(List<OrderExpression> orderKeys) {
+        return windowFrame.map(frame -> new WindowExpression(function, partitionKeys, orderKeys, frame))
+                .orElseGet(() -> new WindowExpression(function, partitionKeys, orderKeys));
+    }
+
+    public WindowExpression withPartitionKeysOrderKeys(
+            List<Expression> partitionKeys, List<OrderExpression> orderKeys) {
+        return windowFrame.map(frame -> new WindowExpression(function, partitionKeys, orderKeys, frame))
+                .orElseGet(() -> new WindowExpression(function, partitionKeys, orderKeys));
     }
 
     public WindowExpression withFunction(Expression function) {
+        return windowFrame.map(frame -> new WindowExpression(function, partitionKeys, orderKeys, frame))
+                .orElseGet(() -> new WindowExpression(function, partitionKeys, orderKeys));
+    }
+
+    public WindowExpression withFunctionPartitionKeysOrderKeys(Expression function,
+            List<Expression> partitionKeys, List<OrderExpression> orderKeys) {
         return windowFrame.map(frame -> new WindowExpression(function, partitionKeys, orderKeys, frame))
                 .orElseGet(() -> new WindowExpression(function, partitionKeys, orderKeys));
     }
@@ -125,7 +136,7 @@ public class WindowExpression extends Expression {
 
     @Override
     public WindowExpression withChildren(List<Expression> children) {
-        Preconditions.checkArgument(children.size() >= 1);
+        Preconditions.checkArgument(!children.isEmpty());
         int index = 0;
         Expression func = children.get(index);
         index += 1;
@@ -140,6 +151,9 @@ public class WindowExpression extends Expression {
 
         if (index < children.size()) {
             return new WindowExpression(func, partitionKeys, orderKeys, (WindowFrame) children.get(index));
+        }
+        if (windowFrame.isPresent()) {
+            return new WindowExpression(func, partitionKeys, orderKeys, windowFrame.get());
         }
         return new WindowExpression(func, partitionKeys, orderKeys);
     }
@@ -160,12 +174,12 @@ public class WindowExpression extends Expression {
     }
 
     @Override
-    public int hashCode() {
+    public int computeHashCode() {
         return Objects.hash(function, partitionKeys, orderKeys, windowFrame);
     }
 
     @Override
-    public String toSql() {
+    public String computeToSql() {
         StringBuilder sb = new StringBuilder();
         sb.append(function.toSql()).append(" OVER(");
         if (!partitionKeys.isEmpty()) {
@@ -185,7 +199,7 @@ public class WindowExpression extends Expression {
     @Override
     public String toString() {
         StringBuilder sb = new StringBuilder();
-        sb.append(function).append(" WindowSpec(");
+        sb.append("WindowExpression(").append(function).append(" spec(");
         if (!partitionKeys.isEmpty()) {
             sb.append("PARTITION BY ").append(partitionKeys.stream()
                     .map(Expression::toString)
@@ -197,7 +211,7 @@ public class WindowExpression extends Expression {
                     .collect(Collectors.joining(", ", "", " ")));
         }
         windowFrame.ifPresent(wf -> sb.append(wf.toSql()));
-        return sb.toString().trim() + ")";
+        return sb.toString().trim() + "))";
     }
 
     @Override

@@ -18,6 +18,7 @@
 import org.codehaus.groovy.runtime.IOGroovyMethods
 
 suite("test_jsonb_load_and_function", "p0") {
+
     // define a sql table
     def testTable = "tbl_test_jsonb"
     def dataFile = "test_jsonb.csv"
@@ -50,20 +51,13 @@ suite("test_jsonb_load_and_function", "p0") {
             }
             log.info("Stream load result: ${result}".toString())
             def json = parseJson(result)
-
-            StringBuilder sb = new StringBuilder()
-            sb.append("curl -X GET " + json.ErrorURL)
-            String command = sb.toString()
-            def process = command.execute()
-            def code = process.waitFor()
-            def err = IOGroovyMethods.getText(new BufferedReader(new InputStreamReader(process.getErrorStream())))
-            def out = process.getText()
+            def (code, out, err) = curl("GET", json.ErrorURL)
             log.info("error result: " + out)
 
             assertEquals("fail", json.Status.toLowerCase())
             assertTrue(json.Message.contains("too many filtered rows"))
             assertEquals(25, json.NumberTotalRows)
-            assertEquals(18, json.NumberLoadedRows)
+            assertEquals(0, json.NumberLoadedRows)
             assertEquals(7, json.NumberFilteredRows)
             assertTrue(json.LoadBytes > 0)
             log.info("url: " + json.ErrorURL)
@@ -89,14 +83,7 @@ suite("test_jsonb_load_and_function", "p0") {
             }
             log.info("Stream load result: ${result}".toString())
             def json = parseJson(result)
-
-            StringBuilder sb = new StringBuilder()
-            sb.append("curl -X GET " + json.ErrorURL)
-            String command = sb.toString()
-            def process = command.execute()
-            def code = process.waitFor()
-            def err = IOGroovyMethods.getText(new BufferedReader(new InputStreamReader(process.getErrorStream())))
-            def out = process.getText()
+            def (code, out, err) = curl("GET", json.ErrorURL)
             log.info("error result: " + out)
 
             assertEquals("success", json.Status.toLowerCase())
@@ -107,6 +94,8 @@ suite("test_jsonb_load_and_function", "p0") {
         }
     }
 
+    sql """ sync; """
+
     // check result
     qt_select "SELECT * FROM ${testTable} ORDER BY id"
 
@@ -114,51 +103,23 @@ suite("test_jsonb_load_and_function", "p0") {
     sql """INSERT INTO ${testTable} VALUES(26, NULL)"""
     sql """INSERT INTO ${testTable} VALUES(27, '{"k1":"v1", "k2": 200}')"""
     sql """INSERT INTO ${testTable} VALUES(28, '{"a.b.c":{"k1.a1":"v31", "k2": 300},"a":"niu"}')"""
+    // int64 value
+    sql """INSERT INTO ${testTable} VALUES(29, '12524337771678448270')"""
+    // int64 min value
+    sql """INSERT INTO ${testTable} VALUES(30, '-9223372036854775808')"""
+    // int64 max value
+    sql """INSERT INTO ${testTable} VALUES(31, '18446744073709551615')"""
+    // insert into json with empty key
+    sql """INSERT INTO ${testTable} VALUES(32, '{"":"v1"}')"""
+    sql """INSERT INTO ${testTable} VALUES(33, '{"":1, " ":"v1"}')"""
+    sql """INSERT INTO ${testTable} VALUES(34, '{"":1, "ab":"v1", " ":"v1", "  ": 2}')"""
 
-    // insert into invalid json rows with enable_insert_strict=true
-    // expect excepiton and no rows not changed
-    sql """ set enable_insert_strict = true """
-    success = true
-    try {
-        sql """INSERT INTO ${testTable} VALUES(26, '')"""
-    } catch(Exception ex) {
-       logger.info("""INSERT INTO ${testTable} invalid json failed: """ + ex)
-       success = false
-    }
-    assertEquals(false, success)
-    success = true
-    try {
-        sql """INSERT INTO ${testTable} VALUES(26, 'abc')"""
-    } catch(Exception ex) {
-       logger.info("""INSERT INTO ${testTable} invalid json failed: """ + ex)
-       success = false
-    }
-    assertEquals(false, success)
-
-    // insert into invalid json rows with enable_insert_strict=false
-    // expect no excepiton but no rows not changed
-    sql """ set enable_insert_strict = false """
-    success = true
-    try {
-        sql """INSERT INTO ${testTable} VALUES(26, '')"""
-    } catch(Exception ex) {
-       logger.info("""INSERT INTO ${testTable} invalid json failed: """ + ex)
-       success = false
-    }
-    assertEquals(true, success)
-    success = true
-    try {
-        sql """INSERT INTO ${testTable} VALUES(26, 'abc')"""
-    } catch(Exception ex) {
-       logger.info("""INSERT INTO ${testTable} invalid json failed: """ + ex)
-       success = false
-    }
-    assertEquals(true, success)
+    qt_select "SELECT * FROM ${testTable} where id in (32, 33, 34) ORDER BY id"
 
     qt_select "SELECT * FROM ${testTable} ORDER BY id"
 
     // jsonb_extract
-    qt_select "SELECT id, j, jsonb_extract(j, '\$') FROM ${testTable} ORDER BY id"
+    qt_jsonb_extract_select "SELECT id, j, jsonb_extract(j, '\$') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_extract(j, '\$.*') FROM ${testTable} ORDER BY id"
 
     qt_select "SELECT id, j, jsonb_extract(j, '\$.k1') FROM ${testTable} ORDER BY id"
@@ -184,12 +145,19 @@ suite("test_jsonb_load_and_function", "p0") {
     qt_select "SELECT id, j, jsonb_extract(j, '\$.a1[4]') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_extract(j, '\$.a1[10]') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_extract(j, '\$.a1[last]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract(j, '\$.a1[last-0]') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_extract(j, '\$.a1[last-1]') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_extract(j, '\$.a1[last-2]') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_extract(j, '\$.a1[last-10]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract(j, '\$.a1[-0]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract(j, '\$.a1[-1]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract(j, '\$.a1[-10]') FROM ${testTable} ORDER BY id"
+
+    // jsonb_extract_multipath
+    qt_jsonb_extract_multipath "SELECT id, j, jsonb_extract(j, '\$', '\$.*', '\$.k1', '\$[0]') FROM ${testTable} ORDER BY id"
 
     // jsonb_extract_string
-    qt_select "SELECT id, j, jsonb_extract_string(j, '\$') FROM ${testTable} ORDER BY id"
+    qt_jsonb_extract_string_select "SELECT id, j, jsonb_extract_string(j, '\$') FROM ${testTable} ORDER BY id"
 
     qt_select "SELECT id, j, jsonb_extract_string(j, '\$.k1') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_extract_string(j, '\$.k2') FROM ${testTable} ORDER BY id"
@@ -211,9 +179,17 @@ suite("test_jsonb_load_and_function", "p0") {
     qt_select "SELECT id, j, jsonb_extract_string(j, '\$.a1[3]') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_extract_string(j, '\$.a1[4]') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_extract_string(j, '\$.a1[10]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_string(j, '\$.a1[last]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_string(j, '\$.a1[last-0]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_string(j, '\$.a1[last-1]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_string(j, '\$.a1[last-2]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_string(j, '\$.a1[last-10]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_string(j, '\$.a1[-0]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_string(j, '\$.a1[-1]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_string(j, '\$.a1[-10]') FROM ${testTable} ORDER BY id"
 
     // jsonb_extract_int
-    qt_select "SELECT id, j, jsonb_extract_int(j, '\$') FROM ${testTable} ORDER BY id"
+    qt_jsonb_extract_int_select "SELECT id, j, jsonb_extract_int(j, '\$') FROM ${testTable} ORDER BY id"
 
     qt_select "SELECT id, j, jsonb_extract_int(j, '\$.k1') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_extract_int(j, '\$.k2') FROM ${testTable} ORDER BY id"
@@ -235,9 +211,17 @@ suite("test_jsonb_load_and_function", "p0") {
     qt_select "SELECT id, j, jsonb_extract_int(j, '\$.a1[3]') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_extract_int(j, '\$.a1[4]') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_extract_int(j, '\$.a1[10]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_int(j, '\$.a1[last]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_int(j, '\$.a1[last-0]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_int(j, '\$.a1[last-1]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_int(j, '\$.a1[last-2]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_int(j, '\$.a1[last-10]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_int(j, '\$.a1[-0]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_int(j, '\$.a1[-1]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_int(j, '\$.a1[-10]') FROM ${testTable} ORDER BY id"
 
     // jsonb_extract_bigint
-    qt_select "SELECT id, j, jsonb_extract_bigint(j, '\$') FROM ${testTable} ORDER BY id"
+    qt_jsonb_extract_bigint_select "SELECT id, j, jsonb_extract_bigint(j, '\$') FROM ${testTable} ORDER BY id"
 
     qt_select "SELECT id, j, jsonb_extract_bigint(j, '\$.k1') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_extract_bigint(j, '\$.k2') FROM ${testTable} ORDER BY id"
@@ -259,10 +243,51 @@ suite("test_jsonb_load_and_function", "p0") {
     qt_select "SELECT id, j, jsonb_extract_bigint(j, '\$.a1[3]') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_extract_bigint(j, '\$.a1[4]') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_extract_bigint(j, '\$.a1[10]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_bigint(j, '\$.a1[last]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_bigint(j, '\$.a1[last-0]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_bigint(j, '\$.a1[last-1]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_bigint(j, '\$.a1[last-2]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_bigint(j, '\$.a1[last-10]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_bigint(j, '\$.a1[-0]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_bigint(j, '\$.a1[-1]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_bigint(j, '\$.a1[-10]') FROM ${testTable} ORDER BY id"
+
+
+    // jsonb_extract_largeint
+    qt_jsonb_extract_largeint_select "SELECT id, j, jsonb_extract_largeint(j, '\$') FROM ${testTable} ORDER BY id"
+
+    qt_select "SELECT id, j, jsonb_extract_largeint(j, '\$.k1') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_largeint(j, '\$.k2') FROM ${testTable} ORDER BY id"
+
+    qt_select "SELECT id, j, jsonb_extract_largeint(j, '\$[0]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_largeint(j, '\$[1]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_largeint(j, '\$[2]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_largeint(j, '\$[3]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_largeint(j, '\$[4]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_largeint(j, '\$[5]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_largeint(j, '\$[6]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_largeint(j, '\$[10]') FROM ${testTable} ORDER BY id"
+
+    qt_select "SELECT id, j, jsonb_extract_largeint(j, '\$.a1') FROM ${testTable} ORDER BY id"
+
+    qt_select "SELECT id, j, jsonb_extract_largeint(j, '\$.a1[0]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_largeint(j, '\$.a1[1]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_largeint(j, '\$.a1[2]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_largeint(j, '\$.a1[3]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_largeint(j, '\$.a1[4]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_largeint(j, '\$.a1[10]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_largeint(j, '\$.a1[last]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_largeint(j, '\$.a1[last-0]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_largeint(j, '\$.a1[last-1]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_largeint(j, '\$.a1[last-2]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_largeint(j, '\$.a1[last-10]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_largeint(j, '\$.a1[-0]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_largeint(j, '\$.a1[-1]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_largeint(j, '\$.a1[-10]') FROM ${testTable} ORDER BY id"
 
 
     // jsonb_extract_double
-    qt_select "SELECT id, j, jsonb_extract_double(j, '\$') FROM ${testTable} ORDER BY id"
+    qt_jsonb_extract_double_select "SELECT id, j, jsonb_extract_double(j, '\$') FROM ${testTable} ORDER BY id"
 
     qt_select "SELECT id, j, jsonb_extract_double(j, '\$.k1') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_extract_double(j, '\$.k2') FROM ${testTable} ORDER BY id"
@@ -284,9 +309,17 @@ suite("test_jsonb_load_and_function", "p0") {
     qt_select "SELECT id, j, jsonb_extract_double(j, '\$.a1[3]') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_extract_double(j, '\$.a1[4]') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_extract_double(j, '\$.a1[10]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_double(j, '\$.a1[last]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_double(j, '\$.a1[last-0]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_double(j, '\$.a1[last-1]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_double(j, '\$.a1[last-2]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_double(j, '\$.a1[last-10]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_double(j, '\$.a1[-0]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_double(j, '\$.a1[-1]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_double(j, '\$.a1[-10]') FROM ${testTable} ORDER BY id"
 
     // jsonb_extract_bool
-    qt_select "SELECT id, j, jsonb_extract_bool(j, '\$') FROM ${testTable} ORDER BY id"
+    qt_jsonb_extract_bool_select "SELECT id, j, jsonb_extract_bool(j, '\$') FROM ${testTable} ORDER BY id"
 
     qt_select "SELECT id, j, jsonb_extract_bool(j, '\$.k1') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_extract_bool(j, '\$.k2') FROM ${testTable} ORDER BY id"
@@ -308,9 +341,17 @@ suite("test_jsonb_load_and_function", "p0") {
     qt_select "SELECT id, j, jsonb_extract_bool(j, '\$.a1[3]') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_extract_bool(j, '\$.a1[4]') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_extract_bool(j, '\$.a1[10]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_bool(j, '\$.a1[last]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_bool(j, '\$.a1[last-0]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_bool(j, '\$.a1[last-1]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_bool(j, '\$.a1[last-2]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_bool(j, '\$.a1[last-10]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_bool(j, '\$.a1[-0]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_bool(j, '\$.a1[-1]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_bool(j, '\$.a1[-10]') FROM ${testTable} ORDER BY id"
 
     // jsonb_extract_isnull
-    qt_select "SELECT id, j, jsonb_extract_isnull(j, '\$') FROM ${testTable} ORDER BY id"
+    qt_jsonb_extract_isnull_select "SELECT id, j, jsonb_extract_isnull(j, '\$') FROM ${testTable} ORDER BY id"
 
     qt_select "SELECT id, j, jsonb_extract_isnull(j, '\$.k1') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_extract_isnull(j, '\$.k2') FROM ${testTable} ORDER BY id"
@@ -332,9 +373,17 @@ suite("test_jsonb_load_and_function", "p0") {
     qt_select "SELECT id, j, jsonb_extract_isnull(j, '\$.a1[3]') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_extract_isnull(j, '\$.a1[4]') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_extract_isnull(j, '\$.a1[10]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_isnull(j, '\$.a1[last]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_isnull(j, '\$.a1[last-0]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_isnull(j, '\$.a1[last-1]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_isnull(j, '\$.a1[last-2]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_isnull(j, '\$.a1[last-10]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_isnull(j, '\$.a1[-0]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_isnull(j, '\$.a1[-1]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_extract_isnull(j, '\$.a1[-10]') FROM ${testTable} ORDER BY id"
 
     // jsonb_exists_path
-    qt_select "SELECT id, j, jsonb_exists_path(j, '\$') FROM ${testTable} ORDER BY id"
+    qt_jsonb_exists_path_select "SELECT id, j, jsonb_exists_path(j, '\$') FROM ${testTable} ORDER BY id"
 
     qt_select "SELECT id, j, jsonb_exists_path(j, '\$.k1') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_exists_path(j, '\$.k2') FROM ${testTable} ORDER BY id"
@@ -356,9 +405,17 @@ suite("test_jsonb_load_and_function", "p0") {
     qt_select "SELECT id, j, jsonb_exists_path(j, '\$.a1[3]') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_exists_path(j, '\$.a1[4]') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_exists_path(j, '\$.a1[10]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_exists_path(j, '\$.a1[last]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_exists_path(j, '\$.a1[last-0]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_exists_path(j, '\$.a1[last-1]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_exists_path(j, '\$.a1[last-2]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_exists_path(j, '\$.a1[last-10]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_exists_path(j, '\$.a1[-0]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_exists_path(j, '\$.a1[-1]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_exists_path(j, '\$.a1[-10]') FROM ${testTable} ORDER BY id"
 
     // jsonb_type
-    qt_select "SELECT id, j, jsonb_type(j, '\$') FROM ${testTable} ORDER BY id"
+    qt_jsonb_type_select "SELECT id, j, jsonb_type(j, '\$') FROM ${testTable} ORDER BY id"
 
     qt_select "SELECT id, j, jsonb_type(j, '\$.k1') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_type(j, '\$.k2') FROM ${testTable} ORDER BY id"
@@ -380,10 +437,18 @@ suite("test_jsonb_load_and_function", "p0") {
     qt_select "SELECT id, j, jsonb_type(j, '\$.a1[3]') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_type(j, '\$.a1[4]') FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, jsonb_type(j, '\$.a1[10]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_type(j, '\$.a1[last]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_type(j, '\$.a1[last-0]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_type(j, '\$.a1[last-1]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_type(j, '\$.a1[last-2]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_type(j, '\$.a1[last-10]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_type(j, '\$.a1[-0]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_type(j, '\$.a1[-1]') FROM ${testTable} ORDER BY id"
+    qt_select "SELECT id, j, jsonb_type(j, '\$.a1[-10]') FROM ${testTable} ORDER BY id"
 
 
     // CAST from JSONB
-    qt_select "SELECT id, j, CAST(j AS BOOLEAN) FROM ${testTable} ORDER BY id"
+    qt_cast_from_select "SELECT id, j, CAST(j AS BOOLEAN) FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, CAST(j AS SMALLINT) FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, CAST(j AS INT) FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, CAST(j AS BIGINT) FROM ${testTable} ORDER BY id"
@@ -391,7 +456,7 @@ suite("test_jsonb_load_and_function", "p0") {
     qt_select "SELECT id, j, CAST(j AS STRING) FROM ${testTable} ORDER BY id"
 
     // CAST to JSONB
-    qt_select "SELECT id, j, CAST(CAST(j AS BOOLEAN) AS JSONB) FROM ${testTable} ORDER BY id"
+    qt_cast_to_select "SELECT id, j, CAST(CAST(j AS BOOLEAN) AS JSONB) FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, CAST(CAST(j AS SMALLINT) AS JSONB) FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, CAST(CAST(j AS INT) AS JSONB) FROM ${testTable} ORDER BY id"
     qt_select "SELECT id, j, CAST(CAST(j AS BIGINT) AS JSONB) FROM ${testTable} ORDER BY id"
@@ -435,9 +500,82 @@ suite("test_jsonb_load_and_function", "p0") {
     qt_select """SELECT id, j, JSON_EXTRACT(j, '\$.k2', null) FROM ${testTable} ORDER BY id"""
     qt_select """SELECT id, j, JSON_EXTRACT(j, '\$.a1[0].k1', '\$.a1[0].k2', '\$.a1[2]') FROM ${testTable} ORDER BY id"""
 
-    qt_select """SELECT id, j, j->'\$.k1' FROM ${testTable} ORDER BY id"""
-    qt_select """SELECT id, j, j->'\$.[1]' FROM ${testTable} ORDER BY id"""
-    qt_select """SELECT id, j, j->null FROM ${testTable} ORDER BY id"""
-    qt_select """SELECT id, j, j->'\$.a1[0].k2' FROM ${testTable} ORDER BY id"""
-    qt_select """SELECT id, j, j->'\$.a1[0]'->'\$.k1' FROM ${testTable} ORDER BY id"""
+    //json_length
+    qt_sql_json_length """SELECT json_length('1')"""
+    qt_sql_json_length """SELECT json_length('true')"""
+    qt_sql_json_length """SELECT json_length('null')"""
+    qt_sql_json_length """SELECT json_length('"abc"')"""
+    qt_sql_json_length """SELECT json_length('[]')"""
+    qt_sql_json_length """SELECT json_length('[1, 2]')"""
+    qt_sql_json_length """SELECT json_length('[1, {"x": 2}]')"""
+    qt_sql_json_length """SELECT json_length('{"x": 1, "y": [1, 2]}', '\$.y')"""
+    qt_sql_json_length """SELECT json_length('{"k1":"v31","k2":300}')"""
+    qt_sql_json_length """SELECT json_length('{"a.b.c":{"k1.a1":"v31", "k2": 300},"a":"niu"}')"""
+    qt_sql_json_length """SELECT json_length('{"a":{"k1.a1":"v31", "k2": 300},"b":"niu"}','\$.a')"""
+    qt_sql_json_length """SELECT json_length('abc','\$.k1')"""
+
+    qt_select_length """SELECT id, j, json_length(j) FROM ${testTable} ORDER BY id"""
+    qt_select_length """SELECT id, j, json_length(j, '\$[1]') FROM ${testTable} ORDER BY id"""
+    qt_select_length """SELECT id, j, json_length(j, '\$.k2') FROM ${testTable} ORDER BY id"""
+    qt_select_length """SELECT id, j, json_length(null) FROM ${testTable} ORDER BY id"""
+
+    //json_contains
+    qt_sql_json_contains """SELECT json_contains('[1, 2, {"x": 3}]', '1')"""
+    qt_sql_json_contains """SELECT json_contains('[1, 2, {"x": 3}]', '{"x": 3}')"""
+    qt_sql_json_contains """SELECT json_contains('[1, 2, {"x": 3}]', '3')"""
+    qt_sql_json_contains """SELECT json_contains('[1, 2, [3, 4]]', '2')"""
+    qt_sql_json_contains """SELECT json_contains('[1, 2, [3, 4]]', '2', '\$[2]')"""
+    qt_sql_json_contains """SELECT json_contains('{"k1":"v31","k2":300}', '{"k2":300}')"""
+    qt_sql_json_contains """SELECT json_contains('{"k1":"v31","k2":300}', '{"k2":300,"k1":"v31"}')"""
+
+    qt_select_json_contains """SELECT id, j, json_contains(j, cast('true' as json)) FROM ${testTable} ORDER BY id"""
+    qt_select_json_contains """SELECT id, j, json_contains(j, cast('{"k2":300}' as json)) FROM ${testTable} ORDER BY id"""
+    qt_select_json_contains """SELECT id, j, json_contains(j, cast('{"k1":"v41","k2":400}' as json), '\$.a1') FROM ${testTable} ORDER BY id"""
+    qt_select_json_contains """SELECT id, j, json_contains(j, cast('[123,456]' as json)) FROM ${testTable} ORDER BY id"""
+
+    // json_parse
+    qt_sql_json_parse """SELECT/*+SET_VAR(enable_fold_constant_by_be=false)*/ json_parse('{"":"v1"}')"""
+    qt_sql_json_parse """SELECT/*+SET_VAR(enable_fold_constant_by_be=false)*/ json_parse('{"":1, "":"v1"}')"""
+    qt_sql_json_parse """SELECT/*+SET_VAR(enable_fold_constant_by_be=false)*/ json_parse('{"":1, "ab":"v1", "":"v1", "": 2}')"""
+    
+    // json_keys
+    qt_sql_json_keys """SELECT json_keys('{"k1":"v31","k2":300}')"""
+    qt_sql_json_keys """SELECT json_keys('{"a.b.c":{"k1.a1":"v31", "k2": 300},"a":"niu"}')"""
+    qt_sql_json_keys """SELECT json_keys('{"a":{"k1.a1":"v31", "k2": 300},"b":"niu"}','\$.a')"""
+    qt_sql_json_keys """SELECT json_keys('abc','\$.k1')"""
+    qt_sql_json_keys """SELECT json_keys('["a", "b", "c"]', '\$.k2')"""
+    qt_sql_json_keys """SELECT json_keys('["a", "b", "c"]')"""
+    qt_sql_json_keys """SELECT json_keys('["a", "b", "c"]', '\$[1]')"""
+
+    // error keys
+    test {
+        sql """ SELECT JSON_KEYS('{"a": {}, "a.b.c": {"c": 30}}', ''); """
+        exception("Invalid Json Path for value")
+    }
+
+    test {
+        sql """ SELECT JSON_KEYS('{"a": {}, "a.b.c": {"c": 30}}', 'a.b.c'); """
+        exception("Invalid Json Path for value")
+    }
+
+    // from table
+    qt_select_json_keys """SELECT id, j, json_keys(j) FROM ${testTable} ORDER BY id"""
+    qt_select_json_keys """SELECT id, j, json_keys(j, '\$.k2') FROM ${testTable} ORDER BY id"""
+    qt_select_json_keys """SELECT id, j, json_keys(j, '\$.a1') FROM ${testTable} ORDER BY id"""
+    
+    // make table with path
+    sql """ DROP TABLE IF EXISTS json_keys_table;"""
+    sql """
+        CREATE TABLE IF NOT EXISTS json_keys_table (
+            id INT,
+            j JSONB,
+            p STRING
+        )
+        DUPLICATE KEY(id)
+        DISTRIBUTED BY HASH(id) BUCKETS 10
+        PROPERTIES("replication_num" = "1");
+        """
+
+    sql """ insert into json_keys_table values (1, '{"a.b.c":{"k1.a1":"v31", "k2": 300}, "a": {}}', '\$.a'), (2, '{"a.b.c":{"k1.a1":"v31", "k2": 300}}', '\$.a.b.c'), (3, '{"a.b.c":{"k1.a1":"v31", "k2": 300}, "a": {"k1.a1": 1}}', '\$.a'), (4, '["a", "b"]', '\$.a'); """
+    qt_select_json_keys """SELECT j, p, json_keys(j, p) FROM json_keys_table ORDER BY id"""
 }

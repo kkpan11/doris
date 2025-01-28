@@ -18,7 +18,7 @@
 suite("test_query_sys", "query,p0") {
     sql "SET enable_nereids_planner=true"
     sql "SET enable_fallback_to_original_planner=false"
-    sql "use test_query_db;"
+    sql "use nereids_test_query_db;"
 
     def tableName = "test"
     sql "SELECT DATABASE();"
@@ -36,15 +36,29 @@ suite("test_query_sys", "query,p0") {
     sql "select pi();"
     sql "select e();"
     sql "select sleep(2);"
+    sql "select sleep('1.1');"
 
     // INFORMATION_SCHEMA
-    sql "SELECT table_name FROM INFORMATION_SCHEMA.TABLES where table_schema=\"test_query_db\" and TABLE_TYPE = \"BASE TABLE\" order by table_name"
-    sql "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT FROM INFORMATION_SCHEMA.COLUMNS WHERE table_name = \"${tableName}\" AND table_schema =\"test_query_db\" AND column_name LIKE \"k%\""
-    
-    // test version()
-    sql "set enable_nereids_planner=false"
-    def v1 = sql "select version()"
-    sql "set enable_nereids_planner=true"
-    def v2 = sql "select version()"
-    assertEquals(v1, v2)
+    sql "SELECT table_name FROM INFORMATION_SCHEMA.TABLES where table_schema=\"nereids_test_query_db\" and TABLE_TYPE = \"BASE TABLE\" order by table_name"
+    sql "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT FROM INFORMATION_SCHEMA.COLUMNS WHERE table_name = \"${tableName}\" AND table_schema =\"nereids_test_query_db\" AND column_name LIKE \"k%\""
+
+    test {
+        sql "select random(random());"
+        exception "The param of rand function must be literal"
+    }
+
+    sql """
+        CREATE TABLE IF NOT EXISTS `test_random` (
+        fcst_emp varchar(128) NOT NULL
+        ) ENGINE=OLAP
+        DISTRIBUTED BY HASH(`fcst_emp`)
+        PROPERTIES(
+        "replication_num" = "1",
+        "compression" = "LZ4" );
+    """
+    sql """ insert into test_random values('123,1233,4123,3131'); """
+    test {
+        sql "select random(1,array_size(split_by_string(fcst_emp,','))) from test_random;"
+        exception "The param of rand function must be literal"
+    }
 }

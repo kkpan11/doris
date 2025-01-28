@@ -20,12 +20,13 @@
 
 #pragma once
 
-#include <limits.h>
-#include <stddef.h>
+#include <gen_cpp/Types_types.h>
 
 #include <boost/intrusive/detail/algo_type.hpp>
 #include <boost/intrusive/list.hpp>
 #include <boost/intrusive/list_hook.hpp>
+#include <climits>
+#include <cstddef>
 // IWYU pragma: no_include <bits/chrono.h>
 #include <chrono> // IWYU pragma: keep
 #include <condition_variable>
@@ -37,19 +38,23 @@
 #include <string>
 #include <unordered_set>
 
+#include "agent/cgroup_cpu_ctl.h"
 #include "common/status.h"
+#include "util/interval_histogram.h"
+#include "util/metrics.h"
+#include "util/uid_util.h"
+#include "util/work_thread_pool.hpp"
 
 namespace doris {
 
 class Thread;
 class ThreadPool;
 class ThreadPoolToken;
-class PriorityThreadPool;
 
 class Runnable {
 public:
     virtual void run() = 0;
-    virtual ~Runnable() {}
+    virtual ~Runnable() = default;
 };
 
 // ThreadPool takes a lot of arguments. We provide sane defaults with a builder.
@@ -99,13 +104,14 @@ public:
 //
 class ThreadPoolBuilder {
 public:
-    explicit ThreadPoolBuilder(std::string name);
+    explicit ThreadPoolBuilder(std::string name, std::string workload_group = "");
 
     // Note: We violate the style guide by returning mutable references here
     // in order to provide traditional Builder pattern conveniences.
     ThreadPoolBuilder& set_min_threads(int min_threads);
     ThreadPoolBuilder& set_max_threads(int max_threads);
     ThreadPoolBuilder& set_max_queue_size(int max_queue_size);
+    ThreadPoolBuilder& set_cgroup_cpu_ctl(std::weak_ptr<CgroupCpuCtl> cgroup_cpu_ctl);
     template <class Rep, class Period>
     ThreadPoolBuilder& set_idle_timeout(const std::chrono::duration<Rep, Period>& idle_timeout) {
         _idle_timeout = std::chrono::duration_cast<std::chrono::milliseconds>(idle_timeout);
@@ -125,16 +131,18 @@ public:
         return Status::OK();
     }
 
+    ThreadPoolBuilder(const ThreadPoolBuilder&) = delete;
+    void operator=(const ThreadPoolBuilder&) = delete;
+
 private:
     friend class ThreadPool;
     const std::string _name;
+    const std::string _workload_group;
     int _min_threads;
     int _max_threads;
     int _max_queue_size;
+    std::weak_ptr<CgroupCpuCtl> _cgroup_cpu_ctl;
     std::chrono::milliseconds _idle_timeout;
-
-    ThreadPoolBuilder(const ThreadPoolBuilder&) = delete;
-    void operator=(const ThreadPoolBuilder&) = delete;
 
     template <typename T>
     static constexpr bool always_false_v = false;
@@ -253,6 +261,27 @@ public:
         return _total_queued_tasks;
     }
 
+    int get_max_queue_size() const {
+        std::lock_guard<std::mutex> l(_lock);
+        return _max_queue_size;
+    }
+
+    std::vector<int> debug_info() const {
+        std::lock_guard<std::mutex> l(_lock);
+        std::vector<int> arr = {_num_threads, static_cast<int>(_threads.size()), _min_threads,
+                                _max_threads};
+        return arr;
+    }
+
+    std::string get_info() const {
+        std::lock_guard<std::mutex> l(_lock);
+        return fmt::format("ThreadPool(name={}, threads(active/pending)=({}/{}), queued_task={})",
+                           _name, _active_threads, _num_threads_pending_start, _total_queued_tasks);
+    }
+
+    ThreadPool(const ThreadPool&) = delete;
+    void operator=(const ThreadPool&) = delete;
+
 private:
     friend class ThreadPoolBuilder;
     friend class ThreadPoolToken;
@@ -262,7 +291,7 @@ private:
         std::shared_ptr<Runnable> runnable;
 
         // Time at which the entry was submitted to the pool.
-        std::chrono::time_point<std::chrono::system_clock> submit_time;
+        MonotonicStopWatch submit_time_wather;
     };
 
     // Creates a new thread pool using a builder.
@@ -289,7 +318,11 @@ private:
     // Releases token 't' and invalidates it.
     void release_token(ThreadPoolToken* t);
 
+    //NOTE: not thread safe, caller should keep it thread-safe by using lock
+    Status try_create_thread(int thread_num, std::lock_guard<std::mutex>&);
+
     const std::string _name;
+    const std::string _workload_group;
     int _min_threads;
     int _max_threads;
     const int _max_queue_size;
@@ -335,6 +368,8 @@ private:
     // Protected by _lock.
     int _total_queued_tasks;
 
+    std::weak_ptr<CgroupCpuCtl> _cgroup_cpu_ctl;
+
     // All allocated tokens.
     //
     // Protected by _lock.
@@ -360,7 +395,7 @@ private:
     //
     // Protected by _lock.
     struct IdleThread : public boost::intrusive::list_base_hook<> {
-        explicit IdleThread() {}
+        explicit IdleThread() = default;
 
         // Condition variable for "queue is not empty". Waiters wake up when a new
         // task is queued.
@@ -372,9 +407,20 @@ private:
 
     // ExecutionMode::CONCURRENT token used by the pool for tokenless submission.
     std::unique_ptr<ThreadPoolToken> _tokenless;
+    const UniqueId _id;
 
-    ThreadPool(const ThreadPool&) = delete;
-    void operator=(const ThreadPool&) = delete;
+    std::shared_ptr<MetricEntity> _metric_entity;
+    IntGauge* thread_pool_active_threads = nullptr;
+    IntGauge* thread_pool_queue_size = nullptr;
+    IntGauge* thread_pool_max_queue_size = nullptr;
+    IntGauge* thread_pool_max_threads = nullptr;
+    IntGauge* task_execution_time_ns_avg_in_last_1000_times = nullptr;
+    IntGauge* task_wait_worker_ns_avg_in_last_1000_times = nullptr;
+
+    IntervalHistogramStat<int64_t> _task_execution_time_ns_statistic {1000};
+    IntervalHistogramStat<int64_t> _task_wait_worker_time_ns_statistic {1000};
+
+    IntCounter* thread_pool_submit_failed = nullptr;
 };
 
 // Entry point for token-based task submission and blocking for a particular
@@ -421,6 +467,9 @@ public:
         std::lock_guard<std::mutex> l(_pool->_lock);
         return _entries.size();
     }
+
+    ThreadPoolToken(const ThreadPoolToken&) = delete;
+    void operator=(const ThreadPoolToken&) = delete;
 
 private:
     // All possible token states. Legal state transitions:
@@ -482,7 +531,7 @@ private:
     ThreadPool::ExecutionMode _mode;
 
     // Pointer to the token's thread pool.
-    ThreadPool* _pool;
+    ThreadPool* _pool = nullptr;
 
     // Token state machine.
     State _state;
@@ -504,9 +553,6 @@ private:
     int _num_submitted_tasks;
     // Number of tasks which has not been submitted to the thread pool's queue.
     int _num_unsubmitted_tasks;
-
-    ThreadPoolToken(const ThreadPoolToken&) = delete;
-    void operator=(const ThreadPoolToken&) = delete;
 };
 
 } // namespace doris

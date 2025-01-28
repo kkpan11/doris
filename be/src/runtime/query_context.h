@@ -18,80 +18,142 @@
 #pragma once
 
 #include <gen_cpp/PaloInternalService_types.h>
+#include <gen_cpp/RuntimeProfile_types.h>
 #include <gen_cpp/Types_types.h>
+#include <glog/logging.h>
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 
 #include "common/config.h"
 #include "common/factory_creator.h"
 #include "common/object_pool.h"
-#include "runtime/datetime_value.h"
 #include "runtime/exec_env.h"
 #include "runtime/memory/mem_tracker_limiter.h"
+#include "runtime/query_statistics.h"
 #include "runtime/runtime_filter_mgr.h"
 #include "runtime/runtime_predicate.h"
-#include "task_group/task_group.h"
-#include "util/pretty_printer.h"
+#include "runtime/workload_management/resource_context.h"
+#include "util/hash_util.hpp"
 #include "util/threadpool.h"
 #include "vec/exec/scan/scanner_scheduler.h"
 #include "vec/runtime/shared_hash_table_controller.h"
-#include "vec/runtime/shared_scanner_controller.h"
+#include "workload_group/workload_group.h"
 
 namespace doris {
+
+namespace pipeline {
+class PipelineFragmentContext;
+} // namespace pipeline
+
+struct ReportStatusRequest {
+    const Status status;
+    std::vector<RuntimeState*> runtime_states;
+    bool done;
+    TNetworkAddress coord_addr;
+    TUniqueId query_id;
+    int fragment_id;
+    TUniqueId fragment_instance_id;
+    int backend_num;
+    RuntimeState* runtime_state;
+    std::function<void(const Status&)> cancel_fn;
+};
+
+enum class QuerySource {
+    INTERNAL_FRONTEND,
+    STREAM_LOAD,
+    GROUP_COMMIT_LOAD,
+    ROUTINE_LOAD,
+    EXTERNAL_CONNECTOR
+};
+
+const std::string toString(QuerySource query_source);
 
 // Save the common components of fragments in a query.
 // Some components like DescriptorTbl may be very large
 // that will slow down each execution of fragments when DeSer them every time.
 class DescriptorTbl;
-class QueryContext {
+class QueryContext : public std::enable_shared_from_this<QueryContext> {
     ENABLE_FACTORY_CREATOR(QueryContext);
 
 public:
-    QueryContext(int total_fragment_num, ExecEnv* exec_env, const TQueryOptions& query_options)
-            : fragment_num(total_fragment_num),
-              timeout_second(-1),
-              _exec_env(exec_env),
-              _runtime_filter_mgr(new RuntimeFilterMgr(TUniqueId(), this)),
-              _query_options(query_options) {
-        _start_time = vectorized::VecDateTimeValue::local_time();
-        _shared_hash_table_controller.reset(new vectorized::SharedHashTableController());
-        _shared_scanner_controller.reset(new vectorized::SharedScannerController());
-    }
+    class QueryTaskController : public TaskController {
+        ENABLE_FACTORY_CREATOR(QueryTaskController);
 
-    ~QueryContext() {
-        // query mem tracker consumption is equal to 0, it means that after QueryContext is created,
-        // it is found that query already exists in _query_ctx_map, and query mem tracker is not used.
-        // query mem tracker consumption is not equal to 0 after use, because there is memory consumed
-        // on query mem tracker, released on other trackers.
-        if (query_mem_tracker->peak_consumption() != 0) {
-            LOG(INFO) << fmt::format(
-                    "Deregister query/load memory tracker, queryId={}, Limit={}, CurrUsed={}, "
-                    "PeakUsed={}",
-                    print_id(query_id), MemTracker::print_bytes(query_mem_tracker->limit()),
-                    MemTracker::print_bytes(query_mem_tracker->consumption()),
-                    MemTracker::print_bytes(query_mem_tracker->peak_consumption()));
-        }
-        if (_task_group) {
-            _task_group->remove_mem_tracker_limiter(query_mem_tracker);
-        }
-    }
+    public:
+        static std::unique_ptr<TaskController> create(QueryContext* query_ctx);
 
-    // Notice. For load fragments, the fragment_num sent by FE has a small probability of 0.
-    // this may be a bug, bug <= 1 in theory it shouldn't cause any problems at this stage.
-    bool countdown() { return fragment_num.fetch_sub(1) <= 1; }
+        bool is_cancelled() const override;
+        Status cancel(const Status& reason, int fragment_id);
+        Status cancel(const Status& reason) override { return cancel(reason, -1); }
+
+    private:
+        QueryTaskController(const std::shared_ptr<QueryContext>& query_ctx)
+                : query_ctx_(query_ctx) {}
+
+        const std::weak_ptr<QueryContext> query_ctx_;
+    };
+
+    class QueryMemoryContext : public MemoryContext {
+        ENABLE_FACTORY_CREATOR(QueryMemoryContext);
+
+    public:
+        static std::unique_ptr<MemoryContext> create();
+
+        int64_t revokable_bytes() override {
+            // TODO
+            return 0;
+        }
+
+        bool ready_do_revoke() override {
+            // TODO
+            return true;
+        }
+
+        Status revoke(int64_t bytes) override {
+            // TODO
+            return Status::OK();
+        }
+
+        Status enter_arbitration(Status reason) override {
+            // TODO, pause the pipeline
+            return Status::OK();
+        }
+
+        Status leave_arbitration(Status reason) override {
+            // TODO, start pipeline
+            return Status::OK();
+        }
+
+    private:
+        QueryMemoryContext() = default;
+    };
+
+    static std::shared_ptr<QueryContext> create(TUniqueId query_id, ExecEnv* exec_env,
+                                                const TQueryOptions& query_options,
+                                                TNetworkAddress coord_addr, bool is_nereids,
+                                                TNetworkAddress current_connect_fe,
+                                                QuerySource query_type);
+
+    // use QueryContext::create, cannot be made private because of ENABLE_FACTORY_CREATOR::create_shared.
+    QueryContext(TUniqueId query_id, ExecEnv* exec_env, const TQueryOptions& query_options,
+                 TNetworkAddress coord_addr, bool is_nereids, TNetworkAddress current_connect_fe,
+                 QuerySource query_type);
+
+    ~QueryContext();
+
+    void init_query_task_controller();
 
     ExecEnv* exec_env() { return _exec_env; }
 
-    bool is_timeout(const vectorized::VecDateTimeValue& now) const {
-        if (timeout_second <= 0) {
+    bool is_timeout(timespec now) const {
+        if (_timeout_second <= 0) {
             return false;
         }
-        if (now.second_diff(_start_time) > timeout_second) {
-            return true;
-        }
-        return false;
+        return _query_watcher.elapsed_time_seconds(now) > _timeout_second;
     }
 
     void set_thread_token(int concurrency, bool is_serial) {
@@ -103,52 +165,42 @@ public:
 
     ThreadPoolToken* get_token() { return _thread_token.get(); }
 
-    void set_ready_to_execute(bool is_cancelled) {
-        {
-            std::lock_guard<std::mutex> l(_start_lock);
-            _is_cancelled = is_cancelled;
-            _ready_to_execute = true;
-        }
-        if (query_mem_tracker && is_cancelled) {
-            query_mem_tracker->set_is_query_cancelled(is_cancelled);
-        }
-        _start_cond.notify_all();
-    }
-    void set_ready_to_execute_only() {
-        {
-            std::lock_guard<std::mutex> l(_start_lock);
-            _ready_to_execute = true;
-        }
-        _start_cond.notify_all();
-    }
+    void set_ready_to_execute(Status reason);
 
-    bool is_ready_to_execute() {
-        std::lock_guard<std::mutex> l(_start_lock);
-        return _ready_to_execute;
-    }
+    [[nodiscard]] bool is_cancelled() const { return !_exec_status.ok(); }
 
-    bool wait_for_start() {
-        int wait_time = config::max_fragment_start_wait_time_seconds;
-        std::unique_lock<std::mutex> l(_start_lock);
-        while (!_ready_to_execute.load() && !_is_cancelled.load() && --wait_time > 0) {
-            _start_cond.wait_for(l, std::chrono::seconds(1));
-        }
-        return _ready_to_execute.load() && !_is_cancelled.load();
-    }
+    void cancel_all_pipeline_context(const Status& reason, int fragment_id = -1);
+    std::string print_all_pipeline_context();
+    void set_pipeline_context(const int fragment_id,
+                              std::shared_ptr<pipeline::PipelineFragmentContext> pip_ctx);
+    void cancel(Status new_status, int fragment_id = -1);
+
+    [[nodiscard]] Status exec_status() { return _exec_status.status(); }
+
+    void set_execution_dependency_ready();
+
+    void set_ready_to_execute_only();
 
     std::shared_ptr<vectorized::SharedHashTableController> get_shared_hash_table_controller() {
         return _shared_hash_table_controller;
     }
 
-    std::shared_ptr<vectorized::SharedScannerController> get_shared_scanner_controller() {
-        return _shared_scanner_controller;
+    bool has_runtime_predicate(int source_node_id) {
+        return _runtime_predicates.contains(source_node_id);
     }
 
-    vectorized::RuntimePredicate& get_runtime_predicate() { return _runtime_predicate; }
+    vectorized::RuntimePredicate& get_runtime_predicate(int source_node_id) {
+        DCHECK(has_runtime_predicate(source_node_id));
+        return _runtime_predicates.find(source_node_id)->second;
+    }
 
-    void set_task_group(taskgroup::TaskGroupPtr& tg) { _task_group = tg; }
+    void init_runtime_predicates(const std::vector<TTopnFilterDesc>& topn_filter_descs) {
+        for (auto desc : topn_filter_descs) {
+            _runtime_predicates.try_emplace(desc.source_node_id, desc);
+        }
+    }
 
-    taskgroup::TaskGroup* get_task_group() const { return _task_group.get(); }
+    void set_workload_group(WorkloadGroupPtr& tg);
 
     int execution_timeout() const {
         return _query_options.__isset.execution_timeout ? _query_options.execution_timeout
@@ -159,9 +211,9 @@ public:
         return _query_options.runtime_filter_wait_time_ms;
     }
 
-    bool enable_pipeline_exec() const {
-        return _query_options.__isset.enable_pipeline_engine &&
-               _query_options.enable_pipeline_engine;
+    bool runtime_filter_wait_infinitely() const {
+        return _query_options.__isset.runtime_filter_wait_infinitely &&
+               _query_options.runtime_filter_wait_infinitely;
     }
 
     int be_exec_version() const {
@@ -171,57 +223,210 @@ public:
         return _query_options.be_exec_version;
     }
 
+    [[nodiscard]] int64_t get_fe_process_uuid() const {
+        return _query_options.__isset.fe_process_uuid ? _query_options.fe_process_uuid : 0;
+    }
+
+    bool ignore_runtime_filter_error() const {
+        return _query_options.__isset.ignore_runtime_filter_error
+                       ? _query_options.ignore_runtime_filter_error
+                       : false;
+    }
+
+    // global runtime filter mgr, the runtime filter have remote target or
+    // need local merge should regist here. before publish() or push_to_remote()
+    // the runtime filter should do the local merge work
     RuntimeFilterMgr* runtime_filter_mgr() { return _runtime_filter_mgr.get(); }
 
-public:
-    TUniqueId query_id;
-    DescriptorTbl* desc_tbl;
+    TUniqueId query_id() const { return _query_id; }
+
+    vectorized::SimplifiedScanScheduler* get_scan_scheduler() { return _scan_task_scheduler; }
+
+    vectorized::SimplifiedScanScheduler* get_remote_scan_scheduler() {
+        return _remote_scan_task_scheduler;
+    }
+
+    pipeline::Dependency* get_execution_dependency() { return _execution_dependency.get(); }
+
+    void register_query_statistics(std::shared_ptr<QueryStatistics> qs);
+
+    std::shared_ptr<QueryStatistics> get_query_statistics();
+
+    void register_memory_statistics();
+
+    void register_cpu_statistics();
+
+    std::shared_ptr<QueryStatistics> get_cpu_statistics() { return _cpu_statistics; }
+
+    doris::pipeline::TaskScheduler* get_pipe_exec_scheduler();
+
+    ThreadPool* get_memtable_flush_pool();
+
+    int64_t mem_limit() const { return _bytes_limit; }
+
+    void set_merge_controller_handler(
+            std::shared_ptr<RuntimeFilterMergeControllerEntity>& handler) {
+        _merge_controller_handler = handler;
+    }
+
+    bool is_nereids() const { return _is_nereids; }
+
+    WorkloadGroupPtr workload_group() const {
+        return resource_ctx->workload_group_context()->workload_group();
+    }
+    std::shared_ptr<MemTrackerLimiter> query_mem_tracker() const {
+        return resource_ctx->memory_context()->mem_tracker();
+    }
+
+    void inc_running_big_mem_op_num() {
+        _running_big_mem_op_num.fetch_add(1, std::memory_order_relaxed);
+    }
+    void dec_running_big_mem_op_num() {
+        _running_big_mem_op_num.fetch_sub(1, std::memory_order_relaxed);
+    }
+    int32_t get_running_big_mem_op_num() {
+        return _running_big_mem_op_num.load(std::memory_order_relaxed);
+    }
+
+    void set_spill_threshold(int64_t spill_threshold) { _spill_threshold = spill_threshold; }
+    int64_t spill_threshold() { return _spill_threshold; }
+    DescriptorTbl* desc_tbl = nullptr;
     bool set_rsc_info = false;
     std::string user;
     std::string group;
     TNetworkAddress coord_addr;
+    TNetworkAddress current_connect_fe;
     TQueryGlobals query_globals;
 
-    /// In the current implementation, for multiple fragments executed by a query on the same BE node,
-    /// we store some common components in QueryContext, and save QueryContext in FragmentMgr.
-    /// When all Fragments are executed, QueryContext needs to be deleted from FragmentMgr.
-    /// Here we use a counter to store the number of Fragments that have not yet been completed,
-    /// and after each Fragment is completed, this value will be reduced by one.
-    /// When the last Fragment is completed, the counter is cleared, and the worker thread of the last Fragment
-    /// will clean up QueryContext.
-    std::atomic<int> fragment_num;
-    int timeout_second;
     ObjectPool obj_pool;
-    // MemTracker that is shared by all fragment instances running on this host.
-    std::shared_ptr<MemTrackerLimiter> query_mem_tracker;
 
-    std::vector<TUniqueId> fragment_ids;
+    std::shared_ptr<ResourceContext> resource_ctx;
+
+    std::vector<TUniqueId> fragment_instance_ids;
+
+    // plan node id -> TFileScanRangeParams
+    // only for file scan node
+    std::map<int, TFileScanRangeParams> file_scan_range_params_map;
+
+    void update_cpu_time(int64_t delta_cpu_time) const {
+        if (workload_group() != nullptr) {
+            workload_group()->update_cpu_time(delta_cpu_time);
+        }
+    }
+
+    void add_using_brpc_stub(const TNetworkAddress& network_address,
+                             std::shared_ptr<PBackendService_Stub> brpc_stub) {
+        if (network_address.port == 0) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(_brpc_stubs_mutex);
+        if (!_using_brpc_stubs.contains(network_address)) {
+            _using_brpc_stubs.emplace(network_address, brpc_stub);
+        }
+
+        DCHECK_EQ(_using_brpc_stubs[network_address].get(), brpc_stub.get());
+    }
+
+    std::unordered_map<TNetworkAddress, std::shared_ptr<PBackendService_Stub>>
+    get_using_brpc_stubs() {
+        std::lock_guard<std::mutex> lock(_brpc_stubs_mutex);
+        return _using_brpc_stubs;
+    }
 
 private:
-    ExecEnv* _exec_env;
-    vectorized::VecDateTimeValue _start_time;
+    int _timeout_second;
+    TUniqueId _query_id;
+    ExecEnv* _exec_env = nullptr;
+    MonotonicStopWatch _query_watcher;
+    int64_t _bytes_limit = 0;
+    bool _is_nereids = false;
+    std::atomic<int> _running_big_mem_op_num = 0;
 
     // A token used to submit olap scanner to the "_limited_scan_thread_pool",
     // This thread pool token is created from "_limited_scan_thread_pool" from exec env.
     // And will be shared by all instances of this query.
     // So that we can control the max thread that a query can be used to execute.
     // If this token is not set, the scanner will be executed in "_scan_thread_pool" in exec env.
-    std::unique_ptr<ThreadPoolToken> _thread_token;
+    std::unique_ptr<ThreadPoolToken> _thread_token {nullptr};
 
-    std::mutex _start_lock;
-    std::condition_variable _start_cond;
-    // Only valid when _need_wait_execution_trigger is set to true in FragmentExecState.
-    // And all fragments of this query will start execution when this is set to true.
-    std::atomic<bool> _ready_to_execute {false};
-    std::atomic<bool> _is_cancelled {false};
+    void _init_resource_context();
+    void _init_query_mem_tracker();
 
     std::shared_ptr<vectorized::SharedHashTableController> _shared_hash_table_controller;
-    std::shared_ptr<vectorized::SharedScannerController> _shared_scanner_controller;
-    vectorized::RuntimePredicate _runtime_predicate;
+    std::unordered_map<int, vectorized::RuntimePredicate> _runtime_predicates;
 
-    taskgroup::TaskGroupPtr _task_group;
     std::unique_ptr<RuntimeFilterMgr> _runtime_filter_mgr;
     const TQueryOptions _query_options;
+
+    // All pipeline tasks use the same query context to report status. So we need a `_exec_status`
+    // to report the real message if failed.
+    AtomicStatus _exec_status;
+
+    doris::pipeline::TaskScheduler* _task_scheduler = nullptr;
+    vectorized::SimplifiedScanScheduler* _scan_task_scheduler = nullptr;
+    ThreadPool* _memtable_flush_pool = nullptr;
+    vectorized::SimplifiedScanScheduler* _remote_scan_task_scheduler = nullptr;
+    std::unique_ptr<pipeline::Dependency> _execution_dependency;
+
+    std::shared_ptr<QueryStatistics> _cpu_statistics = nullptr;
+    // This shared ptr is never used. It is just a reference to hold the object.
+    // There is a weak ptr in runtime filter manager to reference this object.
+    std::shared_ptr<RuntimeFilterMergeControllerEntity> _merge_controller_handler;
+
+    std::map<int, std::weak_ptr<pipeline::PipelineFragmentContext>> _fragment_id_to_pipeline_ctx;
+    std::mutex _pipeline_map_write_lock;
+
+    std::atomic<int64_t> _spill_threshold {0};
+
+    std::mutex _profile_mutex;
+    timespec _query_arrival_timestamp;
+    // Distinguish the query source, for query that comes from fe, we will have some memory structure on FE to
+    // help us manage the query.
+    QuerySource _query_source;
+
+    std::mutex _brpc_stubs_mutex;
+    std::unordered_map<TNetworkAddress, std::shared_ptr<PBackendService_Stub>> _using_brpc_stubs;
+
+    // when fragment of pipeline is closed, it will register its profile to this map by using add_fragment_profile
+    // flatten profile of one fragment:
+    // Pipeline 0
+    //      PipelineTask 0
+    //              Operator 1
+    //              Operator 2
+    //              Scanner
+    //      PipelineTask 1
+    //              Operator 1
+    //              Operator 2
+    //              Scanner
+    // Pipeline 1
+    //      PipelineTask 2
+    //              Operator 3
+    //      PipelineTask 3
+    //              Operator 3
+    // fragment_id -> list<profile>
+    std::unordered_map<int, std::vector<std::shared_ptr<TRuntimeProfileTree>>> _profile_map;
+    std::unordered_map<int, std::shared_ptr<TRuntimeProfileTree>> _load_channel_profile_map;
+
+    void _report_query_profile();
+
+    std::unordered_map<int, std::vector<std::shared_ptr<TRuntimeProfileTree>>>
+    _collect_realtime_query_profile() const;
+
+public:
+    // when fragment of pipeline is closed, it will register its profile to this map by using add_fragment_profile
+    void add_fragment_profile(
+            int fragment_id,
+            const std::vector<std::shared_ptr<TRuntimeProfileTree>>& pipeline_profile,
+            std::shared_ptr<TRuntimeProfileTree> load_channel_profile);
+
+    TReportExecStatusParams get_realtime_exec_status() const;
+
+    bool enable_profile() const {
+        return _query_options.__isset.enable_profile && _query_options.enable_profile;
+    }
+
+    timespec get_query_arrival_timestamp() const { return this->_query_arrival_timestamp; }
+    QuerySource get_query_source() const { return this->_query_source; }
 };
 
 } // namespace doris

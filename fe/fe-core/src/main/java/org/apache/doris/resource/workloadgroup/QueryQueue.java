@@ -17,12 +17,18 @@
 
 package org.apache.doris.resource.workloadgroup;
 
-import com.google.common.base.Preconditions;
+import org.apache.doris.catalog.Env;
+import org.apache.doris.common.Pair;
+import org.apache.doris.common.UserException;
+import org.apache.doris.resource.AdmissionControl;
+import org.apache.doris.resource.workloadgroup.QueueToken.TokenState;
+
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.Condition;
+import java.util.LinkedList;
+import java.util.PriorityQueue;
+import java.util.Queue;
 import java.util.concurrent.locks.ReentrantLock;
 
 // note(wb) refer java BlockingQueue, but support altering capacity
@@ -32,85 +38,150 @@ public class QueryQueue {
     private static final Logger LOG = LogManager.getLogger(QueryQueue.class);
     // note(wb) used unfair by default, need more test later
     private final ReentrantLock queueLock = new ReentrantLock();
-    private final Condition queueLockCond = queueLock.newCondition();
     // resource group property
     private int maxConcurrency;
     private int maxQueueSize;
     private int queueTimeout; // ms
-    // running property
-    private int currentRunningQueryNum;
-    private int currentWaitingQueryNum;
 
-    public QueryQueue(int maxConcurrency, int maxQueueSize, int queueTimeout) {
+    public static final String RUNNING_QUERY_NUM = "running_query_num";
+    public static final String WAITING_QUERY_NUM = "waiting_query_num";
+
+    private long wgId;
+
+    private long propVersion;
+
+    private PriorityQueue<QueueToken> waitingQueryQueue;
+    private Queue<QueueToken> runningQueryQueue;
+
+    Pair<Integer, Integer> getQueryQueueDetail() {
+        try {
+            queueLock.lock();
+            return Pair.of(runningQueryQueue.size(), waitingQueryQueue.size());
+        } finally {
+            queueLock.unlock();
+        }
+    }
+
+    long getPropVersion() {
+        return propVersion;
+    }
+
+    long getWgId() {
+        return wgId;
+    }
+
+    int getMaxConcurrency() {
+        return maxConcurrency;
+    }
+
+    int getMaxQueueSize() {
+        return maxQueueSize;
+    }
+
+    int getQueueTimeout() {
+        return queueTimeout;
+    }
+
+    public QueryQueue(long wgId, int maxConcurrency, int maxQueueSize, int queueTimeout, long propVersion) {
+        this.wgId = wgId;
         this.maxConcurrency = maxConcurrency;
         this.maxQueueSize = maxQueueSize;
         this.queueTimeout = queueTimeout;
+        this.propVersion = propVersion;
+        this.waitingQueryQueue = new PriorityQueue<QueueToken>();
+        this.runningQueryQueue = new LinkedList<QueueToken>();
     }
 
     public String debugString() {
-        return "maxConcurrency=" + maxConcurrency + ", maxQueueSize=" + maxQueueSize + ", queueTimeout=" + queueTimeout
-                + ", currentRunningQueryNum=" + currentRunningQueryNum + ", currentWaitingQueryNum="
-                + currentWaitingQueryNum;
+        return "wgId= " + wgId + ", version=" + this.propVersion + ",maxConcurrency=" + maxConcurrency
+                + ", maxQueueSize=" + maxQueueSize + ", queueTimeout=" + queueTimeout + ", currentRunningQueryNum="
+                + runningQueryQueue.size() + ", currentWaitingQueryNum=" + waitingQueryQueue.size();
     }
 
-    public QueueOfferToken offer() throws InterruptedException {
-        // to prevent hang
-        // the lock shouldn't be hold for too long
-        // we should catch the case when it happens
-        queueLock.tryLock(5, TimeUnit.SECONDS);
+    public QueueToken getToken() throws UserException {
+        AdmissionControl admissionControl = Env.getCurrentEnv().getAdmissionControl();
+        queueLock.lock();
         try {
-            // currentRunningQueryNum may bigger than maxRunningQueryNum
-            // because maxRunningQueryNum can be altered
-            if (currentRunningQueryNum >= maxConcurrency) {
-                if (currentWaitingQueryNum >= maxQueueSize) {
-                    LOG.debug(this.debugString());
-                    return new QueueOfferToken(false, "query waiting queue is full, queue length=" + maxQueueSize);
-                }
-
-                currentWaitingQueryNum++;
-                boolean ret;
-                try {
-                    ret = queueLockCond.await(queueTimeout, TimeUnit.MILLISECONDS);
-                } finally {
-                    currentWaitingQueryNum--;
-                }
-                if (!ret) {
-                    LOG.debug(this.debugString());
-                    return new QueueOfferToken(false, "query wait timeout " + queueTimeout + " ms");
-                }
+            if (LOG.isDebugEnabled()) {
+                LOG.info(this.debugString());
             }
-            currentRunningQueryNum++;
-            return new QueueOfferToken(true, "offer success");
+            QueueToken queueToken = new QueueToken(queueTimeout, this);
+
+            boolean isReachMaxCon = runningQueryQueue.size() >= maxConcurrency;
+            boolean isResourceAvailable = admissionControl.checkResourceAvailable(queueToken);
+            if (!isReachMaxCon && isResourceAvailable) {
+                runningQueryQueue.offer(queueToken);
+                queueToken.complete();
+                return queueToken;
+            } else if (waitingQueryQueue.size() >= maxQueueSize) {
+                throw new UserException("query waiting queue is full, queue length=" + maxQueueSize);
+            } else {
+                if (isReachMaxCon) {
+                    queueToken.setQueueMsg("WAIT_IN_QUEUE");
+                }
+                queueToken.setTokenState(TokenState.ENQUEUE_SUCCESS);
+                this.waitingQueryQueue.offer(queueToken);
+                // if a query is added to wg's queue but not in AdmissionControl's
+                // queue may be blocked by be memory later,
+                // then we should put query to AdmissionControl in releaseAndNotify, it's too complicated.
+                // To simplify the code logic, put all waiting query to AdmissionControl,
+                // waiting query can be notified when query finish or memory is enough.
+                admissionControl.addQueueToken(queueToken);
+            }
+            return queueToken;
         } finally {
+            if (LOG.isDebugEnabled()) {
+                LOG.info(this.debugString());
+            }
             queueLock.unlock();
         }
     }
 
-    public void poll() throws InterruptedException {
-        queueLock.tryLock(5, TimeUnit.SECONDS);
+    public void notifyWaitQuery() {
+        releaseAndNotify(null);
+    }
+
+    public void releaseAndNotify(QueueToken releaseToken) {
+        AdmissionControl admissionControl = Env.getCurrentEnv().getAdmissionControl();
+        queueLock.lock();
         try {
-            currentRunningQueryNum--;
-            Preconditions.checkArgument(currentRunningQueryNum >= 0);
-            // maybe only when currentWaitingQueryNum != 0 need to signal
-            queueLockCond.signal();
+            runningQueryQueue.remove(releaseToken);
+            waitingQueryQueue.remove(releaseToken);
+            admissionControl.removeQueueToken(releaseToken);
+            while (runningQueryQueue.size() < maxConcurrency) {
+                QueueToken queueToken = waitingQueryQueue.peek();
+                if (queueToken == null) {
+                    break;
+                }
+                if (admissionControl.checkResourceAvailable(queueToken)) {
+                    queueToken.complete();
+                    runningQueryQueue.offer(queueToken);
+                    waitingQueryQueue.remove();
+                    admissionControl.removeQueueToken(queueToken);
+                } else {
+                    break;
+                }
+            }
         } finally {
             queueLock.unlock();
+            if (LOG.isDebugEnabled()) {
+                LOG.info(this.debugString());
+            }
         }
     }
 
-    public void resetQueueProperty(int maxConcurrency, int maxQueueSize, int queryWaitTimeout) {
+    public void resetQueueProperty(int maxConcurrency, int maxQueueSize, int queryWaitTimeout, long version) {
+        queueLock.lock();
         try {
-            queueLock.tryLock(5, TimeUnit.SECONDS);
-            try {
-                this.maxConcurrency = maxConcurrency;
-                this.maxQueueSize = maxQueueSize;
-                this.queueTimeout = queryWaitTimeout;
-            } finally {
-                queueLock.unlock();
+            this.maxConcurrency = maxConcurrency;
+            this.maxQueueSize = maxQueueSize;
+            this.queueTimeout = queryWaitTimeout;
+            this.propVersion = version;
+        } finally {
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(this.debugString());
             }
-        } catch (InterruptedException e) {
-            LOG.error("reset queue property failed, ", e);
-            throw new RuntimeException("reset queue property failed, reason=" + e.getMessage());
+            queueLock.unlock();
         }
     }
 

@@ -56,6 +56,8 @@ public:
         PageBuilderOptions options;
         options.data_page_size = 256 * 1024;
         PageBuilderType page_builder(options);
+        Status ret0 = page_builder.init();
+        EXPECT_TRUE(ret0.ok());
 
         page_builder.add(reinterpret_cast<const uint8_t*>(src), &size);
         OwnedSlice s = page_builder.finish();
@@ -121,6 +123,8 @@ public:
         PageBuilderOptions options;
         options.data_page_size = 256 * 1024;
         PageBuilderType page_builder(options);
+        Status ret0 = page_builder.init();
+        EXPECT_TRUE(ret0.ok());
 
         page_builder.add(reinterpret_cast<const uint8_t*>(src), &size);
         OwnedSlice s = page_builder.finish();
@@ -165,7 +169,7 @@ public:
         EXPECT_FALSE(exact_match);
 
         status = page_decoder.seek_at_or_after_value(bigger_than_biggest, &exact_match);
-        EXPECT_EQ(status.code(), NOT_FOUND);
+        EXPECT_EQ(status.code(), ENTRY_NOT_FOUND);
     }
 };
 

@@ -30,37 +30,26 @@ import org.apache.doris.analysis.FunctionParams;
 import org.apache.doris.analysis.ImportColumnDesc;
 import org.apache.doris.analysis.IsNullPredicate;
 import org.apache.doris.analysis.NullLiteral;
-import org.apache.doris.analysis.PartitionNames;
 import org.apache.doris.analysis.SlotDescriptor;
 import org.apache.doris.analysis.SlotRef;
 import org.apache.doris.analysis.StringLiteral;
 import org.apache.doris.analysis.TupleDescriptor;
-import org.apache.doris.catalog.AggregateType;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
-import org.apache.doris.catalog.KeysType;
+import org.apache.doris.catalog.GeneratedColumnInfo;
 import org.apache.doris.catalog.MaterializedIndex;
 import org.apache.doris.catalog.OlapTable;
-import org.apache.doris.catalog.OlapTable.OlapTableState;
 import org.apache.doris.catalog.Partition;
-import org.apache.doris.catalog.PartitionType;
 import org.apache.doris.catalog.PrimitiveType;
-import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.ScalarType;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.TableIf.TableType;
-import org.apache.doris.catalog.Tablet;
-import org.apache.doris.catalog.TabletInvertedIndex;
-import org.apache.doris.catalog.TabletMeta;
 import org.apache.doris.catalog.Type;
-import org.apache.doris.cluster.ClusterNamespace;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.CaseSensibility;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
-import org.apache.doris.common.ErrorCode;
-import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.LabelAlreadyUsedException;
 import org.apache.doris.common.LoadException;
@@ -69,8 +58,9 @@ import org.apache.doris.common.Pair;
 import org.apache.doris.common.PatternMatcher;
 import org.apache.doris.common.PatternMatcherWrapper;
 import org.apache.doris.common.UserException;
-import org.apache.doris.common.util.ListComparator;
+import org.apache.doris.common.util.ExprUtil;
 import org.apache.doris.common.util.TimeUtils;
+import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.load.LoadJob.JobState;
 import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.persist.ReplicaPersistInfo;
@@ -78,22 +68,19 @@ import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.task.LoadTaskInfo;
 import org.apache.doris.thrift.TEtlState;
 import org.apache.doris.thrift.TFileFormatType;
+import org.apache.doris.thrift.TUniqueKeyUpdateMode;
 
 import com.google.common.base.Preconditions;
-import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.google.gson.Gson;
-import org.apache.commons.collections.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedList;
@@ -207,282 +194,6 @@ public class Load {
         lock.writeLock().unlock();
     }
 
-    /*
-     * This is only used for hadoop load
-     */
-    public static void checkAndCreateSource(Database db, DataDescription dataDescription,
-            Map<Long, Map<Long, List<Source>>> tableToPartitionSources, EtlJobType jobType) throws DdlException {
-        Source source = new Source(dataDescription.getFilePaths());
-        long tableId = -1;
-        Set<Long> sourcePartitionIds = Sets.newHashSet();
-
-        // source column names and partitions
-        String tableName = dataDescription.getTableName();
-        Map<String, Pair<String, List<String>>> columnToFunction = null;
-
-        OlapTable table = db.getOlapTableOrDdlException(tableName);
-        tableId = table.getId();
-
-        table.readLock();
-        try {
-            if (table.getPartitionInfo().isMultiColumnPartition() && jobType == EtlJobType.HADOOP) {
-                throw new DdlException("Load by hadoop cluster does not support table with multi partition columns."
-                        + " Table: " + table.getName() + ". Try using broker load. See 'help broker load;'");
-            }
-
-            // check partition
-            if (dataDescription.getPartitionNames() != null
-                    && table.getPartitionInfo().getType() == PartitionType.UNPARTITIONED) {
-                ErrorReport.reportDdlException(ErrorCode.ERR_PARTITION_CLAUSE_NO_ALLOWED);
-            }
-
-            if (table.getState() == OlapTableState.RESTORE) {
-                throw new DdlException("Table [" + tableName + "] is under restore");
-            }
-
-            if (table.getKeysType() != KeysType.AGG_KEYS && dataDescription.isNegative()) {
-                throw new DdlException("Load for AGG_KEYS table should not specify NEGATIVE");
-            }
-
-            // get table schema
-            List<Column> baseSchema = table.getBaseSchema(false);
-            // fill the column info if user does not specify them
-            dataDescription.fillColumnInfoIfNotSpecified(baseSchema);
-
-            // source columns
-            List<String> columnNames = Lists.newArrayList();
-            List<String> assignColumnNames = Lists.newArrayList();
-            if (dataDescription.getFileFieldNames() != null) {
-                assignColumnNames.addAll(dataDescription.getFileFieldNames());
-                if (dataDescription.getColumnsFromPath() != null) {
-                    assignColumnNames.addAll(dataDescription.getColumnsFromPath());
-                }
-            }
-            if (assignColumnNames.isEmpty()) {
-                // use table columns
-                for (Column column : baseSchema) {
-                    columnNames.add(column.getName());
-                }
-            } else {
-                // convert column to schema format
-                for (String assignCol : assignColumnNames) {
-                    if (table.getColumn(assignCol) != null) {
-                        columnNames.add(table.getColumn(assignCol).getName());
-                    } else {
-                        columnNames.add(assignCol);
-                    }
-                }
-            }
-            source.setColumnNames(columnNames);
-
-            // check default value
-            Map<String, Pair<String, List<String>>> columnToHadoopFunction
-                    = dataDescription.getColumnToHadoopFunction();
-            List<ImportColumnDesc> parsedColumnExprList = dataDescription.getParsedColumnExprList();
-            Map<String, Expr> parsedColumnExprMap = Maps.newTreeMap(String.CASE_INSENSITIVE_ORDER);
-            for (ImportColumnDesc importColumnDesc : parsedColumnExprList) {
-                parsedColumnExprMap.put(importColumnDesc.getColumnName(), importColumnDesc.getExpr());
-            }
-            for (Column column : baseSchema) {
-                String columnName = column.getName();
-                if (columnNames.contains(columnName)) {
-                    continue;
-                }
-
-                if (parsedColumnExprMap.containsKey(columnName)) {
-                    continue;
-                }
-
-                if (column.getDefaultValue() != null || column.isAllowNull()) {
-                    continue;
-                }
-
-                throw new DdlException("Column has no default value. column: " + columnName);
-            }
-
-            // check negative for sum aggregate type
-            if (dataDescription.isNegative()) {
-                for (Column column : baseSchema) {
-                    if (!column.isKey() && column.getAggregationType() != AggregateType.SUM) {
-                        throw new DdlException("Column is not SUM AggregateType. column:" + column.getName());
-                    }
-                }
-            }
-
-            // check hll
-            for (Column column : baseSchema) {
-                if (column.getDataType() == PrimitiveType.HLL) {
-                    if (columnToHadoopFunction != null && !columnToHadoopFunction.containsKey(column.getName())) {
-                        throw new DdlException("Hll column is not assigned. column:" + column.getName());
-                    }
-                }
-            }
-
-            // check mapping column exist in table
-            // check function
-            // convert mapping column and func arg columns to schema format
-
-            // When doing schema change, there may have some 'shadow' columns, with prefix '__doris_shadow_' in
-            // their names. These columns are invisible to user, but we need to generate data for these columns.
-            // So we add column mappings for these column.
-            // eg1:
-            // base schema is (A, B, C), and B is under schema change,
-            // so there will be a shadow column: '__doris_shadow_B'
-            // So the final column mapping should looks like: (A, B, C, __doris_shadow_B = substitute(B));
-            for (Column column : table.getFullSchema()) {
-                if (column.isNameWithPrefix(SchemaChangeHandler.SHADOW_NAME_PREFIX)) {
-                    String originCol = column.getNameWithoutPrefix(SchemaChangeHandler.SHADOW_NAME_PREFIX);
-                    if (parsedColumnExprMap.containsKey(originCol)) {
-                        Expr mappingExpr = parsedColumnExprMap.get(originCol);
-                        if (mappingExpr != null) {
-                            /*
-                             * eg:
-                             * (A, C) SET (B = func(xx))
-                             * ->
-                             * (A, C) SET (B = func(xx), __doris_shadow_B = func(xxx))
-                             */
-                            if (columnToHadoopFunction.containsKey(originCol)) {
-                                columnToHadoopFunction.put(column.getName(), columnToHadoopFunction.get(originCol));
-                            }
-                            ImportColumnDesc importColumnDesc = new ImportColumnDesc(column.getName(), mappingExpr);
-                            parsedColumnExprList.add(importColumnDesc);
-                        } else {
-                            /*
-                             * eg:
-                             * (A, B, C)
-                             * ->
-                             * (A, B, C) SET (__doris_shadow_B = substitute(B))
-                             */
-                            columnToHadoopFunction.put(column.getName(),
-                                    Pair.of("substitute", Lists.newArrayList(originCol)));
-                            ImportColumnDesc importColumnDesc
-                                    = new ImportColumnDesc(column.getName(), new SlotRef(null, originCol));
-                            parsedColumnExprList.add(importColumnDesc);
-                        }
-                    } else {
-                        /*
-                         * There is a case that if user does not specify the related origin column, eg:
-                         * COLUMNS (A, C), and B is not specified, but B is being modified
-                         * so there is a shadow column '__doris_shadow_B'.
-                         * We can not just add a mapping function "__doris_shadow_B = substitute(B)",
-                         * because Doris can not find column B.
-                         * In this case, __doris_shadow_B can use its default value,
-                         * so no need to add it to column mapping
-                         */
-                        // do nothing
-                    }
-
-                } else if (!column.isVisible()) {
-                    /*
-                     *  For batch delete table add hidden column __DORIS_DELETE_SIGN__ to columns
-                     * eg:
-                     * (A, B, C)
-                     * ->
-                     * (A, B, C) SET (__DORIS_DELETE_SIGN__ = 0)
-                     */
-                    columnToHadoopFunction.put(column.getName(), Pair.of("default_value",
-                            Lists.newArrayList(column.getDefaultValue())));
-                    ImportColumnDesc importColumnDesc = null;
-                    try {
-                        importColumnDesc = new ImportColumnDesc(column.getName(),
-                                new FunctionCallExpr("default_value", Arrays.asList(column.getDefaultValueExpr())));
-                    } catch (AnalysisException e) {
-                        throw new DdlException(e.getMessage());
-                    }
-                    parsedColumnExprList.add(importColumnDesc);
-                }
-            }
-
-            LOG.debug("after add shadow column. parsedColumnExprList: {}, columnToHadoopFunction: {}",
-                    parsedColumnExprList, columnToHadoopFunction);
-
-            Map<String, String> columnNameMap = Maps.newTreeMap(String.CASE_INSENSITIVE_ORDER);
-            for (String columnName : columnNames) {
-                columnNameMap.put(columnName, columnName);
-            }
-
-            // validate hadoop functions
-            if (columnToHadoopFunction != null) {
-                columnToFunction = Maps.newHashMap();
-                for (Entry<String, Pair<String, List<String>>> entry : columnToHadoopFunction.entrySet()) {
-                    String mappingColumnName = entry.getKey();
-                    Column mappingColumn = table.getColumn(mappingColumnName);
-                    if (mappingColumn == null) {
-                        throw new DdlException("Mapping column is not in table. column: " + mappingColumnName);
-                    }
-
-                    Pair<String, List<String>> function = entry.getValue();
-                    try {
-                        DataDescription.validateMappingFunction(function.first, function.second, columnNameMap,
-                                mappingColumn, dataDescription.isHadoopLoad());
-                    } catch (AnalysisException e) {
-                        throw new DdlException(e.getMessage());
-                    }
-
-                    columnToFunction.put(mappingColumn.getName(), function);
-                }
-            }
-
-            // partitions of this source
-            OlapTable olapTable = table;
-            PartitionNames partitionNames = dataDescription.getPartitionNames();
-            if (partitionNames == null) {
-                for (Partition partition : olapTable.getPartitions()) {
-                    sourcePartitionIds.add(partition.getId());
-                }
-            } else {
-                for (String partitionName : partitionNames.getPartitionNames()) {
-                    Partition partition = olapTable.getPartition(partitionName, partitionNames.isTemp());
-                    if (partition == null) {
-                        throw new DdlException("Partition [" + partitionName + "] does not exist");
-                    }
-                    sourcePartitionIds.add(partition.getId());
-                }
-            }
-        } finally {
-            table.readUnlock();
-        }
-
-        // column separator
-        String columnSeparator = dataDescription.getColumnSeparator();
-        if (!Strings.isNullOrEmpty(columnSeparator)) {
-            source.setColumnSeparator(columnSeparator);
-        }
-
-        // line delimiter
-        String lineDelimiter = dataDescription.getLineDelimiter();
-        if (!Strings.isNullOrEmpty(lineDelimiter)) {
-            source.setLineDelimiter(lineDelimiter);
-        }
-
-        // source negative
-        source.setNegative(dataDescription.isNegative());
-
-        // column mapping functions
-        if (columnToFunction != null) {
-            source.setColumnToFunction(columnToFunction);
-        }
-
-        // add source to table partition map
-        Map<Long, List<Source>> partitionToSources = null;
-        if (tableToPartitionSources.containsKey(tableId)) {
-            partitionToSources = tableToPartitionSources.get(tableId);
-        } else {
-            partitionToSources = Maps.newHashMap();
-            tableToPartitionSources.put(tableId, partitionToSources);
-        }
-        for (long partitionId : sourcePartitionIds) {
-            List<Source> sources = null;
-            if (partitionToSources.containsKey(partitionId)) {
-                sources = partitionToSources.get(partitionId);
-            } else {
-                sources = new ArrayList<Source>();
-                partitionToSources.put(partitionId, sources);
-            }
-            sources.add(source);
-        }
-    }
-
     /**
      * When doing schema change, there may have some 'shadow' columns, with prefix '__doris_shadow_' in
      * their names. These columns are invisible to user, but we need to generate data for these columns.
@@ -517,8 +228,9 @@ public class Load {
                      * ->
                      * (A, B, C) SET (__doris_shadow_B = B)
                      */
-                    ImportColumnDesc importColumnDesc = new ImportColumnDesc(column.getName(),
-                            new SlotRef(null, originCol));
+                    SlotRef slot = new SlotRef(null, originCol);
+                    slot.setType(column.getType());
+                    ImportColumnDesc importColumnDesc = new ImportColumnDesc(column.getName(), slot);
                     shadowColumnDescs.add(importColumnDesc);
                 }
             } else {
@@ -542,8 +254,8 @@ public class Load {
      */
     public static void initColumns(Table tbl, List<ImportColumnDesc> columnExprs,
             Map<String, Pair<String, List<String>>> columnToHadoopFunction) throws UserException {
-        initColumns(tbl, columnExprs, columnToHadoopFunction, null, null, null, null, null, null, null, false, false,
-                false);
+        initColumns(tbl, columnExprs, columnToHadoopFunction, null, null, null, null, null, null, null, false,
+                TUniqueKeyUpdateMode.UPSERT);
     }
 
     /*
@@ -553,18 +265,18 @@ public class Load {
     public static void initColumns(Table tbl, LoadTaskInfo.ImportColumnDescs columnDescs,
             Map<String, Pair<String, List<String>>> columnToHadoopFunction, Map<String, Expr> exprsByName,
             Analyzer analyzer, TupleDescriptor srcTupleDesc, Map<String, SlotDescriptor> slotDescByName,
-            List<Integer> srcSlotIds, TFileFormatType formatType, List<String> hiddenColumns, boolean useVectorizedLoad,
-            boolean isPartialUpdate)
+            List<Integer> srcSlotIds, TFileFormatType formatType, List<String> hiddenColumns,
+            TUniqueKeyUpdateMode uniquekeyUpdateMode)
             throws UserException {
         rewriteColumns(columnDescs);
         initColumns(tbl, columnDescs.descs, columnToHadoopFunction, exprsByName, analyzer, srcTupleDesc, slotDescByName,
-                srcSlotIds, formatType, hiddenColumns, useVectorizedLoad, true, isPartialUpdate);
+                srcSlotIds, formatType, hiddenColumns, true, uniquekeyUpdateMode);
     }
 
     /*
      * This function will do followings:
      * 1. fill the column exprs if user does not specify any column or column mapping.
-     * 2. For not specified columns, check if they have default value.
+     * 2. For not specified columns, check if they have default value or they are auto-increment columns.
      * 3. Add any shadow columns if have.
      * 4. validate hadoop functions
      * 5. init slot descs and expr map for load plan
@@ -572,8 +284,8 @@ public class Load {
     private static void initColumns(Table tbl, List<ImportColumnDesc> columnExprs,
             Map<String, Pair<String, List<String>>> columnToHadoopFunction, Map<String, Expr> exprsByName,
             Analyzer analyzer, TupleDescriptor srcTupleDesc, Map<String, SlotDescriptor> slotDescByName,
-            List<Integer> srcSlotIds, TFileFormatType formatType, List<String> hiddenColumns, boolean useVectorizedLoad,
-            boolean needInitSlotAndAnalyzeExprs, boolean isPartialUpdate) throws UserException {
+            List<Integer> srcSlotIds, TFileFormatType formatType, List<String> hiddenColumns,
+            boolean needInitSlotAndAnalyzeExprs, TUniqueKeyUpdateMode uniquekeyUpdateMode) throws UserException {
         // We make a copy of the columnExprs so that our subsequent changes
         // to the columnExprs will not affect the original columnExprs.
         // skip the mapping columns not exist in schema
@@ -589,10 +301,15 @@ public class Load {
                 copiedColumnExprs.add(importColumnDesc);
             }
         }
-        // check whether the OlapTable has sequenceCol
+        // check whether the OlapTable has sequenceCol and skipBitmapCol
         boolean hasSequenceCol = false;
-        if (tbl instanceof OlapTable && ((OlapTable) tbl).hasSequenceCol()) {
-            hasSequenceCol = true;
+        boolean hasSequenceMapCol = false;
+        boolean hasSkipBitmapColumn = false;
+        if (tbl instanceof OlapTable) {
+            OlapTable olapTable = (OlapTable) tbl;
+            hasSequenceCol = olapTable.hasSequenceCol();
+            hasSequenceMapCol = (olapTable.getSequenceMapCol() != null);
+            hasSkipBitmapColumn = olapTable.hasSkipBitmapColumn();
         }
 
         // If user does not specify the file field names, generate it by using base schema of table.
@@ -611,15 +328,38 @@ public class Load {
                 } else {
                     columnDesc = new ImportColumnDesc(column.getName().toLowerCase());
                 }
-                LOG.debug("add base column {} to stream load task", column.getName());
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("add base column {} to stream load task", column.getName());
+                }
                 copiedColumnExprs.add(columnDesc);
+            }
+            if (hasSkipBitmapColumn && uniquekeyUpdateMode == TUniqueKeyUpdateMode.UPDATE_FLEXIBLE_COLUMNS) {
+                Preconditions.checkArgument(!specifyFileFieldNames);
+                Preconditions.checkArgument(hiddenColumns == null);
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("add hidden column {} to stream load task", Column.DELETE_SIGN);
+                }
+                copiedColumnExprs.add(new ImportColumnDesc(Column.DELETE_SIGN));
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("add hidden column {} to stream load task", Column.SKIP_BITMAP_COL);
+                }
+                // allow to specify __DORIS_SEQUENCE_COL__ if table has sequence type column
+                if (hasSequenceCol && !hasSequenceMapCol) {
+                    copiedColumnExprs.add(new ImportColumnDesc(Column.SEQUENCE_COL));
+                    if (LOG.isDebugEnabled()) {
+                        LOG.debug("add hidden column {} to stream load task", Column.SEQUENCE_COL);
+                    }
+                }
+                copiedColumnExprs.add(new ImportColumnDesc(Column.SKIP_BITMAP_COL));
             }
             if (hiddenColumns != null) {
                 for (String columnName : hiddenColumns) {
                     Column column = tbl.getColumn(columnName);
                     if (column != null && !column.isVisible()) {
                         ImportColumnDesc columnDesc = new ImportColumnDesc(column.getName());
-                        LOG.debug("add hidden column {} to stream load task", column.getName());
+                        if (LOG.isDebugEnabled()) {
+                            LOG.debug("add hidden column {} to stream load task", column.getName());
+                        }
                         copiedColumnExprs.add(columnDesc);
                     }
                 }
@@ -630,17 +370,34 @@ public class Load {
         for (ImportColumnDesc importColumnDesc : copiedColumnExprs) {
             columnExprMap.put(importColumnDesc.getColumnName(), importColumnDesc.getExpr());
         }
+        HashMap<String, Type> colToType = new HashMap<>();
 
-        // check default value
+        // check default value and auto-increment column
         for (Column column : tbl.getBaseSchema()) {
             String columnName = column.getName();
+            colToType.put(columnName, column.getType());
+            if (column.getGeneratedColumnInfo() != null) {
+                GeneratedColumnInfo info = column.getGeneratedColumnInfo();
+                exprsByName.put(column.getName(), info.getExpandExprForLoad());
+                continue;
+            }
             if (columnExprMap.containsKey(columnName)) {
                 continue;
             }
-            if (column.getDefaultValue() != null || column.isAllowNull() || isPartialUpdate) {
+            if (column.getDefaultValue() != null) {
+                exprsByName.put(column.getName(), column.getDefaultValueExpr());
                 continue;
             }
-            //continue;
+            if (column.isAllowNull()) {
+                exprsByName.put(column.getName(), NullLiteral.create(column.getType()));
+                continue;
+            }
+            if (uniquekeyUpdateMode == TUniqueKeyUpdateMode.UPDATE_FIXED_COLUMNS) {
+                continue;
+            }
+            if (column.isAutoInc()) {
+                continue;
+            }
             throw new DdlException("Column has no default value. column: " + columnName);
         }
 
@@ -686,8 +443,7 @@ public class Load {
                 exprSrcSlotName.add(slotColumnName);
             }
         }
-        // excludedColumns is columns that should be varchar type
-        Set<String> excludedColumns = Sets.newTreeSet(String.CASE_INSENSITIVE_ORDER);
+
         // init slot desc add expr map, also transform hadoop functions
         for (ImportColumnDesc importColumnDesc : copiedColumnExprs) {
             // make column name case match with real column name
@@ -704,73 +460,53 @@ public class Load {
                 exprsByName.put(realColName, expr);
             } else {
                 SlotDescriptor slotDesc = analyzer.getDescTbl().addSlotDescriptor(srcTupleDesc);
-                // only support parquet format now
-                if (useVectorizedLoad  && formatType == TFileFormatType.FORMAT_PARQUET
-                        && tblColumn != null) {
-                    // in vectorized load
-                    // example: k1 is DATETIME in source file, and INT in schema, mapping exper is k1=year(k1)
-                    // we can not determine whether to use the type in the schema or the type inferred from expr
-                    // so use varchar type as before
-                    if (exprSrcSlotName.contains(columnName)) {
-                        // columns in expr args should be varchar type
-                        slotDesc.setType(ScalarType.createType(PrimitiveType.VARCHAR));
-                        slotDesc.setColumn(new Column(realColName, PrimitiveType.VARCHAR));
-                        excludedColumns.add(realColName);
-                        // example k1, k2 = k1 + 1, k1 is not nullable, k2 is nullable
-                        // so we can not determine columns in expr args whether not nullable or nullable
-                        // slot in expr args use nullable as before
-                        slotDesc.setIsNullable(true);
-                    } else {
-                        // columns from files like parquet files can be parsed as the type in table schema
-                        slotDesc.setType(tblColumn.getType());
-                        slotDesc.setColumn(new Column(realColName, tblColumn.getType()));
-                        // non-nullable column is allowed in vectorized load with parquet format
-                        slotDesc.setIsNullable(tblColumn.isAllowNull());
-                    }
+
+                if (formatType == TFileFormatType.FORMAT_ARROW) {
+                    slotDesc.setColumn(new Column(realColName, colToType.get(realColName)));
                 } else {
-                    if (formatType == TFileFormatType.FORMAT_JSON
-                                && tbl instanceof OlapTable && ((OlapTable) tbl).isDynamicSchema()) {
-                        // Dynamic table does not require conversion from VARCHAR to corresponding data types.
-                        // Some columns are self-described and their types are dynamically generated.
-                        slotDesc.setType(tblColumn.getType());
-                        slotDesc.setColumn(new Column(realColName, tblColumn.getType()));
-                        slotDesc.setIsNullable(tblColumn.isAllowNull());
+                    if (uniquekeyUpdateMode == TUniqueKeyUpdateMode.UPDATE_FLEXIBLE_COLUMNS && hasSkipBitmapColumn) {
+                        // we store the unique ids of missing columns in skip bitmap column in flexible partial update
+                        int colUniqueId = tblColumn.getUniqueId();
+                        Column slotColumn = null;
+                        if (realColName.equals(Column.SKIP_BITMAP_COL)) {
+                            // don't change the skip_bitmap_col's type to varchar becasue we will fill this column
+                            // in NewJsonReader manually rather than reading them from files as varchar type and then
+                            // converting them to their real type
+                            slotColumn = new Column(realColName, PrimitiveType.BITMAP);
+                        } else {
+                            // columns default be varchar type
+                            slotColumn = new Column(realColName, PrimitiveType.VARCHAR);
+                        }
+                        // In flexible partial update, every row can update different columns, we should check
+                        // key columns intergrity for every row in XXXReader on BE rather than checking it on FE
+                        // directly for all rows like in fixed columns partial update. So we should set if a slot
+                        // is key column here
+                        slotColumn.setIsKey(tblColumn.isKey());
+                        slotColumn.setUniqueId(colUniqueId);
+                        slotDesc.setAutoInc(tblColumn.isAutoInc());
+                        slotDesc.setColumn(slotColumn);
                     } else {
                         // columns default be varchar type
                         slotDesc.setType(ScalarType.createType(PrimitiveType.VARCHAR));
                         slotDesc.setColumn(new Column(realColName, PrimitiveType.VARCHAR));
-                        // ISSUE A: src slot should be nullable even if the column is not nullable.
-                        // because src slot is what we read from file, not represent to real column value.
-                        // If column is not nullable, error will be thrown when filling the dest slot,
-                        // which is not nullable.
-                        slotDesc.setIsNullable(true);
                     }
                 }
+
+                // ISSUE A: src slot should be nullable even if the column is not nullable.
+                // because src slot is what we read from file, not represent to real column value.
+                // If column is not nullable, error will be thrown when filling the dest slot,
+                // which is not nullable.
+                slotDesc.setIsNullable(true);
+
                 slotDesc.setIsMaterialized(true);
                 srcSlotIds.add(slotDesc.getId().asInt());
                 slotDescByName.put(realColName, slotDesc);
             }
         }
 
-        // add a implict container column "DORIS_DYNAMIC_COL" for dynamic columns
-        if (tbl instanceof OlapTable && ((OlapTable) tbl).isDynamicSchema()) {
-            analyzer.getDescTbl().addReferencedTable(tbl);
-            SlotDescriptor slotDesc = analyzer.getDescTbl().addSlotDescriptor(srcTupleDesc);
-            String name = Column.DYNAMIC_COLUMN_NAME;
-            Column col = new Column(name, Type.VARIANT, false, null, false, "",
-                                    "stream load auto dynamic column");
-            slotDesc.setType(Type.VARIANT);
-            slotDesc.setColumn(col);
-            slotDesc.setIsNullable(false);
-            // Non-nullable slots will have 0 for the byte offset and -1 for the bit mask
-            slotDesc.setNullIndicatorBit(-1);
-            slotDesc.setNullIndicatorByte(0);
-            slotDesc.setIsMaterialized(true);
-            srcSlotIds.add(slotDesc.getId().asInt());
-            slotDescByName.put(name, slotDesc);
-            LOG.debug("add dynamic column to srcTupleDesc with name:{} id:{}", name, slotDesc.getId().asInt());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("plan srcTupleDesc {}", srcTupleDesc.toString());
         }
-        LOG.debug("plan srcTupleDesc {}", srcTupleDesc.toString());
 
         /*
          * The extension column of the materialized view is added to the expression evaluation of load
@@ -781,35 +517,55 @@ public class Load {
         Map<String, Expr> mvDefineExpr = Maps.newHashMap();
         for (Column column : tbl.getFullSchema()) {
             if (column.getDefineExpr() != null) {
+                if (column.getDefineExpr().getType().isInvalid()) {
+                    column.getDefineExpr().setType(column.getType());
+                }
                 mvDefineExpr.put(column.getName(), column.getDefineExpr());
             }
         }
 
-        LOG.debug("slotDescByName: {}, exprsByName: {}, mvDefineExpr: {}", slotDescByName, exprsByName, mvDefineExpr);
-        // we only support parquet format now
-        // use implicit deduction to convert columns
-        // that are not in the doris table from varchar to a more appropriate type
-        if (useVectorizedLoad && formatType == TFileFormatType.FORMAT_PARQUET) {
-            // analyze all exprs
-            Map<String, Expr> cloneExprsByName = Maps.newHashMap(exprsByName);
-            Map<String, Expr> cloneMvDefineExpr = Maps.newHashMap(mvDefineExpr);
-            analyzeAllExprs(tbl, analyzer, cloneExprsByName, cloneMvDefineExpr, slotDescByName, useVectorizedLoad);
-            // columns that only exist in mapping expr args, replace type with inferred from exprs,
-            // if there are more than one, choose the last except varchar type
-            // for example:
-            // k1 involves two mapping expr args: year(k1), t1=k1, k1's varchar type will be replaced by DATETIME
-            replaceVarcharWithCastType(cloneExprsByName, srcTupleDesc, excludedColumns);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("slotDescByName: {}, exprsByName: {}, mvDefineExpr: {}",
+                    slotDescByName, exprsByName, mvDefineExpr);
         }
 
         // in vectorized load, reanalyze exprs with castExpr type
         // otherwise analyze exprs with varchar type
-        analyzeAllExprs(tbl, analyzer, exprsByName, mvDefineExpr, slotDescByName, useVectorizedLoad);
-        LOG.debug("after init column, exprMap: {}", exprsByName);
+        analyzeAllExprs(tbl, analyzer, exprsByName, mvDefineExpr, slotDescByName);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("after init column, exprMap: {}", exprsByName);
+        }
+    }
+
+    private static SlotRef getSlotFromDesc(SlotDescriptor slotDesc) {
+        SlotRef slot = new SlotRef(slotDesc);
+        slot.setType(slotDesc.getType());
+        return slot;
+    }
+
+    public static Expr getExprFromDesc(Analyzer analyzer, Expr rhs, SlotRef slot) throws AnalysisException {
+        Type rhsType = rhs.getType();
+        rhs = rhs.castTo(slot.getType());
+
+        if (slot.getDesc() == null) {
+            // shadow column
+            return rhs;
+        }
+
+        if (rhs.isNullable() && !slot.isNullable()) {
+            rhs = new FunctionCallExpr("non_nullable", Lists.newArrayList(rhs));
+            rhs.setType(rhsType);
+            rhs.analyze(analyzer);
+        } else if (!rhs.isNullable() && slot.isNullable()) {
+            rhs = new FunctionCallExpr("nullable", Lists.newArrayList(rhs));
+            rhs.setType(rhsType);
+            rhs.analyze(analyzer);
+        }
+        return rhs;
     }
 
     private static void analyzeAllExprs(Table tbl, Analyzer analyzer, Map<String, Expr> exprsByName,
-                                            Map<String, Expr> mvDefineExpr, Map<String, SlotDescriptor> slotDescByName,
-                                            boolean useVectorizedLoad) throws UserException {
+            Map<String, Expr> mvDefineExpr, Map<String, SlotDescriptor> slotDescByName) throws UserException {
         // analyze all exprs
         for (Map.Entry<String, Expr> entry : exprsByName.entrySet()) {
             ExprSubstitutionMap smap = new ExprSubstitutionMap();
@@ -821,10 +577,10 @@ public class Load {
                     if (entry.getKey() != null) {
                         if (entry.getKey().equalsIgnoreCase(Column.DELETE_SIGN)) {
                             throw new UserException("unknown reference column in DELETE ON clause:"
-                                + slot.getColumnName());
+                                    + slot.getColumnName());
                         } else if (entry.getKey().equalsIgnoreCase(Column.SEQUENCE_COL)) {
                             throw new UserException("unknown reference column in ORDER BY clause:"
-                                + slot.getColumnName());
+                                    + slot.getColumnName());
                         }
                     }
                     throw new UserException("unknown reference column, column=" + entry.getKey()
@@ -845,11 +601,11 @@ public class Load {
                 }
             }
 
-            // Array type do not support cast now
+            // Array/Map/Struct type do not support cast now
             Type exprReturnType = expr.getType();
-            if (exprReturnType.isArrayType()) {
+            if (exprReturnType.isComplexType()) {
                 Type schemaType = tbl.getColumn(entry.getKey()).getType();
-                if (exprReturnType != schemaType) {
+                if (!exprReturnType.matchesType(schemaType)) {
                     throw new AnalysisException("Don't support load from type:" + exprReturnType + " to type:"
                             + schemaType + " for column:" + entry.getKey());
                 }
@@ -863,14 +619,19 @@ public class Load {
             List<SlotRef> slots = Lists.newArrayList();
             entry.getValue().collect(SlotRef.class, slots);
             for (SlotRef slot : slots) {
-                if (slotDescByName.get(slot.getColumnName()) != null) {
+                if (exprsByName.get(slot.getColumnName()) != null) {
                     smap.getLhs().add(slot);
-                    smap.getRhs().add(new CastExpr(tbl.getColumn(slot.getColumnName()).getType(),
-                            new SlotRef(slotDescByName.get(slot.getColumnName()))));
-                } else if (exprsByName.get(slot.getColumnName()) != null) {
+                    if (tbl.getColumn(slot.getColumnName()).getType()
+                            .equals(exprsByName.get(slot.getColumnName()).getType())) {
+                        smap.getRhs().add(exprsByName.get(slot.getColumnName()));
+                    } else {
+                        smap.getRhs().add(new CastExpr(tbl.getColumn(slot.getColumnName()).getType(),
+                                exprsByName.get(slot.getColumnName())));
+                    }
+                } else if (slotDescByName.get(slot.getColumnName()) != null) {
                     smap.getLhs().add(slot);
-                    smap.getRhs().add(new CastExpr(tbl.getColumn(slot.getColumnName()).getType(),
-                            exprsByName.get(slot.getColumnName())));
+                    smap.getRhs().add(
+                            getExprFromDesc(analyzer, getSlotFromDesc(slotDescByName.get(slot.getColumnName())), slot));
                 } else {
                     if (entry.getKey().equalsIgnoreCase(Column.DELETE_SIGN)) {
                         throw new UserException("unknown reference column in DELETE ON clause:" + slot.getColumnName());
@@ -886,50 +647,6 @@ public class Load {
             expr.analyze(analyzer);
 
             exprsByName.put(entry.getKey(), expr);
-        }
-    }
-
-    /**
-     * columns that only exist in mapping expr args, replace type with inferred from exprs.
-     *
-     * @param excludedColumns columns that the type should not be inferred from expr.
-     *                         1. column exists in both schema and expr args.
-     */
-    private static void replaceVarcharWithCastType(Map<String, Expr> exprsByName, TupleDescriptor srcTupleDesc,
-                                               Set<String> excludedColumns) throws UserException {
-        // if there are more than one, choose the last except varchar type.
-        // for example:
-        // k1 involves two mapping expr args: year(k1), t1=k1, k1's varchar type will be replaced by DATETIME.
-        for (Map.Entry<String, Expr> entry : exprsByName.entrySet()) {
-            List<CastExpr> casts = Lists.newArrayList();
-            // exclude explicit cast. for example: cast(k1 as date)
-            entry.getValue().collect(Expr.IS_VARCHAR_SLOT_REF_IMPLICIT_CAST, casts);
-            if (casts.isEmpty()) {
-                continue;
-            }
-
-            for (CastExpr cast : casts) {
-                Expr child = cast.getChild(0);
-                Type type = cast.getType();
-                if (type.isVarchar()) {
-                    continue;
-                }
-
-                SlotRef slotRef = (SlotRef) child;
-                String columnName = slotRef.getColumn().getName();
-                if (excludedColumns.contains(columnName)) {
-                    continue;
-                }
-
-                // replace src slot desc with cast return type
-                int slotId = slotRef.getSlotId().asInt();
-                SlotDescriptor srcSlotDesc = srcTupleDesc.getSlot(slotId);
-                if (srcSlotDesc == null) {
-                    throw new UserException("Unknown source slot descriptor. id: " + slotId);
-                }
-                srcSlotDesc.setType(type);
-                srcSlotDesc.setColumn(new Column(columnName, type));
-            }
         }
     }
 
@@ -950,30 +667,13 @@ public class Load {
                         importColumnDesc.setExpr(derivativeColumns.get(columnName));
                     }
                 } else {
-                    recursiveRewrite(importColumnDesc.getExpr(), derivativeColumns);
+                    ExprUtil.recursiveRewrite(importColumnDesc.getExpr(), derivativeColumns);
                 }
                 derivativeColumns.put(importColumnDesc.getColumnName(), importColumnDesc.getExpr());
             }
         }
 
         columnDescs.isColumnDescsRewrited = true;
-    }
-
-    private static void recursiveRewrite(Expr expr, Map<String, Expr> derivativeColumns) {
-        if (CollectionUtils.isEmpty(expr.getChildren())) {
-            return;
-        }
-        for (int i = 0; i < expr.getChildren().size(); i++) {
-            Expr e = expr.getChild(i);
-            if (e instanceof SlotRef) {
-                String columnName = ((SlotRef) e).getColumnName();
-                if (derivativeColumns.containsKey(columnName)) {
-                    expr.setChild(i, derivativeColumns.get(columnName));
-                }
-            } else {
-                recursiveRewrite(e, derivativeColumns);
-            }
-        }
     }
 
     /**
@@ -1063,7 +763,9 @@ public class Load {
                     exprs.add(NullLiteral.create(Type.VARCHAR));
                 }
 
-                LOG.debug("replace_value expr: {}", exprs);
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("replace_value expr: {}", exprs);
+                }
                 FunctionCallExpr newFn = new FunctionCallExpr("if", exprs);
                 return newFn;
             } else if (funcName.equalsIgnoreCase("strftime")) {
@@ -1344,6 +1046,7 @@ public class Load {
             List<LoadJob> loadJobs = new ArrayList<>();
             for (Long dbId : dbToLoadJobs.keySet()) {
                 if (!Env.getCurrentEnv().getAccessManager().checkDbPriv(ConnectContext.get(),
+                        InternalCatalog.INTERNAL_CATALOG_NAME,
                         Env.getCurrentEnv().getCatalogMgr().getDbNullable(dbId).getFullName(),
                         PrivPredicate.LOAD)) {
                     continue;
@@ -1379,6 +1082,7 @@ public class Load {
             List<LoadJob> loadJobs = new ArrayList<>();
             for (Long dbId : dbToLoadJobs.keySet()) {
                 if (!Env.getCurrentEnv().getAccessManager().checkDbPriv(ConnectContext.get(),
+                        InternalCatalog.INTERNAL_CATALOG_NAME,
                         Env.getCurrentEnv().getCatalogMgr().getDbNullable(dbId).getFullName(),
                         PrivPredicate.LOAD)) {
                     continue;
@@ -1391,7 +1095,9 @@ public class Load {
             }
 
             long start = System.currentTimeMillis();
-            LOG.debug("begin to get load job info, size: {}", loadJobs.size());
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("begin to get load job info, size: {}", loadJobs.size());
+            }
 
             for (LoadJob loadJob : loadJobs) {
                 // filter first
@@ -1400,8 +1106,9 @@ public class Load {
                 Set<String> tableNames = loadJob.getTableNames();
                 boolean auth = true;
                 for (String tblName : tableNames) {
-                    if (!Env.getCurrentEnv().getAccessManager().checkTblPriv(ConnectContext.get(), dbName,
-                            tblName, PrivPredicate.LOAD)) {
+                    if (!Env.getCurrentEnv().getAccessManager()
+                            .checkTblPriv(ConnectContext.get(), InternalCatalog.INTERNAL_CATALOG_NAME, dbName,
+                                    tblName, PrivPredicate.LOAD)) {
                         auth = false;
                         break;
                     }
@@ -1413,7 +1120,9 @@ public class Load {
                 loadJobInfos.add(composeJobInfoByLoadJob(loadJob));
             } // end for loadJobs
 
-            LOG.debug("finished to get load job info, cost: {}", (System.currentTimeMillis() - start));
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("finished to get load job info, cost: {}", (System.currentTimeMillis() - start));
+            }
         } finally {
             readUnlock();
         }
@@ -1528,7 +1237,9 @@ public class Load {
             }
 
             long start = System.currentTimeMillis();
-            LOG.debug("begin to get load job info, size: {}", loadJobs.size());
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("begin to get load job info, size: {}", loadJobs.size());
+            }
             PatternMatcher matcher = null;
             if (labelValue != null && !accurateMatch) {
                 matcher = PatternMatcherWrapper.createMysqlPattern(labelValue,
@@ -1562,15 +1273,17 @@ public class Load {
                 Set<String> tableNames = loadJob.getTableNames();
                 if (tableNames.isEmpty()) {
                     // forward compatibility
-                    if (!Env.getCurrentEnv().getAccessManager().checkDbPriv(ConnectContext.get(), dbName,
-                            PrivPredicate.LOAD)) {
+                    if (!Env.getCurrentEnv().getAccessManager()
+                            .checkDbPriv(ConnectContext.get(), InternalCatalog.INTERNAL_CATALOG_NAME, dbName,
+                                    PrivPredicate.LOAD)) {
                         continue;
                     }
                 } else {
                     boolean auth = true;
                     for (String tblName : tableNames) {
-                        if (!Env.getCurrentEnv().getAccessManager().checkTblPriv(ConnectContext.get(), dbName,
-                                tblName, PrivPredicate.LOAD)) {
+                        if (!Env.getCurrentEnv().getAccessManager()
+                                .checkTblPriv(ConnectContext.get(), InternalCatalog.INTERNAL_CATALOG_NAME, dbName,
+                                        tblName, PrivPredicate.LOAD)) {
                             auth = false;
                             break;
                         }
@@ -1583,7 +1296,9 @@ public class Load {
                 loadJobInfos.add(composeJobInfoByLoadJob(loadJob));
             } // end for loadJobs
 
-            LOG.debug("finished to get load job info, cost: {}", (System.currentTimeMillis() - start));
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("finished to get load job info, cost: {}", (System.currentTimeMillis() - start));
+            }
         } finally {
             readUnlock();
         }
@@ -1622,111 +1337,24 @@ public class Load {
         return jobId;
     }
 
-    public List<List<Comparable>> getLoadJobUnfinishedInfo(long jobId) {
-        LinkedList<List<Comparable>> infos = new LinkedList<List<Comparable>>();
-        TabletInvertedIndex invertedIndex = Env.getCurrentInvertedIndex();
-
-        LoadJob loadJob = getLoadJob(jobId);
-        if (loadJob == null
-                || (loadJob.getState() != JobState.LOADING && loadJob.getState() != JobState.QUORUM_FINISHED)) {
-            return infos;
-        }
-
-        long dbId = loadJob.getDbId();
-        Database db = Env.getCurrentInternalCatalog().getDbNullable(dbId);
-        if (db == null) {
-            return infos;
-        }
-
-
-        readLock();
-        try {
-            Map<Long, TabletLoadInfo> tabletMap = loadJob.getIdToTabletLoadInfo();
-            for (long tabletId : tabletMap.keySet()) {
-                TabletMeta tabletMeta = invertedIndex.getTabletMeta(tabletId);
-                if (tabletMeta == null) {
-                    // tablet may be dropped during loading
-                    continue;
-                }
-
-                long tableId = tabletMeta.getTableId();
-
-                OlapTable table = (OlapTable) db.getTableNullable(tableId);
-                if (table == null) {
-                    continue;
-                }
-                table.readLock();
-                try {
-                    long partitionId = tabletMeta.getPartitionId();
-                    Partition partition = table.getPartition(partitionId);
-                    if (partition == null) {
-                        continue;
-                    }
-
-                    long indexId = tabletMeta.getIndexId();
-                    MaterializedIndex index = partition.getIndex(indexId);
-                    if (index == null) {
-                        continue;
-                    }
-
-                    Tablet tablet = index.getTablet(tabletId);
-                    if (tablet == null) {
-                        continue;
-                    }
-
-                    PartitionLoadInfo partitionLoadInfo = loadJob.getPartitionLoadInfo(tableId, partitionId);
-                    long version = partitionLoadInfo.getVersion();
-
-                    for (Replica replica : tablet.getReplicas()) {
-                        if (replica.checkVersionCatchUp(version, false)) {
-                            continue;
-                        }
-
-                        List<Comparable> info = Lists.newArrayList();
-                        info.add(replica.getBackendId());
-                        info.add(tabletId);
-                        info.add(replica.getId());
-                        info.add(replica.getVersion());
-                        info.add(partitionId);
-                        info.add(version);
-
-                        infos.add(info);
-                    }
-                } finally {
-                    table.readUnlock();
-                }
-            }
-        } finally {
-            readUnlock();
-        }
-
-        // sort by version, backendId
-        ListComparator<List<Comparable>> comparator = new ListComparator<List<Comparable>>(3, 0);
-        Collections.sort(infos, comparator);
-
-        return infos;
-    }
-
     public static class JobInfo {
         public String dbName;
         public Set<String> tblNames = Sets.newHashSet();
         public String label;
-        public String clusterName;
         public JobState state;
         public String failMsg;
         public String trackingUrl;
 
-        public JobInfo(String dbName, String label, String clusterName) {
+        public JobInfo(String dbName, String label) {
             this.dbName = dbName;
             this.label = label;
-            this.clusterName = clusterName;
         }
     }
 
     // Get job state
     // result saved in info
     public void getJobInfo(JobInfo info) throws DdlException, MetaNotFoundException {
-        String fullDbName = ClusterNamespace.getFullName(info.clusterName, info.dbName);
+        String fullDbName = info.dbName;
         info.dbName = fullDbName;
         Database db = Env.getCurrentInternalCatalog().getDbOrMetaException(fullDbName);
         readLock();

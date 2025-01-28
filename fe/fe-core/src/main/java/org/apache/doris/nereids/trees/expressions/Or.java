@@ -18,6 +18,7 @@
 package org.apache.doris.nereids.trees.expressions;
 
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
+import org.apache.doris.nereids.util.ExpressionUtils;
 
 import com.google.common.base.Preconditions;
 
@@ -35,13 +36,19 @@ public class Or extends CompoundPredicate {
      * @param right right child of comparison predicate
      */
     public Or(Expression left, Expression right) {
-        super(left, right, "OR");
+        super(ExpressionUtils.mergeList(
+                ExpressionUtils.extractDisjunction(left),
+                ExpressionUtils.extractDisjunction(right)), "OR");
+    }
+
+    public Or(List<Expression> children) {
+        super(children, "OR");
     }
 
     @Override
     public Expression withChildren(List<Expression> children) {
-        Preconditions.checkArgument(children.size() == 2);
-        return new Or(children.get(0), children.get(1));
+        Preconditions.checkArgument(children.size() >= 2);
+        return new Or(children);
     }
 
     @Override
@@ -51,16 +58,35 @@ public class Or extends CompoundPredicate {
 
     @Override
     public CompoundPredicate flip() {
-        return new And(left(), right());
+        return new And(children);
     }
 
     @Override
-    public CompoundPredicate flip(Expression left, Expression right) {
-        return new And(left, right);
+    public CompoundPredicate flip(List<Expression> children) {
+        return new And(children);
     }
 
     @Override
     public Class<? extends CompoundPredicate> flipType() {
         return And.class;
+    }
+
+    @Override
+    protected List<Expression> extract() {
+        return ExpressionUtils.extractDisjunction(this);
+    }
+
+    @Override
+    public List<Expression> children() {
+        if (flattenChildren.isEmpty()) {
+            for (Expression child : children) {
+                if (child instanceof Or) {
+                    flattenChildren.addAll(((Or) child).extract());
+                } else {
+                    flattenChildren.add(child);
+                }
+            }
+        }
+        return flattenChildren;
     }
 }

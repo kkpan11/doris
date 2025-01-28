@@ -20,33 +20,37 @@
 #include <gen_cpp/types.pb.h>
 
 #include "runtime/exec_env.h"
-#include "runtime/fragment_mgr.h"
 
 namespace doris {
 
 void ThreadMemTrackerMgr::attach_limiter_tracker(
-        const std::shared_ptr<MemTrackerLimiter>& mem_tracker,
-        const TUniqueId& fragment_instance_id) {
+        const std::shared_ptr<MemTrackerLimiter>& mem_tracker) {
     DCHECK(mem_tracker);
+    CHECK(init());
     flush_untracked_mem();
-    _fragment_instance_id = fragment_instance_id;
+    _last_attach_snapshots_stack.push_back({_reserved_mem, _consumer_tracker_stack});
+    if (_reserved_mem != 0) {
+        // _untracked_mem temporary store bytes that not synchronized to process reserved memory,
+        // but bytes have been subtracted from thread _reserved_mem.
+        doris::GlobalMemoryArbitrator::shrink_process_reserved(_untracked_mem);
+        _limiter_tracker->shrink_reserved(_untracked_mem);
+        _reserved_mem = 0;
+        _untracked_mem = 0;
+    }
+    _consumer_tracker_stack.clear();
     _limiter_tracker = mem_tracker;
-    _limiter_tracker_raw = mem_tracker.get();
-    _wait_gc = true;
 }
 
 void ThreadMemTrackerMgr::detach_limiter_tracker(
         const std::shared_ptr<MemTrackerLimiter>& old_mem_tracker) {
+    CHECK(init());
     flush_untracked_mem();
-    _fragment_instance_id = TUniqueId();
+    shrink_reserved();
+    DCHECK(!_last_attach_snapshots_stack.empty());
+    _reserved_mem = _last_attach_snapshots_stack.back().reserved_mem;
+    _consumer_tracker_stack = _last_attach_snapshots_stack.back().consumer_tracker_stack;
+    _last_attach_snapshots_stack.pop_back();
     _limiter_tracker = old_mem_tracker;
-    _limiter_tracker_raw = old_mem_tracker.get();
-    _wait_gc = false;
-}
-
-void ThreadMemTrackerMgr::cancel_fragment(const std::string& exceed_msg) {
-    ExecEnv::GetInstance()->fragment_mgr()->cancel(
-            _fragment_instance_id, PPlanFragmentCancelReason::MEMORY_LIMIT_EXCEED, exceed_msg);
 }
 
 } // namespace doris

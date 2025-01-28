@@ -43,10 +43,15 @@ public class PlanPreprocessors {
         return resultPlan;
     }
 
+    /**
+     * get preprocessors before doing optimize
+     * @return preprocessors
+     */
     public List<PlanPreprocessor> getProcessors() {
         // add processor if we need
         return ImmutableList.of(
-                new EliminateLogicalSelectHint()
+                new TurnOffPageCacheForInsertIntoSelect(),
+                new PullUpSubqueryAliasToCTE()
         );
     }
 }

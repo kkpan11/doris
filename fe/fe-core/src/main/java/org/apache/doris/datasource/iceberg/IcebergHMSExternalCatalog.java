@@ -19,12 +19,7 @@ package org.apache.doris.datasource.iceberg;
 
 import org.apache.doris.datasource.CatalogProperty;
 import org.apache.doris.datasource.property.PropertyConverter;
-import org.apache.doris.datasource.property.constants.HMSProperties;
 
-import org.apache.iceberg.CatalogProperties;
-import org.apache.iceberg.hive.HiveCatalog;
-
-import java.util.HashMap;
 import java.util.Map;
 
 public class IcebergHMSExternalCatalog extends IcebergExternalCatalog {
@@ -37,16 +32,9 @@ public class IcebergHMSExternalCatalog extends IcebergExternalCatalog {
     }
 
     @Override
-    protected void initLocalObjectsImpl() {
+    protected void initCatalog() {
         icebergCatalogType = ICEBERG_HMS;
-        HiveCatalog hiveCatalog = new org.apache.iceberg.hive.HiveCatalog();
-        hiveCatalog.setConf(getConfiguration());
-        // initialize hive catalog
-        Map<String, String> catalogProperties = new HashMap<>();
-        String metastoreUris = catalogProperty.getOrDefault(HMSProperties.HIVE_METASTORE_URIS, "");
-
-        catalogProperties.put(CatalogProperties.URI, metastoreUris);
-        hiveCatalog.initialize(icebergCatalogType, catalogProperties);
-        catalog = hiveCatalog;
+        catalog = IcebergUtils.createIcebergHiveCatalog(this, getName());
     }
 }
+

@@ -17,6 +17,8 @@
 
 package org.apache.doris.statistics;
 
+import com.google.gson.annotations.SerializedName;
+
 import java.util.Objects;
 import java.util.StringJoiner;
 
@@ -24,18 +26,24 @@ public class StatisticsCacheKey {
 
     /**
      * May be index id either, since they are natively same in the code.
+     * catalogId and dbId are not included in the hashCode. Because tableId is globally unique.
      */
+    @SerializedName("catalogId")
+    public final long catalogId;
+    @SerializedName("dbId")
+    public final long dbId;
+    @SerializedName("tableId")
     public final long tableId;
+    @SerializedName("idxId")
     public final long idxId;
+    @SerializedName("colName")
     public final String colName;
 
     private static final String DELIMITER = "-";
 
-    public StatisticsCacheKey(long tableId, String colName) {
-        this(tableId, -1, colName);
-    }
-
-    public StatisticsCacheKey(long tableId, long idxId, String colName) {
+    public StatisticsCacheKey(long catalogId, long dbId, long tableId, long idxId, String colName) {
+        this.catalogId = catalogId;
+        this.dbId = dbId;
         this.tableId = tableId;
         this.idxId = idxId;
         this.colName = colName;
@@ -43,7 +51,7 @@ public class StatisticsCacheKey {
 
     @Override
     public int hashCode() {
-        return Objects.hash(tableId, idxId, colName);
+        return Objects.hash(catalogId, dbId, tableId, idxId, colName);
     }
 
     @Override
@@ -55,12 +63,16 @@ public class StatisticsCacheKey {
             return false;
         }
         StatisticsCacheKey k = (StatisticsCacheKey) obj;
-        return this.tableId == k.tableId && this.idxId == k.idxId && this.colName.equals(k.colName);
+        return this.catalogId == k.catalogId && this.dbId == k.dbId && this.tableId == k.tableId
+                && this.idxId == k.idxId && this.colName.equals(k.colName);
     }
 
     @Override
     public String toString() {
         StringJoiner sj = new StringJoiner(DELIMITER);
+        sj.add("ColumnStats");
+        sj.add(String.valueOf(catalogId));
+        sj.add(String.valueOf(dbId));
         sj.add(String.valueOf(tableId));
         sj.add(String.valueOf(idxId));
         sj.add(colName);

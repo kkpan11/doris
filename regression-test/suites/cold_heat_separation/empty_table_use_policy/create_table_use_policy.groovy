@@ -29,8 +29,7 @@ suite("create_table_use_policy") {
         DISTRIBUTED BY HASH (k1) BUCKETS 3
         PROPERTIES(
             "storage_policy" = "not_exist_policy",
-            "replication_num" = "1",
-            "enable_unique_key_merge_on_write" = "false"
+            "replication_num" = "1"
         );
     """
 
@@ -90,7 +89,7 @@ suite("create_table_use_policy") {
             "enable_unique_key_merge_on_write" = "false"
         );
     """
-
+    // storage policy is disabled on mow table
     assertEquals(create_table_use_created_policy.size(), 1);
 
     sql """

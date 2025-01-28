@@ -20,10 +20,8 @@
 #include <gen_cpp/Types_types.h>
 
 #include <algorithm>
-#include <boost/iterator/iterator_facade.hpp>
 // IWYU pragma: no_include <bits/std_abs.h>
 #include <cmath> // IWYU pragma: keep
-#include <cstring>
 #include <memory>
 #include <ostream>
 #include <utility>
@@ -33,62 +31,41 @@
 #include "exec/table_connector.h"
 #include "gutil/strings/substitute.h"
 #include "jni.h"
-#include "jni_md.h"
-#include "runtime/define_primitive_type.h"
 #include "runtime/descriptors.h"
 #include "runtime/runtime_state.h"
 #include "runtime/types.h"
 #include "runtime/user_function_cache.h"
 #include "util/jni-util.h"
 #include "util/runtime_profile.h"
-#include "vec/columns/column.h"
 #include "vec/columns/column_nullable.h"
-#include "vec/columns/column_string.h"
-#include "vec/common/string_ref.h"
 #include "vec/core/block.h"
-#include "vec/core/column_with_type_and_name.h"
-#include "vec/core/columns_with_type_and_name.h"
-#include "vec/core/field.h"
-#include "vec/core/types.h"
 #include "vec/data_types/data_type_nullable.h"
-#include "vec/data_types/data_type_number.h"
 #include "vec/data_types/data_type_string.h"
 #include "vec/exec/jni_connector.h"
 #include "vec/exprs/vexpr.h"
-#include "vec/exprs/vexpr_context.h"
-#include "vec/functions/function.h"
 #include "vec/functions/simple_function_factory.h"
 
-namespace doris {
-namespace vectorized {
-const char* JDBC_EXECUTOR_CLASS = "org/apache/doris/udf/JdbcExecutor";
+namespace doris::vectorized {
+const char* JDBC_EXECUTOR_FACTORY_CLASS = "org/apache/doris/jdbc/JdbcExecutorFactory";
 const char* JDBC_EXECUTOR_CTOR_SIGNATURE = "([B)V";
-const char* JDBC_EXECUTOR_WRITE_SIGNATURE = "(Ljava/lang/String;)I";
 const char* JDBC_EXECUTOR_STMT_WRITE_SIGNATURE = "(Ljava/util/Map;)I";
 const char* JDBC_EXECUTOR_HAS_NEXT_SIGNATURE = "()Z";
-const char* JDBC_EXECUTOR_GET_BLOCK_SIGNATURE = "(I)Ljava/util/List;";
-const char* JDBC_EXECUTOR_GET_TYPES_SIGNATURE = "()Ljava/util/List;";
 const char* JDBC_EXECUTOR_CLOSE_SIGNATURE = "()V";
 const char* JDBC_EXECUTOR_TRANSACTION_SIGNATURE = "()V";
-const char* JDBC_EXECUTOR_COPY_BATCH_SIGNATURE = "(Ljava/lang/Object;ZIJJ)V";
 
 JdbcConnector::JdbcConnector(const JdbcConnectorParam& param)
-        : TableConnector(param.tuple_desc, param.query_string),
+        : TableConnector(param.tuple_desc, param.use_transaction, param.table_name,
+                         param.query_string),
           _conn_param(param),
           _closed(false) {}
 
 JdbcConnector::~JdbcConnector() {
     if (!_closed) {
-        close();
+        static_cast<void>(close());
     }
 }
 
-#define GET_BASIC_JAVA_CLAZZ(JAVA_TYPE, CPP_TYPE) \
-    RETURN_IF_ERROR(JniUtil::GetGlobalClassRef(env, JAVA_TYPE, &_executor_##CPP_TYPE##_clazz));
-
-#define DELETE_BASIC_JAVA_CLAZZ_REF(CPP_TYPE) env->DeleteGlobalRef(_executor_##CPP_TYPE##_clazz);
-
-Status JdbcConnector::close() {
+Status JdbcConnector::close(Status /*unused*/) {
     SCOPED_RAW_TIMER(&_jdbc_statistic._connector_close_timer);
     _closed = true;
     if (!_is_open) {
@@ -97,14 +74,11 @@ Status JdbcConnector::close() {
     if (_is_in_transaction) {
         RETURN_IF_ERROR(abort_trans());
     }
-    JNIEnv* env;
+    JNIEnv* env = nullptr;
     RETURN_IF_ERROR(JniUtil::GetJNIEnv(&env));
-    env->DeleteGlobalRef(_executor_clazz);
-    DELETE_BASIC_JAVA_CLAZZ_REF(object)
-    DELETE_BASIC_JAVA_CLAZZ_REF(string)
-    DELETE_BASIC_JAVA_CLAZZ_REF(list)
-#undef DELETE_BASIC_JAVA_CLAZZ_REF
     env->CallNonvirtualVoidMethod(_executor_obj, _executor_clazz, _executor_close_id);
+    env->DeleteGlobalRef(_executor_factory_clazz);
+    env->DeleteGlobalRef(_executor_clazz);
     RETURN_IF_ERROR(JniUtil::GetJniExceptionMsg(env));
     env->DeleteGlobalRef(_executor_obj);
     return Status::OK();
@@ -118,11 +92,26 @@ Status JdbcConnector::open(RuntimeState* state, bool read) {
 
     JNIEnv* env = nullptr;
     RETURN_IF_ERROR(JniUtil::GetJNIEnv(&env));
-    RETURN_IF_ERROR(JniUtil::GetGlobalClassRef(env, JDBC_EXECUTOR_CLASS, &_executor_clazz));
+    RETURN_IF_ERROR(JniUtil::get_jni_scanner_class(env, JDBC_EXECUTOR_FACTORY_CLASS,
+                                                   &_executor_factory_clazz));
 
-    GET_BASIC_JAVA_CLAZZ("java/util/List", list)
-    GET_BASIC_JAVA_CLAZZ("java/lang/Object", object)
-    GET_BASIC_JAVA_CLAZZ("java/lang/String", string)
+    JNI_CALL_METHOD_CHECK_EXCEPTION(
+            , _executor_factory_ctor_id, env,
+            GetStaticMethodID(_executor_factory_clazz, "getExecutorClass",
+                              "(Lorg/apache/doris/thrift/TOdbcTableType;)Ljava/lang/String;"));
+
+    jobject jtable_type = _get_java_table_type(env, _conn_param.table_type);
+
+    JNI_CALL_METHOD_CHECK_EXCEPTION_DELETE_REF(
+            jobject, executor_name, env,
+            CallStaticObjectMethod(_executor_factory_clazz, _executor_factory_ctor_id,
+                                   jtable_type));
+
+    const char* executor_name_str = env->GetStringUTFChars((jstring)executor_name, nullptr);
+
+    RETURN_IF_ERROR(JniUtil::get_jni_scanner_class(env, executor_name_str, &_executor_clazz));
+    env->DeleteLocalRef(jtable_type);
+    env->ReleaseStringUTFChars((jstring)executor_name, executor_name_str);
 
 #undef GET_BASIC_JAVA_CLAZZ
     RETURN_IF_ERROR(_register_func_id(env));
@@ -132,7 +121,7 @@ Status JdbcConnector::open(RuntimeState* state, bool read) {
     {
         std::string local_location;
         std::hash<std::string> hash_str;
-        auto function_cache = UserFunctionCache::instance();
+        auto* function_cache = UserFunctionCache::instance();
         if (_conn_param.resource_name.empty()) {
             // for jdbcExternalTable, _conn_param.resource_name == ""
             // so, we use _conn_param.driver_path as key of jarpath
@@ -150,14 +139,26 @@ Status JdbcConnector::open(RuntimeState* state, bool read) {
 
         TJdbcExecutorCtorParams ctor_params;
         ctor_params.__set_statement(_sql_str);
+        ctor_params.__set_catalog_id(_conn_param.catalog_id);
         ctor_params.__set_jdbc_url(_conn_param.jdbc_url);
         ctor_params.__set_jdbc_user(_conn_param.user);
         ctor_params.__set_jdbc_password(_conn_param.passwd);
         ctor_params.__set_jdbc_driver_class(_conn_param.driver_class);
         ctor_params.__set_driver_path(local_location);
-        ctor_params.__set_batch_size(read ? state->batch_size() : 0);
+        if (state == nullptr) {
+            ctor_params.__set_batch_size(read ? 1 : 0);
+        } else {
+            ctor_params.__set_batch_size(read ? state->batch_size() : 0);
+        }
         ctor_params.__set_op(read ? TJdbcOperation::READ : TJdbcOperation::WRITE);
         ctor_params.__set_table_type(_conn_param.table_type);
+        ctor_params.__set_connection_pool_min_size(_conn_param.connection_pool_min_size);
+        ctor_params.__set_connection_pool_max_size(_conn_param.connection_pool_max_size);
+        ctor_params.__set_connection_pool_max_wait_time(_conn_param.connection_pool_max_wait_time);
+        ctor_params.__set_connection_pool_max_life_time(_conn_param.connection_pool_max_life_time);
+        ctor_params.__set_connection_pool_cache_clear_time(
+                config::jdbc_connection_pool_cache_clear_time_sec);
+        ctor_params.__set_connection_pool_keep_alive(_conn_param.connection_pool_keep_alive);
 
         jbyteArray ctor_params_bytes;
         // Pushed frame will be popped when jni_frame goes out-of-scope.
@@ -174,6 +175,30 @@ Status JdbcConnector::open(RuntimeState* state, bool read) {
     RETURN_ERROR_IF_EXC(env);
     RETURN_IF_ERROR(JniUtil::LocalToGlobalRef(env, _executor_obj, &_executor_obj));
     _is_open = true;
+    RETURN_IF_ERROR(begin_trans());
+
+    return Status::OK();
+}
+
+Status JdbcConnector::test_connection() {
+    RETURN_IF_ERROR(open(nullptr, true));
+
+    JNIEnv* env = nullptr;
+    RETURN_IF_ERROR(JniUtil::GetJNIEnv(&env));
+
+    env->CallNonvirtualVoidMethod(_executor_obj, _executor_clazz, _executor_test_connection_id);
+    RETURN_ERROR_IF_EXC(env);
+    return Status::OK();
+}
+
+Status JdbcConnector::clean_datasource() {
+    if (!_is_open) {
+        return Status::OK();
+    }
+    JNIEnv* env = nullptr;
+    RETURN_IF_ERROR(JniUtil::GetJNIEnv(&env));
+    env->CallNonvirtualVoidMethod(_executor_obj, _executor_clazz, _executor_clean_datasource_id);
+    RETURN_ERROR_IF_EXC(env);
     return Status::OK();
 }
 
@@ -195,389 +220,156 @@ Status JdbcConnector::query() {
         SCOPED_RAW_TIMER(&_jdbc_statistic._execte_read_timer);
         jint colunm_count =
                 env->CallNonvirtualIntMethod(_executor_obj, _executor_clazz, _executor_read_id);
-        RETURN_IF_ERROR(JniUtil::GetJniExceptionMsg(env));
+        if (auto status = JniUtil::GetJniExceptionMsg(env); !status) {
+            return Status::InternalError("GetJniExceptionMsg meet error, query={}, msg={}",
+                                         _conn_param.query_string, status.to_string());
+        }
         if (colunm_count != materialize_num) {
             return Status::InternalError("input and output column num not equal of jdbc query.");
         }
     }
 
     LOG(INFO) << "JdbcConnector::query has exec success: " << _sql_str;
-    if (_conn_param.table_type != TOdbcTableType::NEBULA) {
-        RETURN_IF_ERROR(_check_column_type());
-    }
     return Status::OK();
 }
 
-Status JdbcConnector::_check_column_type() {
-    SCOPED_RAW_TIMER(&_jdbc_statistic._check_type_timer);
-    JNIEnv* env = nullptr;
-    RETURN_IF_ERROR(JniUtil::GetJNIEnv(&env));
-    jobject type_lists =
-            env->CallNonvirtualObjectMethod(_executor_obj, _executor_clazz, _executor_get_types_id);
-    auto column_size = _tuple_desc->slots().size();
-    for (int column_index = 0, materialized_column_index = 0; column_index < column_size;
-         ++column_index) {
-        auto slot_desc = _tuple_desc->slots()[column_index];
-        if (!slot_desc->is_materialized()) {
-            continue;
-        }
-        jobject column_type =
-                env->CallObjectMethod(type_lists, _executor_get_list_id, materialized_column_index);
+Status JdbcConnector::get_next(bool* eos, Block* block, int batch_size) {
+    SCOPED_RAW_TIMER(&_jdbc_statistic._get_data_timer); // Timer for the entire method
 
-        const std::string& type_str = _jobject_to_string(env, column_type);
-        RETURN_IF_ERROR(_check_type(slot_desc, type_str, column_index));
-        env->DeleteLocalRef(column_type);
-        materialized_column_index++;
-    }
-    env->DeleteLocalRef(type_lists);
-    return JniUtil::GetJniExceptionMsg(env);
-}
-/* type mapping: https://doris.apache.org/zh-CN/docs/dev/ecosystem/external-table/jdbc-of-doris?_highlight=jdbc
-
-Doris            MYSQL                      PostgreSQL                  Oracle                      SQLServer
-
-BOOLEAN      java.lang.Boolean          java.lang.Boolean                                       java.lang.Boolean
-TINYINT      java.lang.Integer                                                                  java.lang.Short    
-SMALLINT     java.lang.Integer          java.lang.Integer           java.math.BigDecimal        java.lang.Short    
-INT          java.lang.Integer          java.lang.Integer           java.math.BigDecimal        java.lang.Integer
-BIGINT       java.lang.Long             java.lang.Long                                          java.lang.Long
-LARGET       java.math.BigInteger
-DECIMAL      java.math.BigDecimal       java.math.BigDecimal        java.math.BigDecimal        java.math.BigDecimal
-VARCHAR      java.lang.String           java.lang.String            java.lang.String            java.lang.String
-DOUBLE       java.lang.Double           java.lang.Double            java.lang.Double            java.lang.Double
-FLOAT        java.lang.Float            java.lang.Float                                         java.lang.Float
-DATE         java.sql.Date              java.sql.Date                                           java.sql.Date
-DATETIME     java.sql.Timestamp         java.sql.Timestamp          java.sql.Timestamp          java.sql.Timestamp
-
-NOTE: because oracle always use number(p,s) to create all numerical type, so it's java type maybe java.math.BigDecimal
-*/
-
-Status JdbcConnector::_check_type(SlotDescriptor* slot_desc, const std::string& type_str,
-                                  int column_index) {
-    const std::string error_msg = fmt::format(
-            "Fail to convert jdbc type of {} to doris type {} on column: {}. You need to "
-            "check this column type between external table and doris table.",
-            type_str, slot_desc->type().debug_string(), slot_desc->col_name());
-    switch (slot_desc->type().type) {
-    case TYPE_BOOLEAN: {
-        if (type_str != "java.lang.Boolean" && type_str != "java.lang.Byte") {
-            return Status::InternalError(error_msg);
-        }
-        break;
-    }
-    case TYPE_TINYINT:
-    case TYPE_SMALLINT:
-    case TYPE_INT: {
-        if (type_str != "java.lang.Short" && type_str != "java.lang.Integer" &&
-            type_str != "java.math.BigDecimal" && type_str != "java.lang.Byte" &&
-            type_str != "com.clickhouse.data.value.UnsignedByte" &&
-            type_str != "com.clickhouse.data.value.UnsignedShort") {
-            return Status::InternalError(error_msg);
-        }
-        break;
-    }
-    case TYPE_BIGINT:
-    case TYPE_LARGEINT: {
-        if (type_str != "java.lang.Long" && type_str != "java.math.BigDecimal" &&
-            type_str != "java.math.BigInteger" && type_str != "java.lang.String" &&
-            type_str != "com.clickhouse.data.value.UnsignedInteger" &&
-            type_str != "com.clickhouse.data.value.UnsignedLong") {
-            return Status::InternalError(error_msg);
-        }
-        break;
-    }
-    case TYPE_FLOAT: {
-        if (type_str != "java.lang.Float" && type_str != "java.math.BigDecimal") {
-            return Status::InternalError(error_msg);
-        }
-        break;
-    }
-    case TYPE_DOUBLE: {
-        if (type_str != "java.lang.Double" && type_str != "java.math.BigDecimal") {
-            return Status::InternalError(error_msg);
-        }
-        break;
-    }
-    case TYPE_CHAR:
-    case TYPE_VARCHAR:
-    case TYPE_STRING: {
-        //now here break directly
-        break;
-    }
-    case TYPE_DATE:
-    case TYPE_DATEV2:
-    case TYPE_TIMEV2:
-    case TYPE_DATETIME:
-    case TYPE_DATETIMEV2: {
-        if (type_str != "java.sql.Timestamp" && type_str != "java.time.LocalDateTime" &&
-            type_str != "java.sql.Date" && type_str != "java.time.LocalDate" &&
-            type_str != "oracle.sql.TIMESTAMP") {
-            return Status::InternalError(error_msg);
-        }
-        break;
-    }
-    case TYPE_DECIMALV2:
-    case TYPE_DECIMAL32:
-    case TYPE_DECIMAL64:
-    case TYPE_DECIMAL128I: {
-        if (type_str != "java.math.BigDecimal") {
-            return Status::InternalError(error_msg);
-        }
-        break;
-    }
-    case TYPE_ARRAY: {
-        if (type_str != "java.sql.Array" && type_str != "java.lang.String" &&
-            type_str != "java.lang.Object") {
-            return Status::InternalError(error_msg);
-        }
-        if (!slot_desc->type().children[0].children.empty()) {
-            return Status::InternalError("Now doris not support nested array type in array {}.",
-                                         slot_desc->type().debug_string());
-        }
-        _map_column_idx_to_cast_idx[column_index] = _input_array_string_types.size();
-        if (slot_desc->is_nullable()) {
-            _input_array_string_types.push_back(make_nullable(std::make_shared<DataTypeString>()));
-        } else {
-            _input_array_string_types.push_back(std::make_shared<DataTypeString>());
-        }
-        str_array_cols.push_back(
-                _input_array_string_types[_map_column_idx_to_cast_idx[column_index]]
-                        ->create_column());
-        break;
-    }
-    default: {
-        return Status::InternalError(error_msg);
-    }
-    }
-    return Status::OK();
-}
-
-Status JdbcConnector::get_next(bool* eos, std::vector<MutableColumnPtr>& columns, Block* block,
-                               int batch_size) {
     if (!_is_open) {
         return Status::InternalError("get_next before open of jdbc connector.");
     }
-    SCOPED_RAW_TIMER(&_jdbc_statistic._get_data_timer);
+
     JNIEnv* env = nullptr;
-    RETURN_IF_ERROR(JniUtil::GetJNIEnv(&env));
-    jboolean has_next =
-            env->CallNonvirtualBooleanMethod(_executor_obj, _executor_clazz, _executor_has_next_id);
+    {
+        SCOPED_RAW_TIMER(&_jdbc_statistic._jni_setup_timer); // Timer for setting up JNI environment
+        RETURN_IF_ERROR(JniUtil::GetJNIEnv(&env));
+    } // _jni_setup_timer stops when going out of this scope
+
+    jboolean has_next = JNI_FALSE;
+    {
+        SCOPED_RAW_TIMER(&_jdbc_statistic._has_next_timer); // Timer for hasNext check
+        has_next = env->CallNonvirtualBooleanMethod(_executor_obj, _executor_clazz,
+                                                    _executor_has_next_id);
+    } // _has_next_timer stops here
+
     if (has_next != JNI_TRUE) {
         *eos = true;
         return Status::OK();
     }
 
-    jobject block_obj = env->CallNonvirtualObjectMethod(_executor_obj, _executor_clazz,
-                                                        _executor_get_blocks_id, batch_size);
-
     RETURN_IF_ERROR(JniUtil::GetJniExceptionMsg(env));
 
     auto column_size = _tuple_desc->slots().size();
-    for (int column_index = 0, materialized_column_index = 0; column_index < column_size;
-         ++column_index) {
-        auto slot_desc = _tuple_desc->slots()[column_index];
-        // because the fe planner filter the non_materialize column
-        if (!slot_desc->is_materialized()) {
-            continue;
-        }
-        jobject column_data =
-                env->CallObjectMethod(block_obj, _executor_get_list_id, materialized_column_index);
-        jint num_rows = env->CallNonvirtualIntMethod(_executor_obj, _executor_clazz,
-                                                     _executor_block_rows_id);
-        RETURN_IF_ERROR(_convert_batch_result_set(
-                env, column_data, slot_desc, columns[column_index].get(), num_rows, column_index));
-        env->DeleteLocalRef(column_data);
-        //here need to cast string to array type
-        if (slot_desc->type().is_array_type()) {
-            _cast_string_to_array(slot_desc, block, column_index, num_rows);
-        }
-        materialized_column_index++;
+    auto slots = _tuple_desc->slots();
+
+    jobject map;
+    {
+        SCOPED_RAW_TIMER(&_jdbc_statistic._prepare_params_timer); // Timer for preparing params
+        map = _get_reader_params(block, env, column_size);
+    } // _prepare_params_timer stops here
+
+    long address = 0;
+    {
+        SCOPED_RAW_TIMER(
+                &_jdbc_statistic
+                         ._read_and_fill_vector_table_timer); // Timer for getBlockAddress call
+        address =
+                env->CallLongMethod(_executor_obj, _executor_get_block_address_id, batch_size, map);
+    } // _get_block_address_timer stops here
+
+    RETURN_IF_ERROR(JniUtil::GetJniExceptionMsg(env));
+    env->DeleteLocalRef(map);
+
+    std::vector<uint32_t> all_columns;
+    for (uint32_t i = 0; i < column_size; ++i) {
+        all_columns.push_back(i);
     }
-    // All Java objects returned by JNI functions are local references.
-    env->DeleteLocalRef(block_obj);
+
+    Status fill_block_status;
+    {
+        SCOPED_RAW_TIMER(&_jdbc_statistic._fill_block_timer); // Timer for fill_block
+        fill_block_status = JniConnector::fill_block(block, all_columns, address);
+    } // _fill_block_timer stops here
+
+    if (!fill_block_status) {
+        return fill_block_status;
+    }
+
+    Status cast_status;
+    {
+        SCOPED_RAW_TIMER(&_jdbc_statistic._cast_timer); // Timer for casting process
+        cast_status = _cast_string_to_special(block, env, column_size);
+    } // _cast_timer stops here
+
     return JniUtil::GetJniExceptionMsg(env);
 }
 
-Status JdbcConnector::_convert_batch_result_set(JNIEnv* env, jobject jcolumn_data,
-                                                const SlotDescriptor* slot_desc,
-                                                vectorized::IColumn* column_ptr, int num_rows,
-                                                int column_index) {
-    vectorized::IColumn* col_ptr = column_ptr;
-    col_ptr->resize(num_rows);
-    int64_t address[2] = {0, 0};
-    bool column_is_nullable = slot_desc->is_nullable();
-    if (column_is_nullable) {
-        auto* nullable_column = reinterpret_cast<vectorized::ColumnNullable*>(column_ptr);
-        auto& null_map = nullable_column->get_null_map_data();
-        memset(null_map.data(), 0, num_rows);
-        address[0] = reinterpret_cast<int64_t>(null_map.data());
-        col_ptr = &nullable_column->get_nested_column();
+Status JdbcConnector::append(vectorized::Block* block,
+                             const vectorized::VExprContextSPtrs& output_vexpr_ctxs,
+                             uint32_t start_send_row, uint32_t* num_rows_sent,
+                             TOdbcTableType::type table_type) {
+    RETURN_IF_ERROR(exec_stmt_write(block, output_vexpr_ctxs, num_rows_sent));
+    COUNTER_UPDATE(_sent_rows_counter, *num_rows_sent);
+    return Status::OK();
+}
+
+Status JdbcConnector::exec_stmt_write(Block* block, const VExprContextSPtrs& output_vexpr_ctxs,
+                                      uint32_t* num_rows_sent) {
+    SCOPED_TIMER(_result_send_timer);
+    JNIEnv* env = nullptr;
+    RETURN_IF_ERROR(JniUtil::GetJNIEnv(&env));
+
+    // prepare table meta information
+    std::unique_ptr<long[]> meta_data;
+    RETURN_IF_ERROR(JniConnector::to_java_table(block, meta_data));
+    long meta_address = (long)meta_data.get();
+    auto table_schema = JniConnector::parse_table_schema(block);
+
+    // prepare constructor parameters
+    std::map<String, String> write_params = {{"meta_address", std::to_string(meta_address)},
+                                             {"required_fields", table_schema.first},
+                                             {"columns_types", table_schema.second}};
+    jobject hashmap_object = JniUtil::convert_to_java_map(env, write_params);
+    env->CallNonvirtualIntMethod(_executor_obj, _executor_clazz, _executor_stmt_write_id,
+                                 hashmap_object);
+    env->DeleteLocalRef(hashmap_object);
+    RETURN_ERROR_IF_EXC(env);
+    *num_rows_sent = block->rows();
+    return Status::OK();
+}
+
+Status JdbcConnector::begin_trans() {
+    if (_use_tranaction) {
+        JNIEnv* env = nullptr;
+        RETURN_IF_ERROR(JniUtil::GetJNIEnv(&env));
+        env->CallNonvirtualVoidMethod(_executor_obj, _executor_clazz, _executor_begin_trans_id);
+        RETURN_ERROR_IF_EXC(env);
+        _is_in_transaction = true;
     }
-    switch (slot_desc->type().type) {
-    case TYPE_BOOLEAN: {
-        address[1] = reinterpret_cast<int64_t>(col_ptr->get_raw_data().data);
-        env->CallNonvirtualVoidMethod(_executor_obj, _executor_clazz, _executor_get_boolean_result,
-                                      jcolumn_data, column_is_nullable, num_rows, address[0],
-                                      address[1]);
-        break;
+    return Status::OK();
+}
+
+Status JdbcConnector::abort_trans() {
+    if (!_is_in_transaction) {
+        return Status::InternalError("Abort transaction before begin trans.");
     }
-    case TYPE_TINYINT: {
-        address[1] = reinterpret_cast<int64_t>(col_ptr->get_raw_data().data);
-        env->CallNonvirtualVoidMethod(_executor_obj, _executor_clazz, _executor_get_tinyint_result,
-                                      jcolumn_data, column_is_nullable, num_rows, address[0],
-                                      address[1]);
-        break;
+    JNIEnv* env = nullptr;
+    RETURN_IF_ERROR(JniUtil::GetJNIEnv(&env));
+    env->CallNonvirtualVoidMethod(_executor_obj, _executor_clazz, _executor_abort_trans_id);
+    RETURN_ERROR_IF_EXC(env);
+    return Status::OK();
+}
+
+Status JdbcConnector::finish_trans() {
+    if (_use_tranaction && _is_in_transaction) {
+        JNIEnv* env = nullptr;
+        RETURN_IF_ERROR(JniUtil::GetJNIEnv(&env));
+        env->CallNonvirtualVoidMethod(_executor_obj, _executor_clazz, _executor_finish_trans_id);
+        RETURN_ERROR_IF_EXC(env);
+        _is_in_transaction = false;
     }
-    case TYPE_SMALLINT: {
-        address[1] = reinterpret_cast<int64_t>(col_ptr->get_raw_data().data);
-        env->CallNonvirtualVoidMethod(_executor_obj, _executor_clazz, _executor_get_smallint_result,
-                                      jcolumn_data, column_is_nullable, num_rows, address[0],
-                                      address[1]);
-        break;
-    }
-    case TYPE_INT: {
-        address[1] = reinterpret_cast<int64_t>(col_ptr->get_raw_data().data);
-        env->CallNonvirtualVoidMethod(_executor_obj, _executor_clazz, _executor_get_int_result,
-                                      jcolumn_data, column_is_nullable, num_rows, address[0],
-                                      address[1]);
-        break;
-    }
-    case TYPE_BIGINT: {
-        address[1] = reinterpret_cast<int64_t>(col_ptr->get_raw_data().data);
-        env->CallNonvirtualVoidMethod(_executor_obj, _executor_clazz, _executor_get_bigint_result,
-                                      jcolumn_data, column_is_nullable, num_rows, address[0],
-                                      address[1]);
-        break;
-    }
-    case TYPE_LARGEINT: {
-        address[1] = reinterpret_cast<int64_t>(col_ptr->get_raw_data().data);
-        env->CallNonvirtualVoidMethod(_executor_obj, _executor_clazz, _executor_get_largeint_result,
-                                      jcolumn_data, column_is_nullable, num_rows, address[0],
-                                      address[1]);
-        break;
-    }
-    case TYPE_FLOAT: {
-        address[1] = reinterpret_cast<int64_t>(col_ptr->get_raw_data().data);
-        env->CallNonvirtualVoidMethod(_executor_obj, _executor_clazz, _executor_get_float_result,
-                                      jcolumn_data, column_is_nullable, num_rows, address[0],
-                                      address[1]);
-        break;
-    }
-    case TYPE_DOUBLE: {
-        address[1] = reinterpret_cast<int64_t>(col_ptr->get_raw_data().data);
-        env->CallNonvirtualVoidMethod(_executor_obj, _executor_clazz, _executor_get_double_result,
-                                      jcolumn_data, column_is_nullable, num_rows, address[0],
-                                      address[1]);
-        break;
-    }
-    case TYPE_CHAR: {
-        bool need_trim_spaces = false;
-        if ((_conn_param.table_type == TOdbcTableType::POSTGRESQL) ||
-            (_conn_param.table_type == TOdbcTableType::ORACLE)) {
-            need_trim_spaces = true;
-        }
-        auto column_string = reinterpret_cast<vectorized::ColumnString*>(col_ptr);
-        address[1] = reinterpret_cast<int64_t>(column_string->get_offsets().data());
-        auto chars_addres = reinterpret_cast<int64_t>(&column_string->get_chars());
-        env->CallNonvirtualVoidMethod(_executor_obj, _executor_clazz, _executor_get_char_result,
-                                      jcolumn_data, column_is_nullable, num_rows, address[0],
-                                      address[1], chars_addres, need_trim_spaces);
-        break;
-    }
-    case TYPE_STRING:
-    case TYPE_VARCHAR: {
-        auto column_string = reinterpret_cast<vectorized::ColumnString*>(col_ptr);
-        address[1] = reinterpret_cast<int64_t>(column_string->get_offsets().data());
-        auto chars_addres = reinterpret_cast<int64_t>(&column_string->get_chars());
-        env->CallNonvirtualVoidMethod(_executor_obj, _executor_clazz, _executor_get_string_result,
-                                      jcolumn_data, column_is_nullable, num_rows, address[0],
-                                      address[1], chars_addres);
-        break;
-    }
-    case TYPE_DATE: {
-        address[1] = reinterpret_cast<int64_t>(col_ptr->get_raw_data().data);
-        env->CallNonvirtualVoidMethod(_executor_obj, _executor_clazz, _executor_get_date_result,
-                                      jcolumn_data, column_is_nullable, num_rows, address[0],
-                                      address[1]);
-        break;
-    }
-    case TYPE_DATEV2: {
-        address[1] = reinterpret_cast<int64_t>(col_ptr->get_raw_data().data);
-        env->CallNonvirtualVoidMethod(_executor_obj, _executor_clazz, _executor_get_datev2_result,
-                                      jcolumn_data, column_is_nullable, num_rows, address[0],
-                                      address[1]);
-        break;
-    }
-    case TYPE_DATETIME: {
-        address[1] = reinterpret_cast<int64_t>(col_ptr->get_raw_data().data);
-        env->CallNonvirtualVoidMethod(_executor_obj, _executor_clazz, _executor_get_datetime_result,
-                                      jcolumn_data, column_is_nullable, num_rows, address[0],
-                                      address[1]);
-        break;
-    }
-    case TYPE_DATETIMEV2: {
-        address[1] = reinterpret_cast<int64_t>(col_ptr->get_raw_data().data);
-        env->CallNonvirtualVoidMethod(_executor_obj, _executor_clazz,
-                                      _executor_get_datetimev2_result, jcolumn_data,
-                                      column_is_nullable, num_rows, address[0], address[1]);
-        break;
-    }
-    case TYPE_DECIMALV2: {
-        address[1] = reinterpret_cast<int64_t>(col_ptr->get_raw_data().data);
-        env->CallNonvirtualVoidMethod(_executor_obj, _executor_clazz,
-                                      _executor_get_decimalv2_result, jcolumn_data,
-                                      column_is_nullable, num_rows, address[0], address[1]);
-        break;
-    }
-    case TYPE_DECIMAL32: {
-        address[1] = reinterpret_cast<int64_t>(col_ptr->get_raw_data().data);
-        env->CallNonvirtualVoidMethod(
-                _executor_obj, _executor_clazz, _executor_get_decimal32_result, jcolumn_data,
-                column_is_nullable, num_rows, address[0], address[1], slot_desc->type().scale);
-        break;
-    }
-    case TYPE_DECIMAL64: {
-        address[1] = reinterpret_cast<int64_t>(col_ptr->get_raw_data().data);
-        env->CallNonvirtualVoidMethod(
-                _executor_obj, _executor_clazz, _executor_get_decimal64_result, jcolumn_data,
-                column_is_nullable, num_rows, address[0], address[1], slot_desc->type().scale);
-        break;
-    }
-    case TYPE_DECIMAL128I: {
-        address[1] = reinterpret_cast<int64_t>(col_ptr->get_raw_data().data);
-        env->CallNonvirtualVoidMethod(
-                _executor_obj, _executor_clazz, _executor_get_decimal128_result, jcolumn_data,
-                column_is_nullable, num_rows, address[0], address[1], slot_desc->type().scale);
-        break;
-    }
-    case TYPE_ARRAY: {
-        str_array_cols[_map_column_idx_to_cast_idx[column_index]]->resize(num_rows);
-        if (column_is_nullable) {
-            auto* nullable_column = reinterpret_cast<vectorized::ColumnNullable*>(
-                    str_array_cols[_map_column_idx_to_cast_idx[column_index]].get());
-            auto& null_map = nullable_column->get_null_map_data();
-            memset(null_map.data(), 0, num_rows);
-            address[0] = reinterpret_cast<int64_t>(null_map.data());
-            col_ptr = &nullable_column->get_nested_column();
-        } else {
-            col_ptr = str_array_cols[_map_column_idx_to_cast_idx[column_index]].get();
-        }
-        auto column_string = reinterpret_cast<vectorized::ColumnString*>(col_ptr);
-        address[1] = reinterpret_cast<int64_t>(column_string->get_offsets().data());
-        auto chars_addres = reinterpret_cast<int64_t>(&column_string->get_chars());
-        env->CallNonvirtualVoidMethod(_executor_obj, _executor_clazz, _executor_get_array_result,
-                                      jcolumn_data, column_is_nullable, num_rows, address[0],
-                                      address[1], chars_addres);
-        break;
-    }
-    default: {
-        const std::string& error_msg =
-                fmt::format("Fail to convert jdbc value to {} on column: {}",
-                            slot_desc->type().debug_string(), slot_desc->col_name());
-        return Status::InternalError(std::string(error_msg));
-    }
-    }
-    return JniUtil::GetJniExceptionMsg(env);
+    return Status::OK();
 }
 
 Status JdbcConnector::_register_func_id(JNIEnv* env) {
@@ -594,8 +386,6 @@ Status JdbcConnector::_register_func_id(JNIEnv* env) {
 
     RETURN_IF_ERROR(register_id(_executor_clazz, "<init>", JDBC_EXECUTOR_CTOR_SIGNATURE,
                                 _executor_ctor_id));
-    RETURN_IF_ERROR(register_id(_executor_clazz, "write", JDBC_EXECUTOR_WRITE_SIGNATURE,
-                                _executor_write_id));
     RETURN_IF_ERROR(register_id(_executor_clazz, "write", JDBC_EXECUTOR_STMT_WRITE_SIGNATURE,
                                 _executor_stmt_write_id));
     RETURN_IF_ERROR(register_id(_executor_clazz, "read", "()I", _executor_read_id));
@@ -603,59 +393,10 @@ Status JdbcConnector::_register_func_id(JNIEnv* env) {
                                 _executor_close_id));
     RETURN_IF_ERROR(register_id(_executor_clazz, "hasNext", JDBC_EXECUTOR_HAS_NEXT_SIGNATURE,
                                 _executor_has_next_id));
+    RETURN_IF_ERROR(register_id(_executor_clazz, "getBlockAddress", "(ILjava/util/Map;)J",
+                                _executor_get_block_address_id));
     RETURN_IF_ERROR(
             register_id(_executor_clazz, "getCurBlockRows", "()I", _executor_block_rows_id));
-    RETURN_IF_ERROR(register_id(_executor_clazz, "copyBatchBooleanResult",
-                                JDBC_EXECUTOR_COPY_BATCH_SIGNATURE, _executor_get_boolean_result));
-    RETURN_IF_ERROR(register_id(_executor_clazz, "copyBatchTinyIntResult",
-                                JDBC_EXECUTOR_COPY_BATCH_SIGNATURE, _executor_get_tinyint_result));
-    RETURN_IF_ERROR(register_id(_executor_clazz, "copyBatchSmallIntResult",
-                                JDBC_EXECUTOR_COPY_BATCH_SIGNATURE, _executor_get_smallint_result));
-    RETURN_IF_ERROR(register_id(_executor_clazz, "copyBatchIntResult",
-                                JDBC_EXECUTOR_COPY_BATCH_SIGNATURE, _executor_get_int_result));
-    RETURN_IF_ERROR(register_id(_executor_clazz, "copyBatchBigIntResult",
-                                JDBC_EXECUTOR_COPY_BATCH_SIGNATURE, _executor_get_bigint_result));
-    RETURN_IF_ERROR(register_id(_executor_clazz, "copyBatchLargeIntResult",
-                                JDBC_EXECUTOR_COPY_BATCH_SIGNATURE, _executor_get_largeint_result));
-    RETURN_IF_ERROR(register_id(_executor_clazz, "copyBatchFloatResult",
-                                JDBC_EXECUTOR_COPY_BATCH_SIGNATURE, _executor_get_float_result));
-    RETURN_IF_ERROR(register_id(_executor_clazz, "copyBatchDoubleResult",
-                                JDBC_EXECUTOR_COPY_BATCH_SIGNATURE, _executor_get_double_result));
-    RETURN_IF_ERROR(register_id(_executor_clazz, "copyBatchStringResult",
-                                "(Ljava/lang/Object;ZIJJJ)V", _executor_get_string_result));
-    RETURN_IF_ERROR(register_id(_executor_clazz, "copyBatchArrayResult",
-                                "(Ljava/lang/Object;ZIJJJ)V", _executor_get_array_result));
-    RETURN_IF_ERROR(register_id(_executor_clazz, "copyBatchCharResult",
-                                "(Ljava/lang/Object;ZIJJJZ)V", _executor_get_char_result));
-
-    RETURN_IF_ERROR(register_id(_executor_clazz, "copyBatchDateResult",
-                                JDBC_EXECUTOR_COPY_BATCH_SIGNATURE, _executor_get_date_result));
-    RETURN_IF_ERROR(register_id(_executor_clazz, "copyBatchDateV2Result",
-                                JDBC_EXECUTOR_COPY_BATCH_SIGNATURE, _executor_get_datev2_result));
-    RETURN_IF_ERROR(register_id(_executor_clazz, "copyBatchDateTimeResult",
-                                JDBC_EXECUTOR_COPY_BATCH_SIGNATURE, _executor_get_datetime_result));
-    RETURN_IF_ERROR(register_id(_executor_clazz, "copyBatchDateTimeV2Result",
-                                JDBC_EXECUTOR_COPY_BATCH_SIGNATURE,
-                                _executor_get_datetimev2_result));
-
-    RETURN_IF_ERROR(register_id(_executor_clazz, "copyBatchDecimalV2Result",
-                                JDBC_EXECUTOR_COPY_BATCH_SIGNATURE,
-                                _executor_get_decimalv2_result));
-    RETURN_IF_ERROR(register_id(_executor_clazz, "copyBatchDecimal32Result",
-                                "(Ljava/lang/Object;ZIJJI)V", _executor_get_decimal32_result));
-    RETURN_IF_ERROR(register_id(_executor_clazz, "copyBatchDecimal64Result",
-                                "(Ljava/lang/Object;ZIJJI)V", _executor_get_decimal64_result));
-    RETURN_IF_ERROR(register_id(_executor_clazz, "copyBatchDecimal128Result",
-                                "(Ljava/lang/Object;ZIJJI)V", _executor_get_decimal128_result));
-
-    RETURN_IF_ERROR(register_id(_executor_clazz, "getBlock", JDBC_EXECUTOR_GET_BLOCK_SIGNATURE,
-                                _executor_get_blocks_id));
-    RETURN_IF_ERROR(register_id(_executor_list_clazz, "get", "(I)Ljava/lang/Object;",
-                                _executor_get_list_id));
-    RETURN_IF_ERROR(register_id(_executor_string_clazz, "getBytes", "(Ljava/lang/String;)[B",
-                                _get_bytes_id));
-    RETURN_IF_ERROR(
-            register_id(_executor_object_clazz, "toString", "()Ljava/lang/String;", _to_string_id));
 
     RETURN_IF_ERROR(register_id(_executor_clazz, "openTrans", JDBC_EXECUTOR_TRANSACTION_SIGNATURE,
                                 _executor_begin_trans_id));
@@ -663,23 +404,111 @@ Status JdbcConnector::_register_func_id(JNIEnv* env) {
                                 _executor_finish_trans_id));
     RETURN_IF_ERROR(register_id(_executor_clazz, "rollbackTrans",
                                 JDBC_EXECUTOR_TRANSACTION_SIGNATURE, _executor_abort_trans_id));
-    RETURN_IF_ERROR(register_id(_executor_clazz, "getResultColumnTypeNames",
-                                JDBC_EXECUTOR_GET_TYPES_SIGNATURE, _executor_get_types_id));
+    RETURN_IF_ERROR(
+            register_id(_executor_clazz, "testConnection", "()V", _executor_test_connection_id));
+    RETURN_IF_ERROR(
+            register_id(_executor_clazz, "cleanDataSource", "()V", _executor_clean_datasource_id));
     return Status::OK();
 }
 
-Status JdbcConnector::_cast_string_to_array(const SlotDescriptor* slot_desc, Block* block,
-                                            int column_index, int rows) {
+jobject JdbcConnector::_get_reader_params(Block* block, JNIEnv* env, size_t column_size) {
+    std::ostringstream columns_nullable;
+    std::ostringstream columns_replace_string;
+    std::ostringstream required_fields;
+    std::ostringstream columns_types;
+
+    for (int i = 0; i < column_size; ++i) {
+        auto* slot = _tuple_desc->slots()[i];
+        if (slot->is_materialized()) {
+            auto type = slot->type();
+            // Record if column is nullable
+            columns_nullable << (slot->is_nullable() ? "true" : "false") << ",";
+            // Check column type and replace accordingly
+            std::string replace_type = "not_replace";
+            if (type.is_bitmap_type()) {
+                replace_type = "bitmap";
+            } else if (type.is_hll_type()) {
+                replace_type = "hll";
+            } else if (type.is_json_type()) {
+                replace_type = "jsonb";
+            }
+            columns_replace_string << replace_type << ",";
+            if (replace_type != "not_replace") {
+                block->get_by_position(i).column = std::make_shared<DataTypeString>()
+                                                           ->create_column()
+                                                           ->convert_to_full_column_if_const();
+                block->get_by_position(i).type = std::make_shared<DataTypeString>();
+                if (slot->is_nullable()) {
+                    block->get_by_position(i).column =
+                            make_nullable(block->get_by_position(i).column);
+                    block->get_by_position(i).type = make_nullable(block->get_by_position(i).type);
+                }
+            }
+        }
+        // Record required fields and column types
+        std::string field = slot->col_name();
+        std::string jni_type;
+        if (slot->type().is_bitmap_type() || slot->type().is_hll_type() ||
+            slot->type().is_json_type()) {
+            jni_type = "string";
+        } else {
+            jni_type = JniConnector::get_jni_type(slot->type());
+        }
+        required_fields << (i != 0 ? "," : "") << field;
+        columns_types << (i != 0 ? "#" : "") << jni_type;
+    }
+
+    std::map<String, String> reader_params = {{"is_nullable", columns_nullable.str()},
+                                              {"replace_string", columns_replace_string.str()},
+                                              {"required_fields", required_fields.str()},
+                                              {"columns_types", columns_types.str()}};
+    return JniUtil::convert_to_java_map(env, reader_params);
+}
+
+Status JdbcConnector::_cast_string_to_special(Block* block, JNIEnv* env, size_t column_size) {
+    for (size_t column_index = 0; column_index < column_size; ++column_index) {
+        auto* slot_desc = _tuple_desc->slots()[column_index];
+        // because the fe planner filter the non_materialize column
+        if (!slot_desc->is_materialized()) {
+            continue;
+        }
+        jint num_rows = env->CallNonvirtualIntMethod(_executor_obj, _executor_clazz,
+                                                     _executor_block_rows_id);
+
+        RETURN_IF_ERROR(JniUtil::GetJniExceptionMsg(env));
+
+        if (slot_desc->type().is_hll_type()) {
+            RETURN_IF_ERROR(_cast_string_to_hll(slot_desc, block, column_index, num_rows));
+        } else if (slot_desc->type().is_json_type()) {
+            RETURN_IF_ERROR(_cast_string_to_json(slot_desc, block, column_index, num_rows));
+        } else if (slot_desc->type().is_bitmap_type()) {
+            RETURN_IF_ERROR(_cast_string_to_bitmap(slot_desc, block, column_index, num_rows));
+        }
+    }
+    return Status::OK();
+}
+
+Status JdbcConnector::_cast_string_to_hll(const SlotDescriptor* slot_desc, Block* block,
+                                          int column_index, int rows) {
+    _map_column_idx_to_cast_idx_hll[column_index] = _input_hll_string_types.size();
+    if (slot_desc->is_nullable()) {
+        _input_hll_string_types.push_back(make_nullable(std::make_shared<DataTypeString>()));
+    } else {
+        _input_hll_string_types.push_back(std::make_shared<DataTypeString>());
+    }
+
     DataTypePtr _target_data_type = slot_desc->get_data_type_ptr();
     std::string _target_data_type_name = _target_data_type->get_name();
     DataTypePtr _cast_param_data_type = _target_data_type;
     ColumnPtr _cast_param = _cast_param_data_type->create_column_const_with_default_value(1);
 
+    auto& input_col = block->get_by_position(column_index).column;
+
     ColumnsWithTypeAndName argument_template;
     argument_template.reserve(2);
     argument_template.emplace_back(
-            std::move(str_array_cols[_map_column_idx_to_cast_idx[column_index]]),
-            _input_array_string_types[_map_column_idx_to_cast_idx[column_index]],
+            std::move(input_col),
+            _input_hll_string_types[_map_column_idx_to_cast_idx_hll[column_index]],
             "java.sql.String");
     argument_template.emplace_back(_cast_param, _cast_param_data_type, _target_data_type_name);
     FunctionBasePtr func_cast = SimpleFunctionFactory::instance().get_function(
@@ -688,9 +517,10 @@ Status JdbcConnector::_cast_string_to_array(const SlotDescriptor* slot_desc, Blo
     Block cast_block(argument_template);
     int result_idx = cast_block.columns();
     cast_block.insert({nullptr, make_nullable(_target_data_type), "cast_result"});
-    func_cast->execute(nullptr, cast_block, {0, 1}, result_idx, rows);
+    RETURN_IF_ERROR(func_cast->execute(nullptr, cast_block, {0}, result_idx, rows));
 
     auto res_col = cast_block.get_by_position(result_idx).column;
+    block->get_by_position(column_index).type = _target_data_type;
     if (_target_data_type->is_nullable()) {
         block->replace_by_position(column_index, res_col);
     } else {
@@ -698,114 +528,104 @@ Status JdbcConnector::_cast_string_to_array(const SlotDescriptor* slot_desc, Blo
                                   ->get_nested_column_ptr();
         block->replace_by_position(column_index, nested_ptr);
     }
-    str_array_cols[_map_column_idx_to_cast_idx[column_index]] =
-            _input_array_string_types[_map_column_idx_to_cast_idx[column_index]]->create_column();
+
     return Status::OK();
 }
 
-Status JdbcConnector::exec_stmt_write(Block* block, const VExprContextSPtrs& output_vexpr_ctxs,
-                                      uint32_t* num_rows_sent) {
-    SCOPED_TIMER(_result_send_timer);
-    JNIEnv* env = nullptr;
-    RETURN_IF_ERROR(JniUtil::GetJNIEnv(&env));
-
-    // prepare table schema
-    std::ostringstream required_fields;
-    std::ostringstream columns_types;
-    for (int i = 0; i < block->columns(); ++i) {
-        // column name maybe empty or has special characters
-        // std::string field = block->get_by_position(i).name;
-        std::string type = JniConnector::get_hive_type(output_vexpr_ctxs[i]->root()->type());
-        if (i == 0) {
-            required_fields << "_col" << i;
-            columns_types << type;
-        } else {
-            required_fields << ","
-                            << "_col" << i;
-            columns_types << "#" << type;
-        }
+Status JdbcConnector::_cast_string_to_bitmap(const SlotDescriptor* slot_desc, Block* block,
+                                             int column_index, int rows) {
+    _map_column_idx_to_cast_idx_bitmap[column_index] = _input_bitmap_string_types.size();
+    if (slot_desc->is_nullable()) {
+        _input_bitmap_string_types.push_back(make_nullable(std::make_shared<DataTypeString>()));
+    } else {
+        _input_bitmap_string_types.push_back(std::make_shared<DataTypeString>());
     }
 
-    // prepare table meta information
-    std::unique_ptr<long[]> meta_data;
-    RETURN_IF_ERROR(JniConnector::generate_meta_info(block, meta_data));
-    long meta_address = (long)meta_data.get();
+    DataTypePtr _target_data_type = slot_desc->get_data_type_ptr();
+    std::string _target_data_type_name = _target_data_type->get_name();
+    DataTypePtr _cast_param_data_type = _target_data_type;
+    ColumnPtr _cast_param = _cast_param_data_type->create_column_const_with_default_value(1);
 
-    // prepare constructor parameters
-    std::map<String, String> write_params = {{"meta_address", std::to_string(meta_address)},
-                                             {"required_fields", required_fields.str()},
-                                             {"columns_types", columns_types.str()},
-                                             {"write_sql", "/* todo */"}};
-    jclass hashmap_class = env->FindClass("java/util/HashMap");
-    jmethodID hashmap_constructor = env->GetMethodID(hashmap_class, "<init>", "(I)V");
-    jobject hashmap_object =
-            env->NewObject(hashmap_class, hashmap_constructor, write_params.size());
-    jmethodID hashmap_put = env->GetMethodID(
-            hashmap_class, "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
-    RETURN_ERROR_IF_EXC(env);
-    for (const auto& it : write_params) {
-        jstring key = env->NewStringUTF(it.first.c_str());
-        jstring value = env->NewStringUTF(it.second.c_str());
-        env->CallObjectMethod(hashmap_object, hashmap_put, key, value);
-        env->DeleteLocalRef(key);
-        env->DeleteLocalRef(value);
+    auto& input_col = block->get_by_position(column_index).column;
+
+    ColumnsWithTypeAndName argument_template;
+    argument_template.reserve(2);
+    argument_template.emplace_back(
+            std::move(input_col),
+            _input_bitmap_string_types[_map_column_idx_to_cast_idx_bitmap[column_index]],
+            "java.sql.String");
+    argument_template.emplace_back(_cast_param, _cast_param_data_type, _target_data_type_name);
+    FunctionBasePtr func_cast = SimpleFunctionFactory::instance().get_function(
+            "CAST", argument_template, make_nullable(_target_data_type));
+
+    Block cast_block(argument_template);
+    int result_idx = cast_block.columns();
+    cast_block.insert({nullptr, make_nullable(_target_data_type), "cast_result"});
+    RETURN_IF_ERROR(func_cast->execute(nullptr, cast_block, {0}, result_idx, rows));
+
+    auto res_col = cast_block.get_by_position(result_idx).column;
+    block->get_by_position(column_index).type = _target_data_type;
+    if (_target_data_type->is_nullable()) {
+        block->replace_by_position(column_index, res_col);
+    } else {
+        auto nested_ptr = reinterpret_cast<const vectorized::ColumnNullable*>(res_col.get())
+                                  ->get_nested_column_ptr();
+        block->replace_by_position(column_index, nested_ptr);
     }
-    env->DeleteLocalRef(hashmap_class);
-    env->CallNonvirtualIntMethod(_executor_obj, _executor_clazz, _executor_stmt_write_id,
-                                 hashmap_object);
-    env->DeleteLocalRef(hashmap_object);
-    RETURN_IF_ERROR(JniUtil::GetJniExceptionMsg(env));
-    *num_rows_sent = block->rows();
+
     return Status::OK();
 }
 
-std::string JdbcConnector::_jobject_to_string(JNIEnv* env, jobject jobj) {
-    jobject jstr = env->CallObjectMethod(jobj, _to_string_id);
-    auto coding = env->NewStringUTF("UTF-8");
-    const jbyteArray stringJbytes = (jbyteArray)env->CallObjectMethod(jstr, _get_bytes_id, coding);
-    size_t length = (size_t)env->GetArrayLength(stringJbytes);
-    jbyte* pBytes = env->GetByteArrayElements(stringJbytes, nullptr);
-    std::string str = std::string((char*)pBytes, length);
-    env->ReleaseByteArrayElements(stringJbytes, pBytes, JNI_ABORT);
-    env->DeleteLocalRef(stringJbytes);
-    env->DeleteLocalRef(jstr);
-    env->DeleteLocalRef(coding);
-    return str;
-}
-
-Status JdbcConnector::begin_trans() {
-    if (!_is_open) {
-        return Status::InternalError("Begin transaction before open.");
+// Deprecated, this code is retained only for compatibility with query problems that may be encountered when upgrading the version that maps JSON to JSONB to this version, and will be deleted in subsequent versions.
+Status JdbcConnector::_cast_string_to_json(const SlotDescriptor* slot_desc, Block* block,
+                                           int column_index, int rows) {
+    _map_column_idx_to_cast_idx_json[column_index] = _input_json_string_types.size();
+    if (slot_desc->is_nullable()) {
+        _input_json_string_types.push_back(make_nullable(std::make_shared<DataTypeString>()));
+    } else {
+        _input_json_string_types.push_back(std::make_shared<DataTypeString>());
     }
-    JNIEnv* env = nullptr;
-    RETURN_IF_ERROR(JniUtil::GetJNIEnv(&env));
-    env->CallNonvirtualVoidMethod(_executor_obj, _executor_clazz, _executor_begin_trans_id);
-    RETURN_IF_ERROR(JniUtil::GetJniExceptionMsg(env));
-    _is_in_transaction = true;
+    DataTypePtr _target_data_type = slot_desc->get_data_type_ptr();
+    std::string _target_data_type_name = _target_data_type->get_name();
+    DataTypePtr _cast_param_data_type = _target_data_type;
+    ColumnPtr _cast_param = _cast_param_data_type->create_column_const(1, "{}");
+
+    auto& input_col = block->get_by_position(column_index).column;
+
+    ColumnsWithTypeAndName argument_template;
+    argument_template.reserve(2);
+    argument_template.emplace_back(
+            std::move(input_col),
+            _input_json_string_types[_map_column_idx_to_cast_idx_json[column_index]],
+            "java.sql.String");
+    argument_template.emplace_back(_cast_param, _cast_param_data_type, _target_data_type_name);
+    FunctionBasePtr func_cast = SimpleFunctionFactory::instance().get_function(
+            "CAST", argument_template, make_nullable(_target_data_type));
+
+    Block cast_block(argument_template);
+    int result_idx = cast_block.columns();
+    cast_block.insert({nullptr, make_nullable(_target_data_type), "cast_result"});
+    RETURN_IF_ERROR(func_cast->execute(nullptr, cast_block, {0}, result_idx, rows));
+
+    auto res_col = cast_block.get_by_position(result_idx).column;
+    block->get_by_position(column_index).type = _target_data_type;
+    if (_target_data_type->is_nullable()) {
+        block->replace_by_position(column_index, res_col);
+    } else {
+        auto nested_ptr = reinterpret_cast<const vectorized::ColumnNullable*>(res_col.get())
+                                  ->get_nested_column_ptr();
+        block->replace_by_position(column_index, nested_ptr);
+    }
+
     return Status::OK();
 }
 
-Status JdbcConnector::abort_trans() {
-    if (!_is_in_transaction) {
-        return Status::InternalError("Abort transaction before begin trans.");
-    }
-    JNIEnv* env = nullptr;
-    RETURN_IF_ERROR(JniUtil::GetJNIEnv(&env));
-    env->CallNonvirtualVoidMethod(_executor_obj, _executor_clazz, _executor_abort_trans_id);
-    return JniUtil::GetJniExceptionMsg(env);
+jobject JdbcConnector::_get_java_table_type(JNIEnv* env, TOdbcTableType::type tableType) {
+    jclass enumClass = env->FindClass("org/apache/doris/thrift/TOdbcTableType");
+    jmethodID findByValueMethod = env->GetStaticMethodID(
+            enumClass, "findByValue", "(I)Lorg/apache/doris/thrift/TOdbcTableType;");
+    jobject javaEnumObj =
+            env->CallStaticObjectMethod(enumClass, findByValueMethod, static_cast<jint>(tableType));
+    return javaEnumObj;
 }
-
-Status JdbcConnector::finish_trans() {
-    if (!_is_in_transaction) {
-        return Status::InternalError("Abort transaction before begin trans.");
-    }
-    JNIEnv* env = nullptr;
-    RETURN_IF_ERROR(JniUtil::GetJNIEnv(&env));
-    env->CallNonvirtualVoidMethod(_executor_obj, _executor_clazz, _executor_finish_trans_id);
-    RETURN_IF_ERROR(JniUtil::GetJniExceptionMsg(env));
-    _is_in_transaction = false;
-    return Status::OK();
-}
-
-} // namespace vectorized
-} // namespace doris
+} // namespace doris::vectorized

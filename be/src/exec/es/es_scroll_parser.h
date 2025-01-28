@@ -37,14 +37,18 @@ public:
     ~ScrollParser();
 
     Status parse(const std::string& scroll_result, bool exactly_once = false);
+    // Add time_zone info to convert time field of ES to local time zone of Doris
     Status fill_columns(const TupleDescriptor* _tuple_desc,
                         std::vector<vectorized::MutableColumnPtr>& columns, bool* line_eof,
-                        const std::map<std::string, std::string>& docvalue_context);
+                        const std::map<std::string, std::string>& docvalue_context,
+                        const cctz::time_zone& time_zone);
 
     const std::string& get_scroll_id();
     int get_size() const;
 
 private:
+    Status parse_column(const rapidjson::Value& col, PrimitiveType sub_type, bool pure_doc_value,
+                        vectorized::Array& array, const cctz::time_zone& time_zone);
     std::string _scroll_id;
     int _size;
     rapidjson::SizeType _line_index;

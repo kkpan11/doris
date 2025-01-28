@@ -30,12 +30,12 @@ import org.apache.doris.thrift.TTableType;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.Maps;
+import com.google.gson.annotations.SerializedName;
 import org.apache.commons.codec.digest.DigestUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.util.Collections;
 import java.util.HashMap;
@@ -71,86 +71,27 @@ public class OdbcTable extends Table {
         TABLE_TYPE_MAP = Collections.unmodifiableMap(tempMap);
     }
 
-    /**
-     * Formats the provided name (for example, a database, table, or schema name) according to the specified parameters.
-     *
-     * @param name The name to be formatted.
-     * @param wrapStart The character(s) to be added at the start of each name component.
-     * @param wrapEnd The character(s) to be added at the end of each name component.
-     * @param toUpperCase If true, convert the name to upper case.
-     * @param toLowerCase If true, convert the name to lower case.
-     * <p>
-     * Note: If both toUpperCase and toLowerCase are true, the name will ultimately be converted to lower case.
-     * <p>
-     * The name is expected to be in the format of 'schemaName.tableName'. If there is no '.',
-     * the function will treat the entire string as one name component.
-     * If there is a '.', the function will treat the string before the first '.' as the schema name
-     * and the string after the '.' as the table name.
-     *
-     * @return The formatted name.
-     */
-    public static String formatName(String name, String wrapStart, String wrapEnd, boolean toUpperCase,
-            boolean toLowerCase) {
-        int index = name.indexOf(".");
-        if (index == -1) { // No dot in the name
-            String newName = toUpperCase ? name.toUpperCase() : name;
-            newName = toLowerCase ? newName.toLowerCase() : newName;
-            return wrapStart + newName + wrapEnd;
-        } else {
-            String schemaName = toUpperCase ? name.substring(0, index).toUpperCase() : name.substring(0, index);
-            schemaName = toLowerCase ? schemaName.toLowerCase() : schemaName;
-            String tableName = toUpperCase ? name.substring(index + 1).toUpperCase() : name.substring(index + 1);
-            tableName = toLowerCase ? tableName.toLowerCase() : tableName;
-            return wrapStart + schemaName + wrapEnd + "." + wrapStart + tableName + wrapEnd;
-        }
-    }
-
-    /**
-     * Formats a database name according to the database type.
-     *
-     * Rules:
-     * - MYSQL, OCEANBASE: Wrap with backticks (`), case unchanged. Example: mySchema.myTable -> `mySchema.myTable`
-     * - SQLSERVER: Wrap with square brackets ([]), case unchanged. Example: mySchema.myTable -> [mySchema].[myTable]
-     * - POSTGRESQL, CLICKHOUSE, TRINO, OCEANBASE_ORACLE, SAP_HANA: Wrap with double quotes ("), case unchanged.
-     *   Example: mySchema.myTable -> "mySchema"."myTable"
-     * - ORACLE: Wrap with double quotes ("), convert to upper case. Example: mySchema.myTable -> "MYSCHEMA"."MYTABLE"
-     * For other types, the name is returned as is.
-     *
-     * @param tableType The database type.
-     * @param name The name to be formatted, expected in 'schemaName.tableName' format. If no '.', treats entire string
-     *   as one name component. If '.', treats string before first '.' as schema name and after as table name.
-     * @return The formatted name.
-     */
-    public static String databaseProperName(TOdbcTableType tableType, String name) {
-        switch (tableType) {
-            case MYSQL:
-            case OCEANBASE:
-                return formatName(name, "`", "`", false, false);
-            case SQLSERVER:
-                return formatName(name, "[", "]", false, false);
-            case POSTGRESQL:
-            case CLICKHOUSE:
-            case TRINO:
-            case OCEANBASE_ORACLE:
-            case SAP_HANA:
-                return formatName(name, "\"", "\"", false, false);
-            case ORACLE:
-                return formatName(name, "\"", "\"", true, false);
-            default:
-                return name;
-        }
-    }
-
+    @SerializedName("ocrn")
     private String odbcCatalogResourceName;
+    @SerializedName("h")
     private String host;
+    @SerializedName("p")
     private String port;
+    @SerializedName("un")
     private String userName;
+    @SerializedName("pwd")
     private String passwd;
+    @SerializedName("odn")
     private String odbcDatabaseName;
+    @SerializedName("otn")
     private String odbcTableName;
+    @SerializedName("d")
     private String driver;
+    @SerializedName("ottn")
     private String odbcTableTypeName;
+    @SerializedName("c")
     private String charset;
+    @SerializedName("ep")
     private String extraParam;
     private Map<String, String> resourceProperties;
 
@@ -436,8 +377,8 @@ public class OdbcTable extends Table {
 
     @Override
     public OdbcTable clone() {
-        OdbcTable copied = new OdbcTable();
-        if (!DeepCopy.copy(this, copied, OdbcTable.class, FeConstants.meta_version)) {
+        OdbcTable copied = DeepCopy.copy(this, OdbcTable.class, FeConstants.meta_version);
+        if (copied == null) {
             LOG.warn("failed to copy odbc table: " + getName());
             return null;
         }
@@ -486,41 +427,13 @@ public class OdbcTable extends Table {
             sb.append(extraParam);
         }
         String md5 = DigestUtils.md5Hex(sb.toString());
-        LOG.debug("get signature of odbc table {}: {}. signature string: {}", name, md5, sb.toString());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("get signature of odbc table {}: {}. signature string: {}", name, md5, sb.toString());
+        }
         return md5;
     }
 
-    @Override
-    public void write(DataOutput out) throws IOException {
-        super.write(out);
-
-        Map<String, String> serializeMap = Maps.newHashMap();
-
-        serializeMap.put(ODBC_CATALOG_RESOURCE, odbcCatalogResourceName);
-        serializeMap.put(ODBC_HOST, host);
-        serializeMap.put(ODBC_PORT, port);
-        serializeMap.put(ODBC_USER, userName);
-        serializeMap.put(ODBC_PASSWORD, passwd);
-        serializeMap.put(ODBC_DATABASE, odbcDatabaseName);
-        serializeMap.put(ODBC_TABLE, odbcTableName);
-        serializeMap.put(ODBC_DRIVER, driver);
-        serializeMap.put(ODBC_TYPE, odbcTableTypeName);
-        serializeMap.put(ODBC_CHARSET, charset);
-        serializeMap.put(ODBC_EXTRA_PARAM, extraParam);
-
-        int size = (int) serializeMap.values().stream().filter(v -> {
-            return v != null;
-        }).count();
-        out.writeInt(size);
-
-        for (Map.Entry<String, String> kv : serializeMap.entrySet()) {
-            if (kv.getValue() != null) {
-                Text.writeString(out, kv.getKey());
-                Text.writeString(out, kv.getValue());
-            }
-        }
-    }
-
+    @Deprecated
     public void readFields(DataInput in) throws IOException {
         super.readFields(in);
 

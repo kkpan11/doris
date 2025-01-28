@@ -18,9 +18,11 @@
 package org.apache.doris.persist;
 
 import org.apache.doris.catalog.Env;
+import org.apache.doris.cluster.ClusterNamespace;
 import org.apache.doris.common.FeMetaVersion;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
+import org.apache.doris.persist.gson.GsonPostProcessable;
 import org.apache.doris.persist.gson.GsonUtils;
 
 import com.google.gson.annotations.SerializedName;
@@ -29,17 +31,21 @@ import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 
-public class RecoverInfo implements Writable {
+public class RecoverInfo implements Writable, GsonPostProcessable {
     @SerializedName(value = "dbId")
     private long dbId;
     @SerializedName(value = "newDbName")
     private String newDbName;
     @SerializedName(value = "tableId")
     private long tableId;
+    @SerializedName(value = "tableName")
+    private String tableName;                        /// added for table name.
     @SerializedName(value = "newTableName")
     private String newTableName;
     @SerializedName(value = "partitionId")
     private long partitionId;
+    @SerializedName(value = "partitionName")
+    private String partitionName;
     @SerializedName(value = "newPartitionName")
     private String newPartitionName;
 
@@ -47,13 +53,15 @@ public class RecoverInfo implements Writable {
         // for persist
     }
 
-    public RecoverInfo(long dbId, long tableId, long partitionId, String newDbName, String newTableName,
-                       String newPartitionName) {
+    public RecoverInfo(long dbId, long tableId, long partitionId, String newDbName, String tableName,
+                        String newTableName, String partitionName, String newPartitionName) {
         this.dbId = dbId;
         this.tableId = tableId;
+        this.tableName = tableName;
         this.partitionId = partitionId;
         this.newDbName = newDbName;
         this.newTableName = newTableName;
+        this.partitionName = partitionName;
         this.newPartitionName = newPartitionName;
     }
 
@@ -63,6 +71,10 @@ public class RecoverInfo implements Writable {
 
     public long getTableId() {
         return tableId;
+    }
+
+    public String getTableName() {
+        return tableName;
     }
 
     public long getPartitionId() {
@@ -101,5 +113,18 @@ public class RecoverInfo implements Writable {
         dbId = in.readLong();
         tableId = in.readLong();
         partitionId = in.readLong();
+    }
+
+    @Override
+    public void gsonPostProcess() throws IOException {
+        newDbName = ClusterNamespace.getNameFromFullName(newDbName);
+    }
+
+    public String toJson() {
+        return GsonUtils.GSON.toJson(this);
+    }
+
+    public static RecoverInfo fromJson(String json) {
+        return GsonUtils.GSON.fromJson(json, RecoverInfo.class);
     }
 }

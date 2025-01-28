@@ -18,8 +18,11 @@
 package org.apache.doris.nereids.trees.plans.logical;
 
 import org.apache.doris.nereids.memo.GroupExpression;
+import org.apache.doris.nereids.properties.DataTrait;
+import org.apache.doris.nereids.properties.DataTrait.Builder;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.trees.expressions.AssertNumRowsElement;
+import org.apache.doris.nereids.trees.expressions.AssertNumRowsElement.Assertion;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.plans.Plan;
@@ -33,6 +36,7 @@ import com.google.common.collect.ImmutableList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 /**
  * Assert num rows node is used to determine whether the number of rows is less than desired num of rows.
@@ -89,7 +93,7 @@ public class LogicalAssertNumRows<CHILD_TYPE extends Plan> extends LogicalUnary<
 
     @Override
     public List<? extends Expression> getExpressions() {
-        return ImmutableList.of(assertNumRowsElement);
+        return ImmutableList.of();
     }
 
     @Override
@@ -105,14 +109,44 @@ public class LogicalAssertNumRows<CHILD_TYPE extends Plan> extends LogicalUnary<
     }
 
     @Override
-    public Plan withLogicalProperties(Optional<LogicalProperties> logicalProperties) {
-        return new LogicalAssertNumRows<>(assertNumRowsElement, Optional.empty(), logicalProperties, child());
+    public Plan withGroupExprLogicalPropChildren(Optional<GroupExpression> groupExpression,
+            Optional<LogicalProperties> logicalProperties, List<Plan> children) {
+        Preconditions.checkArgument(children.size() == 1);
+        return new LogicalAssertNumRows<>(assertNumRowsElement, groupExpression, logicalProperties, children.get(0));
     }
 
     @Override
     public List<Slot> computeOutput() {
-        return ImmutableList.<Slot>builder()
-                .addAll(child().getOutput())
-                .build();
+        return child().getOutput().stream().map(o -> o.withNullable(true)).collect(Collectors.toList());
+    }
+
+    @Override
+    public void computeUnique(Builder builder) {
+        if (assertNumRowsElement.getDesiredNumOfRows() == 1
+                && (assertNumRowsElement.getAssertion() == Assertion.EQ
+                || assertNumRowsElement.getAssertion() == Assertion.LT
+                || assertNumRowsElement.getAssertion() == Assertion.LE)) {
+            getOutput().forEach(builder::addUniqueSlot);
+        }
+    }
+
+    @Override
+    public void computeUniform(Builder builder) {
+        if (assertNumRowsElement.getDesiredNumOfRows() == 1
+                && (assertNumRowsElement.getAssertion() == Assertion.EQ
+                || assertNumRowsElement.getAssertion() == Assertion.LT
+                || assertNumRowsElement.getAssertion() == Assertion.LE)) {
+            getOutput().forEach(builder::addUniformSlot);
+        }
+    }
+
+    @Override
+    public void computeEqualSet(DataTrait.Builder builder) {
+        builder.addEqualSet(child().getLogicalProperties().getTrait());
+    }
+
+    @Override
+    public void computeFd(DataTrait.Builder builder) {
+        builder.addFuncDepsDG(child().getLogicalProperties().getTrait());
     }
 }

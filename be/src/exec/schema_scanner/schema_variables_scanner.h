@@ -40,12 +40,12 @@ public:
     ~SchemaVariablesScanner() override;
 
     Status start(RuntimeState* state) override;
-    Status get_next_block(vectorized::Block* block, bool* eos) override;
+    Status get_next_block_internal(vectorized::Block* block, bool* eos) override;
 
 private:
     struct VariableStruct {
-        const char* name;
-        const char* value;
+        const char* name = nullptr;
+        const char* value = nullptr;
     };
 
     Status _fill_block_impl(vectorized::Block* block);

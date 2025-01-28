@@ -22,7 +22,6 @@ import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.common.AnalysisException;
-import org.apache.doris.common.Config;
 import org.apache.doris.common.DuplicatedRequestException;
 import org.apache.doris.common.LabelAlreadyUsedException;
 import org.apache.doris.common.UserException;
@@ -32,6 +31,7 @@ import org.apache.doris.load.sync.SyncJob;
 import org.apache.doris.load.sync.model.Data;
 import org.apache.doris.proto.InternalService;
 import org.apache.doris.qe.InsertStreamTxnExecutor;
+import org.apache.doris.service.ExecuteEnv;
 import org.apache.doris.service.FrontendOptions;
 import org.apache.doris.task.SyncTask;
 import org.apache.doris.task.SyncTaskPool;
@@ -42,8 +42,7 @@ import org.apache.doris.thrift.TStreamLoadPutRequest;
 import org.apache.doris.thrift.TTxnParams;
 import org.apache.doris.thrift.TUniqueId;
 import org.apache.doris.transaction.BeginTransactionException;
-import org.apache.doris.transaction.DatabaseTransactionMgr;
-import org.apache.doris.transaction.GlobalTransactionMgr;
+import org.apache.doris.transaction.GlobalTransactionMgrIface;
 import org.apache.doris.transaction.TransactionEntry;
 import org.apache.doris.transaction.TransactionState;
 
@@ -122,10 +121,10 @@ public class CanalSyncChannel extends SyncChannel {
             String label = "label_job" + + jobId + "_channel" + id + "_db" + db.getId() + "_tbl" + tbl.getId()
                     + "_batch" + batchId + "_" + currentTime;
             String targetColumn = Joiner.on(",").join(columns) + "," + DELETE_COLUMN;
-            GlobalTransactionMgr globalTransactionMgr = Env.getCurrentGlobalTransactionMgr();
-            DatabaseTransactionMgr databaseTransactionMgr = globalTransactionMgr.getDatabaseTransactionMgr(db.getId());
+            GlobalTransactionMgrIface globalTransactionMgr = Env.getCurrentGlobalTransactionMgr();
             long txnLimit = db.getTransactionQuotaSize();
-            if (databaseTransactionMgr.getRunningTxnNums() < txnLimit) {
+            long runningTxnNums = globalTransactionMgr.getRunningTxnNums(db.getId());
+            if (runningTxnNums < txnLimit) {
                 TransactionEntry txnEntry = txnExecutor.getTxnEntry();
                 TTxnParams txnConf = txnEntry.getTxnConf();
                 TransactionState.LoadJobSourceType sourceType = TransactionState.LoadJobSourceType.INSERT_STREAMING;
@@ -133,9 +132,11 @@ public class CanalSyncChannel extends SyncChannel {
                 try {
                     long txnId = globalTransactionMgr.beginTransaction(db.getId(),
                             Lists.newArrayList(tbl.getId()), label,
-                        new TransactionState.TxnCoordinator(TransactionState.TxnSourceType.FE,
-                            FrontendOptions.getLocalHostAddress()), sourceType, timeoutSecond);
-                    String token = Env.getCurrentEnv().getLoadManager().getTokenManager().acquireToken();
+                            new TransactionState.TxnCoordinator(TransactionState.TxnSourceType.FE, 0,
+                                    FrontendOptions.getLocalHostAddress(),
+                                    ExecuteEnv.getInstance().getStartupTime()),
+                            sourceType, timeoutSecond);
+                    String token = Env.getCurrentEnv().getTokenManager().acquireToken();
                     request = new TStreamLoadPutRequest()
                         .setTxnId(txnId).setDb(txnConf.getDb()).setTbl(txnConf.getTbl())
                         .setFileType(TFileType.FILE_STREAM).setFormatType(TFileFormatType.FORMAT_CSV_PLAIN)
@@ -184,7 +185,7 @@ public class CanalSyncChannel extends SyncChannel {
                 }
             } else {
                 String failMsg = "current running txns on db " + db.getId() + " is "
-                        + databaseTransactionMgr.getRunningTxnNums()
+                        + runningTxnNums
                         + ", larger than limit " + txnLimit;
                 LOG.warn(failMsg);
                 throw new BeginTransactionException(failMsg);
@@ -247,9 +248,8 @@ public class CanalSyncChannel extends SyncChannel {
             UUID uuid = UUID.randomUUID();
             TUniqueId loadId = new TUniqueId(uuid.getMostSignificantBits(), uuid.getLeastSignificantBits());
             this.timeoutSecond = timeoutSecond;
-            TTxnParams txnConf = new TTxnParams().setNeedTxn(true).setEnablePipelineTxnLoad(Config.enable_pipeline_load)
-                    .setThriftRpcTimeoutMs(5000).setTxnId(-1).setDb(db.getFullName())
-                    .setTbl(tbl.getName()).setDbId(db.getId());
+            TTxnParams txnConf = new TTxnParams().setNeedTxn(true).setThriftRpcTimeoutMs(5000).setTxnId(-1)
+                    .setDb(db.getFullName()).setTbl(tbl.getName()).setDbId(db.getId());
             this.txnExecutor = new InsertStreamTxnExecutor(new TransactionEntry(txnConf, db, tbl));
             txnExecutor.setTxnId(-1L);
             txnExecutor.setLoadId(loadId);

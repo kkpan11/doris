@@ -17,6 +17,7 @@
 
 package org.apache.doris.analysis;
 
+import org.apache.doris.catalog.TableIf.TableType;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.mysql.privilege.AccessControllerManager;
 import org.apache.doris.mysql.privilege.MockedAuth;
@@ -37,9 +38,9 @@ public class ShowTableStmtTest {
 
     @Before
     public void setUp() {
-        analyzer = AccessTestUtil.fetchAdminAnalyzer(true);
         MockedAuth.mockedAccess(accessManager);
         MockedAuth.mockedConnectContext(ctx, "root", "192.168.1.1");
+        analyzer = AccessTestUtil.fetchAdminAnalyzer(true);
     }
 
     @Test
@@ -47,7 +48,7 @@ public class ShowTableStmtTest {
         ShowTableStmt stmt = new ShowTableStmt("", null, false, null);
         stmt.analyze(analyzer);
         Assert.assertEquals("SHOW TABLES FROM internal.testDb", stmt.toString());
-        Assert.assertEquals("testCluster:testDb", stmt.getDb());
+        Assert.assertEquals("testDb", stmt.getDb());
         Assert.assertFalse(stmt.isVerbose());
         Assert.assertEquals(1, stmt.getMetaData().getColumnCount());
         Assert.assertEquals("Tables_in_testDb", stmt.getMetaData().getColumn(0).getName());
@@ -55,7 +56,7 @@ public class ShowTableStmtTest {
         stmt = new ShowTableStmt("abc", null, true, null);
         stmt.analyze(analyzer);
         Assert.assertEquals("SHOW FULL TABLES FROM internal.abc", stmt.toString());
-        Assert.assertEquals(3, stmt.getMetaData().getColumnCount());
+        Assert.assertEquals(4, stmt.getMetaData().getColumnCount());
         Assert.assertEquals("Tables_in_abc", stmt.getMetaData().getColumn(0).getName());
         Assert.assertEquals("Table_type", stmt.getMetaData().getColumn(1).getName());
 
@@ -63,15 +64,44 @@ public class ShowTableStmtTest {
         stmt.analyze(analyzer);
         Assert.assertEquals("bcd", stmt.getPattern());
         Assert.assertEquals("SHOW FULL TABLES FROM internal.abc LIKE 'bcd'", stmt.toString());
-        Assert.assertEquals(3, stmt.getMetaData().getColumnCount());
+        Assert.assertEquals(4, stmt.getMetaData().getColumnCount());
         Assert.assertEquals("Tables_in_abc", stmt.getMetaData().getColumn(0).getName());
         Assert.assertEquals("Table_type", stmt.getMetaData().getColumn(1).getName());
     }
 
-    @Test(expected = AnalysisException.class)
-    public void testNoDb() throws AnalysisException {
+    @Test
+    public void testShowViews() throws AnalysisException {
+        ShowTableStmt stmt = new ShowTableStmt("", null, false, TableType.VIEW,
+                null, null);
+        stmt.analyze(analyzer);
+        Assert.assertEquals("SHOW VIEWS FROM internal.testDb", stmt.toString());
+        Assert.assertEquals("testDb", stmt.getDb());
+        Assert.assertEquals(TableType.VIEW, stmt.getType());
+        Assert.assertFalse(stmt.isVerbose());
+        Assert.assertEquals(1, stmt.getMetaData().getColumnCount());
+        Assert.assertEquals("Tables_in_testDb", stmt.getMetaData().getColumn(0).getName());
+
+        stmt = new ShowTableStmt("abc", null, true, TableType.VIEW, "bcd", null);
+        stmt.analyze(analyzer);
+        Assert.assertEquals("bcd", stmt.getPattern());
+        Assert.assertEquals("SHOW FULL VIEWS FROM internal.abc LIKE 'bcd'", stmt.toString());
+        Assert.assertEquals(4, stmt.getMetaData().getColumnCount());
+        Assert.assertEquals("Tables_in_abc", stmt.getMetaData().getColumn(0).getName());
+        Assert.assertEquals("Table_type", stmt.getMetaData().getColumn(1).getName());
+        Assert.assertEquals(TableType.VIEW, stmt.getType());
+    }
+
+    @Test
+    public void testNoDb() {
         ShowTableStmt stmt = new ShowTableStmt("", null, false, null);
-        stmt.analyze(AccessTestUtil.fetchEmptyDbAnalyzer());
+        try {
+            stmt.analyze(AccessTestUtil.fetchEmptyDbAnalyzer());
+        } catch (AnalysisException e) {
+            return;
+        } catch (Exception e) {
+            e.printStackTrace();
+            Assert.fail(e.getMessage());
+        }
         Assert.fail("No exception throws");
     }
 }

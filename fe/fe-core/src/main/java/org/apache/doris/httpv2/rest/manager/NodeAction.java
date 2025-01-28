@@ -25,6 +25,7 @@ import org.apache.doris.common.Pair;
 import org.apache.doris.common.ThreadPoolManager;
 import org.apache.doris.common.proc.ProcResult;
 import org.apache.doris.common.proc.ProcService;
+import org.apache.doris.common.util.NetUtils;
 import org.apache.doris.common.util.PropertyAnalyzer;
 import org.apache.doris.ha.FrontendNodeType;
 import org.apache.doris.httpv2.entity.ResponseEntityBuilder;
@@ -143,8 +144,12 @@ public class NodeAction extends RestBaseController {
     private Object fetchNodeInfo(HttpServletRequest request, HttpServletResponse response, String procPath)
             throws Exception {
         try {
-            if (!Env.getCurrentEnv().isMaster()) {
-                return redirectToMasterOrException(request, response);
+            if (needRedirect(request.getScheme())) {
+                return redirectToHttps(request);
+            }
+
+            if (checkForwardToMaster(request)) {
+                return forwardToMaster(request, null);
             }
 
             ProcResult procResult = ProcService.getInstance().open(procPath).fetchResult();
@@ -190,7 +195,8 @@ public class NodeAction extends RestBaseController {
             List<Long> beIds = Env.getCurrentSystemInfo().getAllBackendIds(true);
             if (!beIds.isEmpty()) {
                 Backend be = Env.getCurrentSystemInfo().getBackend(beIds.get(0));
-                String url = "http://" + be.getHost() + ":" + be.getHttpPort() + "/api/show_config";
+                String url = "http://" + NetUtils.getHostPortInAccessibleFormat(be.getHost(), be.getHttpPort())
+                        + "/api/show_config";
                 String questResult = HttpUtils.doGet(url, null);
                 List<List<String>> configs = GsonUtils.GSON.fromJson(questResult, new TypeToken<List<List<String>>>() {
                 }.getType());
@@ -227,14 +233,15 @@ public class NodeAction extends RestBaseController {
     }
 
     private static List<String> getFeList() {
-        return Env.getCurrentEnv().getFrontends(null).stream().map(fe -> fe.getHost() + ":" + Config.http_port)
+        return Env.getCurrentEnv().getFrontends(null).stream()
+                .map(fe -> NetUtils.getHostPortInAccessibleFormat(fe.getHost(), Config.http_port))
                 .collect(Collectors.toList());
     }
 
     private static List<String> getBeList() {
         return Env.getCurrentSystemInfo().getAllBackendIds(false).stream().map(beId -> {
             Backend be = Env.getCurrentSystemInfo().getBackend(beId);
-            return be.getHost() + ":" + be.getHttpPort();
+            return NetUtils.getHostPortInAccessibleFormat(be.getHost(), be.getHttpPort());
         }).collect(Collectors.toList());
     }
 
@@ -357,8 +364,9 @@ public class NodeAction extends RestBaseController {
             configInfoTotal.add(Lists.newArrayList());
 
             Pair<String, Integer> hostPort = hostPorts.get(i);
-            configRequestDoneSignal.addMark(hostPort.first + ":" + hostPort.second, -1);
-            String url = "http://" + hostPort.first + ":" + hostPort.second + questPath;
+            String address = NetUtils.getHostPortInAccessibleFormat(hostPort.first, hostPort.second);
+            configRequestDoneSignal.addMark(address, -1);
+            String url = "http://" + address + questPath;
             httpExecutor.submit(
                     new HttpConfigInfoTask(url, hostPort, authorization, nodeType, confNames, configRequestDoneSignal,
                             configInfoTotal.get(i)));
@@ -433,7 +441,8 @@ public class NodeAction extends RestBaseController {
                         addConfig(conf);
                     }
                 }
-                configRequestDoneSignal.markedCountDown(hostPort.first + ":" + hostPort.second, -1);
+                configRequestDoneSignal.markedCountDown(NetUtils
+                        .getHostPortInAccessibleFormat(hostPort.first, hostPort.second), -1);
             } catch (Exception e) {
                 LOG.warn("get config from {}:{} failed.", hostPort.first, hostPort.second, e);
                 configRequestDoneSignal.countDown();
@@ -441,7 +450,8 @@ public class NodeAction extends RestBaseController {
         }
 
         private void addConfig(List<String> conf) {
-            conf.add(1, hostPort.first + ":" + hostPort.second);
+            conf.add(1, NetUtils
+                    .getHostPortInAccessibleFormat(hostPort.first, hostPort.second));
             conf.add(2, nodeType);
             config.add(conf);
         }
@@ -518,7 +528,8 @@ public class NodeAction extends RestBaseController {
             List<Map<String, String>> failedTotal) {
         for (Map.Entry<String, String> entry : configs.entrySet()) {
             Map<String, String> failed = Maps.newHashMap();
-            addFailedConfig(entry.getKey(), entry.getValue(), hostPort.first + ":" + hostPort.second, err, failed);
+            addFailedConfig(entry.getKey(), entry.getValue(), NetUtils
+                    .getHostPortInAccessibleFormat(hostPort.first, hostPort.second), err, failed);
             failedTotal.add(failed);
         }
     }
@@ -534,7 +545,8 @@ public class NodeAction extends RestBaseController {
         for (SetConfigAction.ErrConfig errConfig : setConfigEntity.getErrConfigs()) {
             Map<String, String> failed = Maps.newHashMap();
             addFailedConfig(errConfig.getConfigName(), errConfig.getConfigValue(),
-                    hostPort.first + ":" + hostPort.second, errConfig.getErrInfo(), failed);
+                    NetUtils.getHostPortInAccessibleFormat(hostPort.first, hostPort.second), errConfig.getErrInfo(),
+                    failed);
             failedTotal.add(failed);
         }
     }
@@ -596,8 +608,12 @@ public class NodeAction extends RestBaseController {
     public Object operateBackend(HttpServletRequest request, HttpServletResponse response, @PathVariable String action,
             @RequestBody BackendReqInfo reqInfo) {
         try {
-            if (!Env.getCurrentEnv().isMaster()) {
-                return redirectToMasterOrException(request, response);
+            if (needRedirect(request.getScheme())) {
+                return redirectToHttps(request);
+            }
+
+            if (checkForwardToMaster(request)) {
+                return forwardToMaster(request, reqInfo);
             }
 
             List<String> hostPorts = reqInfo.getHostPorts();
@@ -619,7 +635,7 @@ public class NodeAction extends RestBaseController {
             } else if ("DROP".equals(action)) {
                 currentSystemInfo.dropBackends(hostInfos);
             } else if ("DECOMMISSION".equals(action)) {
-                ImmutableMap<Long, Backend> backendsInCluster = currentSystemInfo.getAllBackendsMap();
+                ImmutableMap<Long, Backend> backendsInCluster = currentSystemInfo.getAllBackendsByAllCluster();
                 backendsInCluster.forEach((k, v) -> {
                     hostInfos.stream()
                             .filter(h -> v.getHost().equals(h.getHost()) && v.getHeartbeatPort() == h.getPort())
@@ -639,8 +655,12 @@ public class NodeAction extends RestBaseController {
     public Object operateFrontends(HttpServletRequest request, HttpServletResponse response,
             @PathVariable String action, @RequestBody FrontendReqInfo reqInfo) {
         try {
-            if (!Env.getCurrentEnv().isMaster()) {
-                return redirectToMasterOrException(request, response);
+            if (needRedirect(request.getScheme())) {
+                return redirectToHttps(request);
+            }
+
+            if (checkForwardToMaster(request)) {
+                return forwardToMaster(request, reqInfo);
             }
 
             String role = reqInfo.getRole();
@@ -800,7 +820,8 @@ public class NodeAction extends RestBaseController {
     }
 
     private String concatNodeConfig(String host, Integer port, String configName, String configValue) {
-        return host + ":" + port + ":" + configName + ":" + configValue;
+        return NetUtils
+                .getHostPortInAccessibleFormat(host, port) + ":" + configName + ":" + configValue;
     }
 
     private Map<String, String> parseNodeConfig(String nodeConfig) {
@@ -841,13 +862,15 @@ public class NodeAction extends RestBaseController {
                 JsonObject jsonObject = JsonParser.parseString(response).getAsJsonObject();
                 String status = jsonObject.get("status").getAsString();
                 if (!status.equals("OK")) {
-                    addFailedConfig(configName, configValue, hostPort.first + ":" + hostPort.second,
+                    addFailedConfig(configName, configValue, NetUtils
+                            .getHostPortInAccessibleFormat(hostPort.first, hostPort.second),
                             jsonObject.get("msg").getAsString(), failed);
                 }
                 beSetConfigDoneSignal.markedCountDown(
                         concatNodeConfig(hostPort.first, hostPort.second, configName, configValue), -1);
             } catch (Exception e) {
-                LOG.warn("set be:{} config:{} failed.", hostPort.first + ":" + hostPort.second,
+                LOG.warn("set be:{} config:{} failed.", NetUtils
+                        .getHostPortInAccessibleFormat(hostPort.first, hostPort.second),
                         configName + "=" + configValue, e);
                 beSetConfigDoneSignal.countDown();
             }

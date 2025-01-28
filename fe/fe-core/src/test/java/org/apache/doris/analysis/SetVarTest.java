@@ -38,9 +38,9 @@ public class SetVarTest {
 
     @Before
     public void setUp() {
-        analyzer = AccessTestUtil.fetchAdminAnalyzer(false);
         MockedAuth.mockedAccess(accessManager);
         MockedAuth.mockedConnectContext(ctx, "root", "192.168.1.1");
+        analyzer = AccessTestUtil.fetchAdminAnalyzer(false);
     }
 
     @Test
@@ -52,7 +52,7 @@ public class SetVarTest {
         var.setType(SetType.GLOBAL);
         Assert.assertEquals(SetType.GLOBAL, var.getType());
         Assert.assertEquals("names", var.getVariable());
-        Assert.assertEquals("utf-8", var.getValue().getStringValue());
+        Assert.assertEquals("utf-8", var.getResult().getStringValue());
 
         Assert.assertEquals("GLOBAL names = 'utf-8'", var.toString());
 

@@ -18,8 +18,10 @@
 package org.apache.doris.nereids.trees.expressions.functions.scalar;
 
 import org.apache.doris.catalog.FunctionSignature;
+import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.functions.ExplicitlyCastableSignature;
+import org.apache.doris.nereids.trees.expressions.literal.Literal;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
 import org.apache.doris.nereids.types.BigIntType;
 import org.apache.doris.nereids.types.DoubleType;
@@ -37,7 +39,8 @@ public class Random extends ScalarFunction
 
     public static final List<FunctionSignature> SIGNATURES = ImmutableList.of(
             FunctionSignature.ret(DoubleType.INSTANCE).args(),
-            FunctionSignature.ret(DoubleType.INSTANCE).args(BigIntType.INSTANCE)
+            FunctionSignature.ret(DoubleType.INSTANCE).args(BigIntType.INSTANCE),
+            FunctionSignature.ret(BigIntType.INSTANCE).args(BigIntType.INSTANCE, BigIntType.INSTANCE)
     );
 
     /**
@@ -52,6 +55,26 @@ public class Random extends ScalarFunction
      */
     public Random(Expression arg) {
         super("random", arg);
+        // align with original planner behavior, refer to: org/apache/doris/analysis/Expr.getBuiltinFunction()
+        Preconditions.checkState(arg instanceof Literal, "The param of rand function must be literal");
+    }
+
+    /**
+     * constructor with 2 argument.
+     */
+    public Random(Expression lchild, Expression rchild) {
+        super("random", lchild, rchild);
+    }
+
+    @Override
+    public void checkLegalityBeforeTypeCoercion() {
+        // align with original planner behavior, refer to:
+        // org/apache/doris/analysis/Expr.getBuiltinFunction()
+        for (Expression child : children()) {
+            if (!child.isLiteral()) {
+                throw new AnalysisException("The param of rand function must be literal ");
+            }
+        }
     }
 
     /**
@@ -71,13 +94,14 @@ public class Random extends ScalarFunction
      */
     @Override
     public Random withChildren(List<Expression> children) {
-        Preconditions.checkArgument(children.size() == 0
-                || children.size() == 1);
-        if (children.isEmpty() && arity() == 0) {
-            return this;
-        } else {
+        if (children.isEmpty()) {
+            return new Random();
+        } else if (children.size() == 1) {
             return new Random(children.get(0));
+        } else if (children.size() == 2) {
+            return new Random(children.get(0), children.get(1));
         }
+        throw new AnalysisException("random function only accept 0-2 arguments");
     }
 
     @Override
@@ -88,5 +112,15 @@ public class Random extends ScalarFunction
     @Override
     public <R, C> R accept(ExpressionVisitor<R, C> visitor, C context) {
         return visitor.visitRandom(this, context);
+    }
+
+    @Override
+    public boolean isDeterministic() {
+        return false;
+    }
+
+    @Override
+    public boolean foldable() {
+        return false;
     }
 }

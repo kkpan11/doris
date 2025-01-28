@@ -17,12 +17,15 @@
 
 #pragma once
 
+#include <cctz/time_zone.h>
 #include <gen_cpp/Types_types.h>
+#include <gen_cpp/segment_v2.pb.h>
 
 #include <ctime>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -31,34 +34,56 @@
 #include "util/countdown_latch.h"
 #include "util/hash_util.hpp"
 
+namespace arrow {
+class RecordBatch;
+class Schema;
+} // namespace arrow
+
 namespace doris {
 
 class BufferControlBlock;
 struct GetResultBatchCtx;
+struct GetArrowResultBatchCtx;
 class PUniqueId;
+class RuntimeState;
+class MemTrackerLimiter;
 class Thread;
+namespace vectorized {
+class Block;
+} // namespace vectorized
 
 // manage all result buffer control block in one backend
 class ResultBufferMgr {
 public:
     ResultBufferMgr();
-    ~ResultBufferMgr();
+    ~ResultBufferMgr() = default;
     // init Result Buffer Mgr, start cancel thread
     Status init();
+
+    void stop();
+
     // create one result sender for this query_id
     // the returned sender do not need release
     // sender is not used when call cancel or unregister
     Status create_sender(const TUniqueId& query_id, int buffer_size,
-                         std::shared_ptr<BufferControlBlock>* sender, bool enable_pipeline,
-                         int exec_timeout);
+                         std::shared_ptr<BufferControlBlock>* sender, RuntimeState* state);
 
+    // fetch data result to FE
     void fetch_data(const PUniqueId& finst_id, GetResultBatchCtx* ctx);
+    // fetch data result to Arrow Flight Client
+    Status fetch_arrow_data(const TUniqueId& finst_id, std::shared_ptr<vectorized::Block>* result,
+                            cctz::time_zone& timezone_obj);
+    // fetch data result to Other BE forwards to Client
+    void fetch_arrow_data(const PUniqueId& finst_id, GetArrowResultBatchCtx* ctx);
+    Status find_mem_tracker(const TUniqueId& finst_id,
+                            std::shared_ptr<MemTrackerLimiter>* mem_tracker);
+    Status find_arrow_schema(const TUniqueId& query_id, std::shared_ptr<arrow::Schema>* schema);
 
     // cancel
-    Status cancel(const TUniqueId& fragment_id);
+    void cancel(const TUniqueId& query_id, const Status& reason);
 
     // cancel one query at a future time.
-    Status cancel_at_time(time_t cancel_time, const TUniqueId& query_id);
+    void cancel_at_time(time_t cancel_time, const TUniqueId& query_id);
 
 private:
     using BufferMap = std::unordered_map<TUniqueId, std::shared_ptr<BufferControlBlock>>;
@@ -71,7 +96,7 @@ private:
     void cancel_thread();
 
     // lock for buffer map
-    std::mutex _lock;
+    std::shared_mutex _buffer_map_lock;
     // buffer block map
     BufferMap _buffer_map;
 
@@ -86,6 +111,4 @@ private:
     scoped_refptr<Thread> _clean_thread;
 };
 
-// TUniqueId hash function used for std::unordered_map
-std::size_t hash_value(const TUniqueId& fragment_id);
 } // namespace doris

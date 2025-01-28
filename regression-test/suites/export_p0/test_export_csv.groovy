@@ -22,6 +22,10 @@ import java.nio.file.Files
 import java.nio.file.Paths
 
 suite("test_export_csv", "p0") {
+    // open nereids
+    sql """ set enable_nereids_planner=true """
+    sql """ set enable_fallback_to_original_planner=false """
+
     // check whether the FE config 'enable_outfile_to_local' is true
     StringBuilder strBuilder = new StringBuilder()
     strBuilder.append("curl --location-trusted -u " + context.config.jdbcUser + ":" + context.config.jdbcPassword)
@@ -71,7 +75,9 @@ suite("test_export_csv", "p0") {
         `float_col` float COMMENT "",
         `double_col` double COMMENT "",
         `char_col` CHAR(10) COMMENT "",
-        `decimal_col` decimal COMMENT ""
+        `decimal_col` decimal COMMENT "",
+        `ipv4_col` ipv4 COMMENT "",
+        `ipv6_col` ipv6 COMMENT ""
         )
         DISTRIBUTED BY HASH(user_id) PROPERTIES("replication_num" = "1");
     """
@@ -79,11 +85,11 @@ suite("test_export_csv", "p0") {
     int i = 1
     for (; i < 100; i ++) {
         sb.append("""
-            (${i}, '2017-10-01', '2017-10-01 00:00:00', 'Beijing', ${i}, ${i % 128}, true, ${i}, ${i}, ${i}, ${i}.${i}, ${i}.${i}, 'char${i}', ${i}),
+            (${i}, '2017-10-01', '2017-10-01 00:00:00', 'Beijing', ${i}, ${i % 128}, true, ${i}, ${i}, ${i}, ${i}.${i}, ${i}.${i}, 'char${i}', ${i}, '0.0.0.${i}', '::${i}'),
         """)
     }
     sb.append("""
-            (${i}, '2017-10-01', '2017-10-01 00:00:00', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)
+            (${i}, '2017-10-01', '2017-10-01 00:00:00', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)
         """)
     sql """ INSERT INTO ${table_export_name} VALUES
             ${sb.toString()}
@@ -171,7 +177,9 @@ suite("test_export_csv", "p0") {
             `float_col` float COMMENT "",
             `double_col` double COMMENT "",
             `char_col` CHAR(10) COMMENT "",
-            `decimal_col` decimal COMMENT ""
+            `decimal_col` decimal COMMENT "",
+            `ipv4_col` ipv4 COMMENT "",
+            `ipv6_col` ipv6 COMMENT ""
             )
             DISTRIBUTED BY HASH(user_id) PROPERTIES("replication_num" = "1");
         """
@@ -182,7 +190,7 @@ suite("test_export_csv", "p0") {
             table "${table_load_name}"
 
             set 'column_separator', ','
-            set 'columns', 'user_id, date, datetime, city, age, sex, bool_col, int_col, bigint_col, largeint_col, float_col, double_col, char_col, decimal_col'
+            set 'columns', 'user_id, date, datetime, city, age, sex, bool_col, int_col, bigint_col, largeint_col, float_col, double_col, char_col, decimal_col, ipv4_col, ipv6_col'
             set 'strict_mode', 'true'
 
             file "${file_path}"
@@ -218,7 +226,7 @@ suite("test_export_csv", "p0") {
 
         // exec export
         sql """
-            EXPORT TABLE ${table_export_name} where user_id <11 TO "file://${outFilePath}/"
+            EXPORT TABLE ${table_export_name} where user_id < 11 TO "file://${outFilePath}/"
             PROPERTIES(
                 "label" = "${label}",
                 "format" = "csv",
@@ -248,7 +256,9 @@ suite("test_export_csv", "p0") {
             `float_col` float COMMENT "",
             `double_col` double COMMENT "",
             `char_col` CHAR(10) COMMENT "",
-            `decimal_col` decimal COMMENT ""
+            `decimal_col` decimal COMMENT "",
+            `ipv4_col` ipv4 COMMENT "",
+            `ipv6_col` ipv6 COMMENT ""
             )
             DISTRIBUTED BY HASH(user_id) PROPERTIES("replication_num" = "1");
         """
@@ -260,7 +270,7 @@ suite("test_export_csv", "p0") {
 
             set 'column_separator', 'ab'
             set 'line_delimiter', 'cc'
-            set 'columns', 'user_id, date, datetime, city, age, sex, bool_col, int_col, bigint_col, largeint_col, float_col, double_col, char_col, decimal_col'
+            set 'columns', 'user_id, date, datetime, city, age, sex, bool_col, int_col, bigint_col, largeint_col, float_col, double_col, char_col, decimal_col, ipv4_col, ipv6_col'
             set 'strict_mode', 'true'
 
             file "${file_path}"
@@ -295,7 +305,7 @@ suite("test_export_csv", "p0") {
 
         // exec export
         sql """
-            EXPORT TABLE ${table_export_name} where user_id <11 TO "file://${outFilePath}/"
+            EXPORT TABLE ${table_export_name} where user_id < 11 TO "file://${outFilePath}/"
             PROPERTIES(
                 "label" = "${label}",
                 "format" = "csv_with_names",
@@ -325,7 +335,9 @@ suite("test_export_csv", "p0") {
             `float_col` float COMMENT "",
             `double_col` double COMMENT "",
             `char_col` CHAR(10) COMMENT "",
-            `decimal_col` decimal COMMENT ""
+            `decimal_col` decimal COMMENT "",
+            `ipv4_col` ipv4 COMMENT "",
+            `ipv6_col` ipv6 COMMENT ""
             )
             DISTRIBUTED BY HASH(user_id) PROPERTIES("replication_num" = "1");
         """
@@ -337,7 +349,7 @@ suite("test_export_csv", "p0") {
 
             set 'column_separator', 'ab'
             set 'line_delimiter', 'cc'
-            set 'columns', 'user_id, date, datetime, city, age, sex, bool_col, int_col, bigint_col, largeint_col, float_col, double_col, char_col, decimal_col'
+            set 'columns', 'user_id, date, datetime, city, age, sex, bool_col, int_col, bigint_col, largeint_col, float_col, double_col, char_col, decimal_col, ipv4_col, ipv6_col'
             set 'strict_mode', 'true'
             set 'format', 'csv_with_names'
 
@@ -359,8 +371,8 @@ suite("test_export_csv", "p0") {
         qt_select_load3 """ SELECT * FROM ${table_load_name} t ORDER BY user_id; """
     
     } finally {
-        // try_sql("DROP TABLE IF EXISTS ${table_load_name}")
-        // delete_files.call("${outFilePath}")
+        try_sql("DROP TABLE IF EXISTS ${table_load_name}")
+        delete_files.call("${outFilePath}")
     }
 
     // 4. test csv_with_names_and_types
@@ -373,7 +385,7 @@ suite("test_export_csv", "p0") {
 
         // exec export
         sql """
-            EXPORT TABLE ${table_export_name} where user_id <11 TO "file://${outFilePath}/"
+            EXPORT TABLE ${table_export_name} where user_id < 11 TO "file://${outFilePath}/"
             PROPERTIES(
                 "label" = "${label}",
                 "format" = "csv_with_names_and_types",
@@ -403,7 +415,9 @@ suite("test_export_csv", "p0") {
             `float_col` float COMMENT "",
             `double_col` double COMMENT "",
             `char_col` CHAR(10) COMMENT "",
-            `decimal_col` decimal COMMENT ""
+            `decimal_col` decimal COMMENT "",
+            `ipv4_col` ipv4 COMMENT "",
+            `ipv6_col` ipv6 COMMENT ""
             )
             DISTRIBUTED BY HASH(user_id) PROPERTIES("replication_num" = "1");
         """
@@ -415,7 +429,7 @@ suite("test_export_csv", "p0") {
 
             set 'column_separator', 'ab'
             set 'line_delimiter', 'cc'
-            set 'columns', 'user_id, date, datetime, city, age, sex, bool_col, int_col, bigint_col, largeint_col, float_col, double_col, char_col, decimal_col'
+            set 'columns', 'user_id, date, datetime, city, age, sex, bool_col, int_col, bigint_col, largeint_col, float_col, double_col, char_col, decimal_col, ipv4_col, ipv6_col'
             set 'strict_mode', 'true'
             set 'format', 'csv_with_names_and_types'
 
@@ -437,8 +451,8 @@ suite("test_export_csv", "p0") {
         qt_select_load4 """ SELECT * FROM ${table_load_name} t ORDER BY user_id; """
     
     } finally {
-        // try_sql("DROP TABLE IF EXISTS ${table_load_name}")
-        // delete_files.call("${outFilePath}")
+        try_sql("DROP TABLE IF EXISTS ${table_load_name}")
+        delete_files.call("${outFilePath}")
     }
 
     try_sql("DROP TABLE IF EXISTS ${table_export_name}")

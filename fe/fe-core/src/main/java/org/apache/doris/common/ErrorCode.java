@@ -43,6 +43,7 @@ public enum ErrorCode {
     ERR_NO_SUCH_THREAD(1094, new byte[]{'H', 'Y', '0', '0', '0'}, "Unknown thread id: %d"),
     ERR_KILL_DENIED_ERROR(1095, new byte[]{'H', 'Y', '0', '0', '0'}, "You are not owner of thread %d"),
     ERR_NO_TABLES_USED(1096, new byte[]{'H', 'Y', '0', '0', '0'}, "No tables used"),
+    ERR_NO_SUCH_QUERY(1097, new byte[]{'H', 'Y', '0', '0', '0'}, "Unknown query id: %s"),
     ERR_WRONG_DB_NAME(1102, new byte[]{'4', '2', '0', '0', '0'}, "Incorrect database name '%s'"),
     ERR_WRONG_TABLE_NAME(1103, new byte[]{'4', '2', '0', '0', '0'}, "Incorrect table name '%s'. Table name regex is '%s'"),
     ERR_TOO_BIG_SELECT(1104, new byte[]{'4', '2', '0', '0', '0'}, "The SELECT would examine more than MAX_JOIN_SIZE "
@@ -60,7 +61,8 @@ public enum ErrorCode {
     ERR_NOT_ALLOWED_COMMAND(1148, new byte[]{'4', '2', '0', '0', '0'}, "The used command is not allowed"
             + " with this MySQL version"),
     ERR_WRONG_COLUMN_NAME(1166, new byte[]{'4', '2', '0', '0', '0'}, "Incorrect column name '%s'. Column regex is '%s'"),
-    ERR_UNKNOWN_SYSTEM_VARIABLE(1193, new byte[]{'H', 'Y', '0', '0', '0'}, "Unknown system variable '%s'"),
+    ERR_UNKNOWN_SYSTEM_VARIABLE(1193, new byte[]{'H', 'Y', '0', '0', '0'}, "Unknown system variable '%s',"
+                    + "the similar variables are %s"),
     ERR_BAD_SLAVE(1200, new byte[]{'H', 'Y', '0', '0', '0'}, "The server is not configured as slave; fix in config "
             + "file or with CHANGE MASTER TO"),
     ERR_MASTER_INF(1201, new byte[]{'H', 'Y', '0', '0', '0'}, "Could not initialize master info structure; more error"
@@ -72,7 +74,21 @@ public enum ErrorCode {
     ERR_USER_LIMIT_REACHED(1226, new byte[]{'4', '2', '0', '0', '0'}, "User '%s' has exceeded the '%s' resource "
             + "(current value: %d)"),
     ERR_SPECIFIC_ACCESS_DENIED_ERROR(1227, new byte[]{'4', '2', '0', '0', '0'}, "Access denied; you need (at least "
-            + "one of) the %s privilege(s) for this operation"),
+            + "one of) the (%s) privilege(s) for this operation"),
+    ERR_CATALOG_ACCESS_DENIED_ERROR(1221, new byte[]{'4', '2', '0', '0', '0'}, "Access denied; you need (at least "
+            + "one of) the (%s) privilege(s) on catalog %s for this operation"),
+    ERR_DB_ACCESS_DENIED_ERROR(1225, new byte[]{'4', '2', '0', '0', '0'}, "Access denied; you need (at least "
+            + "one of) the (%s) privilege(s) on database %s for this operation"),
+
+    ERR_TABLE_ACCESS_DENIED_ERROR(1224, new byte[]{'4', '2', '0', '0', '0'}, "Access denied; you need (at least "
+            + "one of) the (%s) privilege(s) on table %s for this operation"),
+
+    ERR_SPECIFIC_ALL_ACCESS_DENIED_ERROR(1223, new byte[] {'4', '2', '0', '0', '0'}, "Access denied; you need all "
+            + " %s privilege(s) for this operation"),
+
+    ERR_RESOURCE_ACCESS_DENIED_ERROR(1222, new byte[]{'4', '2', '0', '0', '0'}, "Access denied; you need (at least "
+            + "one of) the (%s) privilege(s) on resource %s for this operation"),
+
     ERR_LOCAL_VARIABLE(1228, new byte[]{'H', 'Y', '0', '0', '0'}, "Variable '%s' is a SESSION variable and can't be "
             + "used with SET GLOBAL"),
     ERR_GLOBAL_VARIABLE(1229, new byte[]{'H', 'Y', '0', '0', '0'}, "Variable '%s' is a GLOBAL variable and should be "
@@ -253,7 +269,7 @@ public enum ErrorCode {
     ERR_VIEW_NO_EXPLAIN(1345, new byte[]{'H', 'Y', '0', '0', '0'}, "EXPLAIN/SHOW can not be issued; lacking "
             + "privileges for underlying table"),
     ERR_FRM_UNKNOWN_TYPE(1346, new byte[]{'H', 'Y', '0', '0', '0'}, "File '%s' has unknown type '%s' in its header"),
-    ERR_WRONG_OBJECT(1347, new byte[]{'H', 'Y', '0', '0', '0'}, "'%s.%s' is not %s"),
+    ERR_WRONG_OBJECT(1347, new byte[]{'H', 'Y', '0', '0', '0'}, "'%s.%s' is not %s. %s."),
     ERR_NONUPDATEABLE_COLUMN(1348, new byte[]{'H', 'Y', '0', '0', '0'}, "Column '%s' is not updatable"),
     ERR_VIEW_SELECT_DERIVED(1349, new byte[]{'H', 'Y', '0', '0', '0'}, "View's SELECT contains a subquery in the FROM"
             + " clause"),
@@ -717,8 +733,7 @@ public enum ErrorCode {
     WARN_OPTION_IGNORED(1618, new byte[]{'H', 'Y', '0', '0', '0'}, "<%s> option ignored"),
     WARN_PLUGIN_DELETE_BUILTIN(1619, new byte[]{'H', 'Y', '0', '0', '0'}, "Built-in plugins cannot be deleted"),
     WARN_PLUGIN_BUSY(1620, new byte[]{'H', 'Y', '0', '0', '0'}, "Plugin is busy and will be uninstalled on shutdown"),
-    ERR_VARIABLE_IS_READONLY(1621, new byte[]{'H', 'Y', '0', '0', '0'}, "%s variable '%s' is read-only. Use SET %s to"
-            + " assign the value"),
+    ERR_VARIABLE_IS_READONLY(1621, new byte[]{'H', 'Y', '0', '0', '0'}, "Variable '%s' is a read only variable"),
     ERR_WARN_ENGINE_TRANSACTION_ROLLBACK(1622, new byte[]{'H', 'Y', '0', '0', '0'}, "Storage engine %s does not "
             + "support rollback for this statement. Transaction rolled back and must be restarted"),
     ERR_SLAVE_HEARTBEAT_FAILURE(1623, new byte[]{'H', 'Y', '0', '0', '0'}, "Unexpected master's heartbeat data: %s"),
@@ -1017,6 +1032,8 @@ public enum ErrorCode {
             + "DISCARD the tablespace before IMPORT."),
     ERR_TABLESPACE_DISCARDED(1814, new byte[]{'H', 'Y', '0', '0', '0'}, "Tablespace has been discarded for table '%s'"),
     ERR_INTERNAL_ERROR(1815, new byte[]{'H', 'Y', '0', '0', '0'}, "Internal error: %s"),
+
+
     ERR_MUST_CHANGE_PASSWORD_LOGIN(1862, new byte[]{'H', 'Y', '0', '0', '0'}, "Your password has expired. To log in "
             + "you must change it using a client that supports expired passwords."),
     ERR_CREDENTIALS_CONTRADICT_TO_HISTORY(3638, new byte[] {'H', 'Y', '0', '0', '0'},
@@ -1049,7 +1066,7 @@ public enum ErrorCode {
     ERR_BAD_PARTITION_STATE(5015, new byte[] {'H', 'Y', '0', '0', '0'}, "Partition state is not NORMAL: '%s':'%s'"),
     ERR_PARTITION_HAS_LOADING_JOBS(5016, new byte[] {'H', 'Y', '0', '0', '0'}, "Partition has loading jobs: '%s'"),
     ERR_NOT_KEY_COLUMN(5017, new byte[] {'H', 'Y', '0', '0', '0'}, "Column is not a key column: '%s'"),
-    ERR_INVALID_VALUE(5018, new byte[] {'H', 'Y', '0', '0', '0'}, "Invalid value format: '%s'"),
+    ERR_INVALID_VALUE(5018, new byte[] {'H', 'Y', '0', '0', '0'}, "Value '%s' of '%s' is invalid, '%s'"),
     ERR_REPLICA_NOT_CATCH_UP_WITH_VERSION(5019, new byte[] {'H', 'Y', '0', '0', '0'},
             "Replica does not catch up with version: '%s':'%s'"),
     ERR_BACKEND_OFFLINE(5021, new byte[] {'H', 'Y', '0', '0', '0'}, "Backend is offline: '%s'"),
@@ -1100,7 +1117,7 @@ public enum ErrorCode {
     ERR_CLUSTER_ALTER_BE_IN_DECOMMISSION(5059, new byte[]{'4', '2', '0', '0', '0'},
             "Cluster '%s' has backends in decommission"),
     ERR_WRONG_NAME_FORMAT(5063, new byte[]{'4', '2', '0', '0', '0'},
-            "Incorrect %s name '%s'"),
+            "Incorrect %s name '%s', required format is '%s'"),
     ERR_COMMON_ERROR(5064, new byte[]{'4', '2', '0', '0', '0'},
             "%s"),
     ERR_COLOCATE_FEATURE_DISABLED(5063, new byte[]{'4', '2', '0', '0', '0'},
@@ -1110,11 +1127,11 @@ public enum ErrorCode {
     ERR_COLOCATE_TABLE_MUST_BE_OLAP_TABLE(5063, new byte[]{'4', '2', '0', '0', '0'},
             "Colocate table '%s' must be OLAP table"),
     ERR_COLOCATE_TABLE_MUST_HAS_SAME_REPLICATION_ALLOCATION(5063, new byte[]{'4', '2', '0', '0', '0'},
-            "Colocate tables must have same replication allocation: %s"),
+            "Colocate tables must have same replication allocation: { %s } should be { %s }"),
     ERR_COLOCATE_TABLE_MUST_HAS_SAME_BUCKET_NUM(5063, new byte[]{'4', '2', '0', '0', '0'},
-            "Colocate tables must have same bucket num: %s"),
+            "Colocate tables must have same bucket num: %s should be %s"),
     ERR_COLOCATE_TABLE_MUST_HAS_SAME_DISTRIBUTION_COLUMN_SIZE(5063, new byte[]{'4', '2', '0', '0', '0'},
-            "Colocate tables distribution columns size must be same : %s"),
+            "Colocate tables distribution columns size must be same: %s should be %s"),
     ERR_COLOCATE_TABLE_MUST_HAS_SAME_DISTRIBUTION_COLUMN_TYPE(5063, new byte[]{'4', '2', '0', '0', '0'},
             "Colocate tables distribution columns must have the same data type: %s should be %s"),
     ERR_COLOCATE_NOT_COLOCATE_TABLE(5064, new byte[]{'4', '2', '0', '0', '0'},
@@ -1182,15 +1199,41 @@ public enum ErrorCode {
     ERR_CATALOG_ACCESS_DENIED(5087, new byte[]{'4', '2', '0', '0', '0'},
             "Access denied for user '%s' to catalog '%s'"),
     ERR_NONSUPPORT_HMS_TABLE(5088, new byte[]{'4', '2', '0', '0', '0'},
-            "Nonsupport hive metastore table named '%s' in database '%s' with catalog '%s'."),
+            "Nonsupport hive metastore table named '%s' in database '%s' with catalog '%s'. %s"),
     ERR_TABLE_NAME_LENGTH_LIMIT(5089, new byte[]{'4', '2', '0', '0', '0'}, "Table name length exceeds limit, "
      + "the length of table name '%s' is %d which is greater than the configuration 'table_name_length_limit' (%d)."),
 
-    ERR_NONSUPPORT_TIME_TRAVEL_TABLE(5090, new byte[]{'4', '2', '0', '0', '0'}, "Only iceberg external"
+    ERR_NONSUPPORT_TIME_TRAVEL_TABLE(5090, new byte[]{'4', '2', '0', '0', '0'}, "Only iceberg/hudi external"
      + " table supports time travel in current version"),
 
     ERR_NONSSL_HANDSHAKE_RESPONSE(5091, new byte[] {'4', '2', '0', '0'},
-            "SSL mode on but received non-ssl handshake response from client.");
+            "SSL mode on but received non-ssl handshake response from client."),
+
+    ERR_MORE_THAN_ONE_AUTO_INCREMENT_COLUMN(5092, new byte[]{'4', '2', '0', '0', '0'},
+            "there can be at most one auto increment column in OlapTable."),
+
+    ERR_AUTO_INCREMENT_COLUMN_NULLABLE(5093, new byte[]{'4', '2', '0', '0', '0'},
+            "the auto increment column should be NOT NULL."),
+
+    ERR_AUTO_INCREMENT_COLUMN_WITH_DEFAULT_VALUE(5094, new byte[]{'4', '2', '0', '0', '0'},
+            "the auto increment column can't have default value."),
+
+    ERR_AUTO_INCREMENT_COLUMN_NOT_BIGINT_TYPE(5095, new byte[]{'4', '2', '0', '0', '0'},
+            "the auto increment must be BIGINT type."),
+
+    ERR_AUTO_INCREMENT_COLUMN_IN_AGGREGATE_TABLE(5096, new byte[]{'4', '2', '0', '0', '0'},
+            "the auto increment is only supported in duplicate table and unique table."),
+
+    ERR_ARROW_FLIGHT_SQL_MUST_ONLY_RESULT_STMT(5097, new byte[]{'4', '2', '0', '0', '0'},
+            "There can only be one stmt that returns the result and it is at the end."),
+
+    ERR_CLOUD_CLUSTER_ERROR(5098, new byte[]{'4', '2', '0', '0', '0'},
+            "Compute group (aka. Cloud cluster) %s not exist, use SQL 'SHOW COMPUTE GROUPS' to get a valid compute group"),
+
+    ERR_NO_CLUSTER_ERROR(5099, new byte[]{'4', '2', '0', '0', '0'}, "No compute group (cloud cluster) selected"),
+
+    ERR_NOT_CLOUD_MODE(6000, new byte[]{'4', '2', '0', '0', '0'},
+            "Command only support in cloud mode.");
 
     // This is error code
     private final int code;
@@ -1211,6 +1254,10 @@ public enum ErrorCode {
 
     public byte[] getSqlState() {
         return sqlState;
+    }
+
+    public String getErrorMsg() {
+        return errorMsg;
     }
 
     public String formatErrorMsg(Object... args) {

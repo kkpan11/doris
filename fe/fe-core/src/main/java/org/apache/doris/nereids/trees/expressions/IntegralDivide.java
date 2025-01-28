@@ -20,19 +20,25 @@ package org.apache.doris.nereids.trees.expressions;
 import org.apache.doris.analysis.ArithmeticExpr.Operator;
 import org.apache.doris.nereids.exceptions.UnboundException;
 import org.apache.doris.nereids.trees.expressions.functions.AlwaysNullable;
+import org.apache.doris.nereids.trees.expressions.functions.PropagateNullLiteral;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
 
 import java.util.List;
 
 /**
  * A DIV B
  */
-public class IntegralDivide extends BinaryArithmetic implements AlwaysNullable {
+public class IntegralDivide extends BinaryArithmetic implements AlwaysNullable, PropagateNullLiteral {
 
     public IntegralDivide(Expression left, Expression right) {
-        super(left, right, Operator.INT_DIVIDE);
+        super(ImmutableList.of(left, right), Operator.INT_DIVIDE);
+    }
+
+    private IntegralDivide(List<Expression> children) {
+        super(children, Operator.INT_DIVIDE);
     }
 
     @Override
@@ -49,6 +55,6 @@ public class IntegralDivide extends BinaryArithmetic implements AlwaysNullable {
     @Override
     public Expression withChildren(List<Expression> children) {
         Preconditions.checkArgument(children.size() == 2);
-        return new IntegralDivide(children.get(0), children.get(1));
+        return new IntegralDivide(children);
     }
 }

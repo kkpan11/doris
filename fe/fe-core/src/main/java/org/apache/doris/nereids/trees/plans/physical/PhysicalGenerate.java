@@ -18,6 +18,7 @@
 package org.apache.doris.nereids.trees.plans.physical;
 
 import org.apache.doris.nereids.memo.GroupExpression;
+import org.apache.doris.nereids.properties.DataTrait;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.properties.PhysicalProperties;
 import org.apache.doris.nereids.trees.expressions.Expression;
@@ -55,7 +56,7 @@ public class PhysicalGenerate<CHILD_TYPE extends Plan> extends PhysicalUnary<CHI
      */
     public PhysicalGenerate(List<Function> generators, List<Slot> generatorOutput,
             Optional<GroupExpression> groupExpression, LogicalProperties logicalProperties, CHILD_TYPE child) {
-        super(PlanType.PHYSICAL_FILTER, groupExpression, logicalProperties, child);
+        super(PlanType.PHYSICAL_GENERATE, groupExpression, logicalProperties, child);
         this.generators = ImmutableList.copyOf(Objects.requireNonNull(generators, "predicates can not be null"));
         this.generatorOutput = ImmutableList.copyOf(Objects.requireNonNull(generatorOutput,
                 "generatorOutput can not be null"));
@@ -106,9 +107,6 @@ public class PhysicalGenerate<CHILD_TYPE extends Plan> extends PhysicalUnary<CHI
         if (o == null || getClass() != o.getClass()) {
             return false;
         }
-        if (!super.equals(o)) {
-            return false;
-        }
         PhysicalGenerate<?> that = (PhysicalGenerate<?>) o;
         return generators.equals(that.generators)
                 && generatorOutput.equals(that.generatorOutput);
@@ -116,7 +114,7 @@ public class PhysicalGenerate<CHILD_TYPE extends Plan> extends PhysicalUnary<CHI
 
     @Override
     public int hashCode() {
-        return Objects.hash(super.hashCode(), generators, generatorOutput);
+        return Objects.hash(generators, generatorOutput);
     }
 
     @Override
@@ -127,8 +125,8 @@ public class PhysicalGenerate<CHILD_TYPE extends Plan> extends PhysicalUnary<CHI
     @Override
     public PhysicalGenerate<Plan> withChildren(List<Plan> children) {
         Preconditions.checkArgument(children.size() == 1);
-        return new PhysicalGenerate<>(generators, generatorOutput,
-                getLogicalProperties(), children.get(0));
+        return new PhysicalGenerate<>(generators, generatorOutput, groupExpression,
+                getLogicalProperties(), physicalProperties, statistics, children.get(0));
     }
 
     @Override
@@ -138,9 +136,11 @@ public class PhysicalGenerate<CHILD_TYPE extends Plan> extends PhysicalUnary<CHI
     }
 
     @Override
-    public PhysicalGenerate<CHILD_TYPE> withLogicalProperties(Optional<LogicalProperties> logicalProperties) {
+    public Plan withGroupExprLogicalPropChildren(Optional<GroupExpression> groupExpression,
+            Optional<LogicalProperties> logicalProperties, List<Plan> children) {
+        Preconditions.checkArgument(children.size() == 1);
         return new PhysicalGenerate<>(generators, generatorOutput,
-                Optional.empty(), logicalProperties.get(), child());
+                groupExpression, logicalProperties.get(), children.get(0));
     }
 
     @Override
@@ -149,5 +149,40 @@ public class PhysicalGenerate<CHILD_TYPE extends Plan> extends PhysicalUnary<CHI
         return new PhysicalGenerate<>(generators, generatorOutput,
                 Optional.empty(), getLogicalProperties(), physicalProperties,
                 statistics, child());
+    }
+
+    @Override
+    public List<Slot> computeOutput() {
+        return ImmutableList.<Slot>builder()
+                .addAll(child().getOutput())
+                .addAll(generatorOutput)
+                .build();
+    }
+
+    @Override
+    public PhysicalGenerate<CHILD_TYPE> resetLogicalProperties() {
+        return new PhysicalGenerate<>(generators, generatorOutput,
+                Optional.empty(), null, physicalProperties,
+                statistics, child());
+    }
+
+    @Override
+    public void computeUnique(DataTrait.Builder builder) {
+        // don't generate and propagate unique
+    }
+
+    @Override
+    public void computeUniform(DataTrait.Builder builder) {
+        builder.addUniformSlot(child(0).getLogicalProperties().getTrait());
+    }
+
+    @Override
+    public void computeEqualSet(DataTrait.Builder builder) {
+        builder.addEqualSet(child().getLogicalProperties().getTrait());
+    }
+
+    @Override
+    public void computeFd(DataTrait.Builder builder) {
+        builder.addFuncDepsDG(child().getLogicalProperties().getTrait());
     }
 }

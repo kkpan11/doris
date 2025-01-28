@@ -20,27 +20,29 @@
 #include <stdint.h>
 
 #include "operator.h"
-#include "vec/exec/vempty_set_node.h"
 
-namespace doris {
-class ExecNode;
+namespace doris::pipeline {
+#include "common/compile_check_begin.h"
 
-namespace pipeline {
-
-class EmptySetSourceOperatorBuilder final : public OperatorBuilder<vectorized::VEmptySetNode> {
+class EmptySetLocalState final : public PipelineXLocalState<FakeSharedState> {
 public:
-    EmptySetSourceOperatorBuilder(int32_t id, ExecNode* empty_set_node);
+    ENABLE_FACTORY_CREATOR(EmptySetLocalState);
 
-    bool is_source() const override { return true; }
-
-    OperatorPtr build_operator() override;
+    EmptySetLocalState(RuntimeState* state, OperatorXBase* parent)
+            : PipelineXLocalState<FakeSharedState>(state, parent) {}
+    ~EmptySetLocalState() = default;
 };
 
-class EmptySetSourceOperator final : public SourceOperator<EmptySetSourceOperatorBuilder> {
+class EmptySetSourceOperatorX final : public OperatorX<EmptySetLocalState> {
 public:
-    EmptySetSourceOperator(OperatorBuilderBase* operator_builder, ExecNode* empty_set_node);
-    bool can_read() override { return true; }
+    EmptySetSourceOperatorX(ObjectPool* pool, const TPlanNode& tnode, int operator_id,
+                            const DescriptorTbl& descs)
+            : OperatorX<EmptySetLocalState>(pool, tnode, operator_id, descs) {}
+
+    Status get_block(RuntimeState* state, vectorized::Block* block, bool* eos) override;
+
+    [[nodiscard]] bool is_source() const override { return true; }
 };
 
-} // namespace pipeline
-} // namespace doris
+#include "common/compile_check_end.h"
+} // namespace doris::pipeline

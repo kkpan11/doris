@@ -41,9 +41,9 @@ public class SetUserPropertyStmtTest {
 
     @Before
     public void setUp() {
-        analyzer = AccessTestUtil.fetchAdminAnalyzer(true);
         MockedAuth.mockedAccess(accessManager);
         MockedAuth.mockedConnectContext(ctx, "root", "192.168.1.1");
+        analyzer = AccessTestUtil.fetchAdminAnalyzer(true);
     }
 
     @Test
@@ -54,7 +54,7 @@ public class SetUserPropertyStmtTest {
 
         SetUserPropertyStmt stmt = new SetUserPropertyStmt("testUser", propertyVarList);
         stmt.analyze(analyzer);
-        Assert.assertEquals("testCluster:testUser", stmt.getUser());
+        Assert.assertEquals("testUser", stmt.getUser());
     }
 
     @Test(expected = AnalysisException.class)

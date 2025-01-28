@@ -19,20 +19,31 @@ package org.apache.doris.nereids.trees.expressions.literal;
 
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.functions.AlwaysNotNullable;
+import org.apache.doris.nereids.trees.expressions.shape.UnaryExpression;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
 import org.apache.doris.nereids.types.DataType;
 import org.apache.doris.nereids.types.DateType;
 
+import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
+import org.apache.commons.lang3.EnumUtils;
+
+import java.util.List;
+import java.util.Optional;
+
 /**
  * Interval for timestamp calculation.
  */
-public class Interval extends Expression implements AlwaysNotNullable {
-    private final Expression value;
+public class Interval extends Expression implements UnaryExpression, AlwaysNotNullable {
     private final TimeUnit timeUnit;
 
     public Interval(Expression value, String desc) {
-        this.value = value;
-        this.timeUnit = TimeUnit.valueOf(desc.toUpperCase());
+        this(value, TimeUnit.valueOf(desc.toUpperCase()));
+    }
+
+    public Interval(Expression value, TimeUnit timeUnit) {
+        super(ImmutableList.of(value));
+        this.timeUnit = timeUnit;
     }
 
     @Override
@@ -41,11 +52,17 @@ public class Interval extends Expression implements AlwaysNotNullable {
     }
 
     public Expression value() {
-        return value;
+        return child();
     }
 
     public TimeUnit timeUnit() {
         return timeUnit;
+    }
+
+    @Override
+    public Expression withChildren(List<Expression> children) {
+        Preconditions.checkArgument(children.size() == 1);
+        return new Interval(children.get(0), timeUnit);
     }
 
     @Override
@@ -57,32 +74,46 @@ public class Interval extends Expression implements AlwaysNotNullable {
      * Supported time unit.
      */
     public enum TimeUnit {
-        YEAR("YEAR", false),
-        MONTH("MONTH", false),
-        WEEK("WEEK", false),
-        DAY("DAY", false),
-        HOUR("HOUR", true),
-        MINUTE("MINUTE", true),
-        SECOND("SECOND", true);
+        YEAR("YEAR", false, 800),
+        MONTH("MONTH", false, 700),
+        QUARTER("QUARTER", false, 600),
+        WEEK("WEEK", false, 500),
+        DAY("DAY", false, 400),
+        HOUR("HOUR", true, 300),
+        MINUTE("MINUTE", true, 200),
+        SECOND("SECOND", true, 100);
 
         private final String description;
-
         private final boolean isDateTimeUnit;
+        /**
+         * Time unit level, second level is low, year level is high
+         */
+        private final int level;
 
-        TimeUnit(String description, boolean isDateTimeUnit) {
+        TimeUnit(String description, boolean isDateTimeUnit, int level) {
             this.description = description;
             this.isDateTimeUnit = isDateTimeUnit;
+            this.level = level;
         }
 
         public boolean isDateTimeUnit() {
             return isDateTimeUnit;
         }
 
+        public int getLevel() {
+            return level;
+        }
+
         @Override
         public String toString() {
             return description;
         }
+
+        /**
+         * Construct time unit by name
+         */
+        public static Optional<TimeUnit> of(String name) {
+            return Optional.ofNullable(EnumUtils.getEnumIgnoreCase(TimeUnit.class, name));
+        }
     }
 }
-
-

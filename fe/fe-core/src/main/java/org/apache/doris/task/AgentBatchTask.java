@@ -20,13 +20,17 @@ package org.apache.doris.task;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.ClientPool;
 import org.apache.doris.common.FeConstants;
+import org.apache.doris.common.ThriftUtils;
 import org.apache.doris.system.Backend;
 import org.apache.doris.thrift.BackendService;
 import org.apache.doris.thrift.TAgentServiceVersion;
 import org.apache.doris.thrift.TAgentTaskRequest;
 import org.apache.doris.thrift.TAlterInvertedIndexReq;
 import org.apache.doris.thrift.TAlterTabletReqV2;
+import org.apache.doris.thrift.TCalcDeleteBitmapRequest;
 import org.apache.doris.thrift.TCheckConsistencyReq;
+import org.apache.doris.thrift.TCleanTrashReq;
+import org.apache.doris.thrift.TCleanUDFCacheReq;
 import org.apache.doris.thrift.TClearAlterTaskRequest;
 import org.apache.doris.thrift.TClearTransactionTaskRequest;
 import org.apache.doris.thrift.TCloneReq;
@@ -34,6 +38,7 @@ import org.apache.doris.thrift.TCompactionReq;
 import org.apache.doris.thrift.TCreateTabletReq;
 import org.apache.doris.thrift.TDownloadReq;
 import org.apache.doris.thrift.TDropTabletReq;
+import org.apache.doris.thrift.TGcBinlogReq;
 import org.apache.doris.thrift.TMoveDirReq;
 import org.apache.doris.thrift.TNetworkAddress;
 import org.apache.doris.thrift.TPublishVersionRequest;
@@ -46,10 +51,12 @@ import org.apache.doris.thrift.TStorageMediumMigrateReq;
 import org.apache.doris.thrift.TTaskType;
 import org.apache.doris.thrift.TUpdateTabletMetaInfoReq;
 import org.apache.doris.thrift.TUploadReq;
+import org.apache.doris.thrift.TVisibleVersionReq;
 
 import com.google.common.collect.Lists;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.thrift.TException;
 
 import java.util.HashMap;
 import java.util.LinkedList;
@@ -62,11 +69,19 @@ import java.util.Map;
 public class AgentBatchTask implements Runnable {
     private static final Logger LOG = LogManager.getLogger(AgentBatchTask.class);
 
+    private int batchSize = Integer.MAX_VALUE;
+
     // backendId -> AgentTask List
     private Map<Long, List<AgentTask>> backendIdToTasks;
 
     public AgentBatchTask() {
         this.backendIdToTasks = new HashMap<Long, List<AgentTask>>();
+    }
+
+    public AgentBatchTask(int batchSize) {
+        this.backendIdToTasks = new HashMap<Long, List<AgentTask>>();
+        this.batchSize = batchSize;
+        assert batchSize > 0;
     }
 
     public AgentBatchTask(AgentTask singleTask) {
@@ -152,9 +167,11 @@ public class AgentBatchTask implements Runnable {
             BackendService.Client client = null;
             TNetworkAddress address = null;
             boolean ok = false;
+            String errMsg = "";
             try {
                 Backend backend = Env.getCurrentSystemInfo().getBackend(backendId);
                 if (backend == null || !backend.isAlive()) {
+                    errMsg = String.format("backend %d is not alive", backendId);
                     continue;
                 }
                 List<AgentTask> tasks = this.backendIdToTasks.get(backendId);
@@ -165,25 +182,49 @@ public class AgentBatchTask implements Runnable {
                 List<TAgentTaskRequest> agentTaskRequests = new LinkedList<TAgentTaskRequest>();
                 for (AgentTask task : tasks) {
                     agentTaskRequests.add(toAgentTaskRequest(task));
-                }
-                client.submitTasks(agentTaskRequests);
-                if (LOG.isDebugEnabled()) {
-                    for (AgentTask task : tasks) {
-                        LOG.debug("send task: type[{}], backend[{}], signature[{}]",
-                                task.getTaskType(), backendId, task.getSignature());
+                    if (agentTaskRequests.size() >= batchSize) {
+                        submitTasks(backendId, client, agentTaskRequests);
+                        agentTaskRequests.clear();
                     }
                 }
+                submitTasks(backendId, client, agentTaskRequests);
                 ok = true;
             } catch (Exception e) {
                 LOG.warn("task exec error. backend[{}]", backendId, e);
+                errMsg = String.format("task exec error: %s. backend[%d]", e.getMessage(), backendId);
             } finally {
                 if (ok) {
                     ClientPool.backendPool.returnObject(address, client);
                 } else {
                     ClientPool.backendPool.invalidateObject(address, client);
+                    List<AgentTask> tasks = this.backendIdToTasks.get(backendId);
+                    for (AgentTask task : tasks) {
+                        task.failedWithMsg(errMsg);
+                    }
                 }
             }
         } // end for backend
+    }
+
+    private static void submitTasks(long backendId,
+            BackendService.Client client, List<TAgentTaskRequest> agentTaskRequests) throws TException {
+        if (!agentTaskRequests.isEmpty()) {
+            if (LOG.isDebugEnabled()) {
+                long size = agentTaskRequests.stream()
+                        .map(ThriftUtils::getBinaryMessageSize)
+                        .reduce(0L, Long::sum);
+                TTaskType firstTaskType = agentTaskRequests.get(0).getTaskType();
+                LOG.debug("submit {} tasks to backend[{}], total size: {}, first task type: {}",
+                        agentTaskRequests.size(), backendId, size, firstTaskType);
+            }
+            client.submitTasks(agentTaskRequests);
+        }
+        if (LOG.isDebugEnabled()) {
+            for (TAgentTaskRequest req : agentTaskRequests) {
+                LOG.debug("send task: type[{}], backend[{}], signature[{}]",
+                        req.getTaskType(), backendId, req.getSignature());
+            }
+        }
     }
 
     private TAgentTaskRequest toAgentTaskRequest(AgentTask task) {
@@ -375,8 +416,55 @@ public class AgentBatchTask implements Runnable {
                 tAgentTaskRequest.setPushCooldownConf(request);
                 return tAgentTaskRequest;
             }
+            case GC_BINLOG: {
+                BinlogGcTask binlogGcTask = (BinlogGcTask) task;
+                TGcBinlogReq request = binlogGcTask.toThrift();
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug(request.toString());
+                }
+                tAgentTaskRequest.setGcBinlogReq(request);
+                return tAgentTaskRequest;
+            }
+            case UPDATE_VISIBLE_VERSION: {
+                UpdateVisibleVersionTask visibleTask = (UpdateVisibleVersionTask) task;
+                TVisibleVersionReq request = visibleTask.toThrift();
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug(request.toString());
+                }
+                tAgentTaskRequest.setVisibleVersionReq(request);
+                return tAgentTaskRequest;
+            }
+            case CALCULATE_DELETE_BITMAP: {
+                CalcDeleteBitmapTask calcDeleteBitmapTask = (CalcDeleteBitmapTask) task;
+                TCalcDeleteBitmapRequest request = calcDeleteBitmapTask.toThrift();
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug(request.toString());
+                }
+                tAgentTaskRequest.setCalcDeleteBitmapReq(request);
+                return tAgentTaskRequest;
+            }
+            case CLEAN_TRASH: {
+                CleanTrashTask cleanTrashTask = (CleanTrashTask) task;
+                TCleanTrashReq request = cleanTrashTask.toThrift();
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug(request.toString());
+                }
+                tAgentTaskRequest.setCleanTrashReq(request);
+                return tAgentTaskRequest;
+            }
+            case CLEAN_UDF_CACHE: {
+                CleanUDFCacheTask cleanUDFCacheTask = (CleanUDFCacheTask) task;
+                TCleanUDFCacheReq request = cleanUDFCacheTask.toThrift();
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug(request.toString());
+                }
+                tAgentTaskRequest.setCleanUdfCacheReq(request);
+                return tAgentTaskRequest;
+            }
             default:
-                LOG.debug("could not find task type for task [{}]", task);
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("could not find task type for task [{}]", task);
+                }
                 return null;
         }
     }

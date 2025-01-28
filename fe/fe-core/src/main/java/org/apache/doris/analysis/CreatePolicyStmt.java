@@ -37,7 +37,7 @@ import java.util.Map;
  * syntax:
  * CREATE ROW POLICY [IF NOT EXISTS] test_row_policy ON test_table AS {PERMISSIVE|RESTRICTIVE} TO user USING (a = ’xxx‘)
  */
-public class CreatePolicyStmt extends DdlStmt {
+public class CreatePolicyStmt extends DdlStmt implements NotFallbackInParser {
 
     @Getter
     private final PolicyTypeEnum type;
@@ -58,6 +58,9 @@ public class CreatePolicyStmt extends DdlStmt {
     private UserIdentity user = null;
 
     @Getter
+    private String roleName = null;
+
+    @Getter
     private Expr wherePredicate;
 
     @Getter
@@ -67,13 +70,14 @@ public class CreatePolicyStmt extends DdlStmt {
      * Use for cup.
      **/
     public CreatePolicyStmt(PolicyTypeEnum type, boolean ifNotExists, String policyName, TableName tableName,
-                            String filterType, UserIdentity user, Expr wherePredicate) {
+            String filterType, UserIdentity user, String roleName, Expr wherePredicate) {
         this.type = type;
         this.ifNotExists = ifNotExists;
         this.policyName = policyName;
         this.tableName = tableName;
         this.filterType = FilterType.of(filterType);
         this.user = user;
+        this.roleName = roleName;
         this.wherePredicate = wherePredicate;
     }
 
@@ -81,7 +85,7 @@ public class CreatePolicyStmt extends DdlStmt {
      * Use for cup.
      */
     public CreatePolicyStmt(PolicyTypeEnum type, boolean ifNotExists, String policyName,
-                            Map<String, String> properties) {
+            Map<String, String> properties) {
         this.type = type;
         this.ifNotExists = ifNotExists;
         this.policyName = policyName;
@@ -97,19 +101,30 @@ public class CreatePolicyStmt extends DdlStmt {
                     throw new UserException("storage policy feature is disabled by default. "
                             + "Enable it by setting 'enable_storage_policy=true' in fe.conf");
                 }
+                // check auth
+                // check if can create policy and use storage_resource
+                if (!Env.getCurrentEnv().getAccessManager()
+                        .checkGlobalPriv(ConnectContext.get(), PrivPredicate.ADMIN)) {
+                    ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR,
+                            PrivPredicate.ADMIN.getPrivs().toString());
+                }
                 break;
             case ROW:
             default:
                 tableName.analyze(analyzer);
-                user.analyze(analyzer.getClusterName());
-                if (user.isRootUser() || user.isAdminUser()) {
-                    ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "CreatePolicyStmt",
-                            user.getQualifiedUser(), user.getHost(), tableName.getTbl());
+                if (user != null) {
+                    user.analyze();
+                    if (user.isRootUser() || user.isAdminUser()) {
+                        ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "CreatePolicyStmt",
+                                user.getQualifiedUser(), user.getHost(), tableName.getTbl());
+                    }
                 }
-        }
-        // check auth
-        if (!Env.getCurrentEnv().getAccessManager().checkGlobalPriv(ConnectContext.get(), PrivPredicate.ADMIN)) {
-            ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR, "ADMIN");
+                // check auth
+                if (!Env.getCurrentEnv().getAccessManager()
+                        .checkGlobalPriv(ConnectContext.get(), PrivPredicate.GRANT)) {
+                    ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR,
+                            PrivPredicate.GRANT.getPrivs().toString());
+                }
         }
     }
 
@@ -128,8 +143,19 @@ public class CreatePolicyStmt extends DdlStmt {
             case ROW:
             default:
                 sb.append(" ON ").append(tableName.toSql()).append(" AS ").append(filterType)
-                    .append(" TO ").append(user.getQualifiedUser()).append(" USING ").append(wherePredicate.toSql());
+                        .append(" TO ");
+                if (user == null) {
+                    sb.append("ROLE ").append(roleName);
+                } else {
+                    sb.append(user.getQualifiedUser());
+                }
+                sb.append(" USING ").append(wherePredicate.toSql());
         }
         return sb.toString();
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.CREATE;
     }
 }

@@ -17,14 +17,22 @@
 
 package org.apache.doris.datasource.property.constants;
 
+import org.apache.doris.cloud.proto.Cloud;
+import org.apache.doris.cloud.proto.Cloud.ObjectStoreInfoPB.Provider;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.DdlException;
-import org.apache.doris.datasource.credentials.CloudCredential;
-import org.apache.doris.datasource.credentials.CloudCredentialWithEndpoint;
-import org.apache.doris.datasource.credentials.DataLakeAWSCredentialsProvider;
+import org.apache.doris.common.credentials.CloudCredential;
+import org.apache.doris.common.credentials.CloudCredentialWithEndpoint;
+import org.apache.doris.common.credentials.DataLakeAWSCredentialsProvider;
+import org.apache.doris.datasource.property.PropertyConverter;
 import org.apache.doris.thrift.TS3StorageParam;
 
 import com.amazonaws.auth.EnvironmentVariableCredentialsProvider;
+import com.amazonaws.auth.InstanceProfileCredentialsProvider;
+import com.amazonaws.auth.SystemPropertiesCredentialsProvider;
+import com.amazonaws.auth.WebIdentityTokenCredentialsProvider;
+import com.amazonaws.auth.profile.ProfileCredentialsProvider;
+import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.common.collect.Maps;
 import org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider;
@@ -35,6 +43,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 public class S3Properties extends BaseProperties {
 
@@ -43,6 +52,7 @@ public class S3Properties extends BaseProperties {
 
     public static final String CREDENTIALS_PROVIDER = "s3.credentials.provider";
     public static final String ENDPOINT = "s3.endpoint";
+    public static final String EXTERNAL_ENDPOINT = "s3.external_endpoint";
     public static final String REGION = "s3.region";
     public static final String ACCESS_KEY = "s3.access_key";
     public static final String SECRET_KEY = "s3.secret_key";
@@ -50,20 +60,32 @@ public class S3Properties extends BaseProperties {
     public static final String MAX_CONNECTIONS = "s3.connection.maximum";
     public static final String REQUEST_TIMEOUT_MS = "s3.connection.request.timeout";
     public static final String CONNECTION_TIMEOUT_MS = "s3.connection.timeout";
+    public static final String S3_PROVIDER = "S3";
 
     // required by storage policy
     public static final String ROOT_PATH = "s3.root.path";
     public static final String BUCKET = "s3.bucket";
     public static final String VALIDITY_CHECK = "s3_validity_check";
-    public static final List<String> REQUIRED_FIELDS = Arrays.asList(ENDPOINT, ACCESS_KEY, SECRET_KEY);
+    public static final String PROVIDER = "provider";
+    public static final List<String> REQUIRED_FIELDS = Arrays.asList(ENDPOINT);
     public static final List<String> TVF_REQUIRED_FIELDS = Arrays.asList(ACCESS_KEY, SECRET_KEY);
+    public static final List<String> FS_KEYS = Arrays.asList(ENDPOINT, REGION, ACCESS_KEY, SECRET_KEY, SESSION_TOKEN,
+            ROOT_PATH, BUCKET, MAX_CONNECTIONS, REQUEST_TIMEOUT_MS, CONNECTION_TIMEOUT_MS);
+
+    public static final List<String> PROVIDERS = Arrays.asList("COS", "OSS", "S3", "OBS", "BOS", "AZURE", "GCP");
 
     public static final List<String> AWS_CREDENTIALS_PROVIDERS = Arrays.asList(
             DataLakeAWSCredentialsProvider.class.getName(),
             TemporaryAWSCredentialsProvider.class.getName(),
             SimpleAWSCredentialsProvider.class.getName(),
             EnvironmentVariableCredentialsProvider.class.getName(),
+            SystemPropertiesCredentialsProvider.class.getName(),
+            ProfileCredentialsProvider.class.getName(),
+            InstanceProfileCredentialsProvider.class.getName(),
+            WebIdentityTokenCredentialsProvider.class.getName(),
             IAMInstanceCredentialsProvider.class.getName());
+
+    private static final Pattern IPV4_PORT_PATTERN = Pattern.compile("((?:\\d{1,3}\\.){3}\\d{1,3}:\\d{1,5})");
 
     public static Map<String, String> credentialToMap(CloudCredentialWithEndpoint credential) {
         Map<String, String> resMap = new HashMap<>();
@@ -97,7 +119,7 @@ public class S3Properties extends BaseProperties {
         public static final String DEFAULT_MAX_CONNECTIONS = "50";
         public static final String DEFAULT_REQUEST_TIMEOUT_MS = "3000";
         public static final String DEFAULT_CONNECTION_TIMEOUT_MS = "1000";
-        public static final List<String> REQUIRED_FIELDS = Arrays.asList(ENDPOINT, ACCESS_KEY, SECRET_KEY);
+        public static final List<String> REQUIRED_FIELDS = Arrays.asList(ENDPOINT);
         public static final List<String> FS_KEYS = Arrays.asList(ENDPOINT, REGION, ACCESS_KEY, SECRET_KEY, TOKEN,
                 ROOT_PATH, BUCKET, MAX_CONNECTIONS, REQUEST_TIMEOUT_MS, CONNECTION_TIMEOUT_MS);
     }
@@ -114,13 +136,24 @@ public class S3Properties extends BaseProperties {
         }
         String endpoint = props.get(Env.ENDPOINT);
         String region = props.getOrDefault(Env.REGION, S3Properties.getRegionOfEndpoint(endpoint));
+        props.putIfAbsent(Env.REGION, PropertyConverter.checkRegion(endpoint, region, Env.REGION));
         return new CloudCredentialWithEndpoint(endpoint, region, credential);
     }
 
     public static String getRegionOfEndpoint(String endpoint) {
-        String[] endpointSplit = endpoint.split("\\.");
+        if (IPV4_PORT_PATTERN.matcher(endpoint).find()) {
+            // if endpoint contains '192.168.0.1:8999', return null region
+            return null;
+        }
+        String[] endpointSplit = endpoint.replace("http://", "")
+                .replace("https://", "")
+                .split("\\.");
         if (endpointSplit.length < 2) {
             return null;
+        }
+        if (endpointSplit[0].contains("oss-")) {
+            // compatible with the endpoint: oss-cn-bejing.aliyuncs.com
+            return endpointSplit[0];
         }
         return endpointSplit[1];
     }
@@ -140,6 +173,11 @@ public class S3Properties extends BaseProperties {
             } else if (entry.getKey().startsWith(ObsProperties.OBS_PREFIX)) {
                 String s3Key = entry.getKey().replace(ObsProperties.OBS_PREFIX, S3Properties.S3_PREFIX);
                 s3Properties.put(s3Key, entry.getValue());
+            } else if (entry.getKey().startsWith(MinioProperties.MINIO_PREFIX)) {
+                String s3Key = entry.getKey().replace(MinioProperties.MINIO_PREFIX, S3Properties.S3_PREFIX);
+                s3Properties.put(s3Key, entry.getValue());
+            } else {
+                s3Properties.put(entry.getKey(), entry.getValue());
             }
         }
         return s3Properties;
@@ -157,6 +195,16 @@ public class S3Properties extends BaseProperties {
         return properties;
     }
 
+    private static void checkProvider(Map<String, String> properties) throws DdlException {
+        if (properties.containsKey(PROVIDER)) {
+            properties.put(PROVIDER, properties.get(PROVIDER).toUpperCase());
+            // S3 Provider properties should be case insensitive.
+            if (!PROVIDERS.stream().anyMatch(s -> s.equals(properties.get(PROVIDER).toUpperCase()))) {
+                throw new DdlException("Provider must be one of OSS, OBS, AZURE, BOS, COS, S3, GCP");
+            }
+        }
+    }
+
     public static void requiredS3Properties(Map<String, String> properties) throws DdlException {
         // Try to convert env properties to uniform properties
         // compatible with old version
@@ -171,6 +219,7 @@ public class S3Properties extends BaseProperties {
                 checkRequiredProperty(properties, field);
             }
         }
+        checkProvider(properties);
     }
 
     public static void requiredS3PingProperties(Map<String, String> properties) throws DdlException {
@@ -230,6 +279,9 @@ public class S3Properties extends BaseProperties {
         if (properties.containsKey(S3Properties.Env.BUCKET)) {
             properties.putIfAbsent(S3Properties.BUCKET, properties.get(S3Properties.Env.BUCKET));
         }
+        if (properties.containsKey(PropertyConverter.USE_PATH_STYLE)) {
+            properties.putIfAbsent(PropertyConverter.USE_PATH_STYLE, properties.get(PropertyConverter.USE_PATH_STYLE));
+        }
     }
 
     public static TS3StorageParam getS3TStorageParam(Map<String, String> properties) {
@@ -238,6 +290,7 @@ public class S3Properties extends BaseProperties {
         s3Info.setRegion(properties.get(S3Properties.REGION));
         s3Info.setAk(properties.get(S3Properties.ACCESS_KEY));
         s3Info.setSk(properties.get(S3Properties.SECRET_KEY));
+        s3Info.setToken(properties.get(S3Properties.SESSION_TOKEN));
 
         s3Info.setRootPath(properties.get(S3Properties.ROOT_PATH));
         s3Info.setBucket(properties.get(S3Properties.BUCKET));
@@ -245,11 +298,54 @@ public class S3Properties extends BaseProperties {
         s3Info.setMaxConn(Integer.parseInt(maxConnections == null
                 ? S3Properties.Env.DEFAULT_MAX_CONNECTIONS : maxConnections));
         String requestTimeoutMs = properties.get(S3Properties.REQUEST_TIMEOUT_MS);
-        s3Info.setMaxConn(Integer.parseInt(requestTimeoutMs == null
+        s3Info.setRequestTimeoutMs(Integer.parseInt(requestTimeoutMs == null
                 ? S3Properties.Env.DEFAULT_REQUEST_TIMEOUT_MS : requestTimeoutMs));
         String connTimeoutMs = properties.get(S3Properties.CONNECTION_TIMEOUT_MS);
-        s3Info.setMaxConn(Integer.parseInt(connTimeoutMs == null
+        s3Info.setConnTimeoutMs(Integer.parseInt(connTimeoutMs == null
                 ? S3Properties.Env.DEFAULT_CONNECTION_TIMEOUT_MS : connTimeoutMs));
+        String usePathStyle = properties.getOrDefault(PropertyConverter.USE_PATH_STYLE, "false");
+        s3Info.setUsePathStyle(Boolean.parseBoolean(usePathStyle));
         return s3Info;
+    }
+
+    public static Cloud.ObjectStoreInfoPB.Builder getObjStoreInfoPB(Map<String, String> properties) {
+        Cloud.ObjectStoreInfoPB.Builder builder = Cloud.ObjectStoreInfoPB.newBuilder();
+        if (properties.containsKey(S3Properties.ENDPOINT)) {
+            builder.setEndpoint(properties.get(S3Properties.ENDPOINT));
+        }
+        if (properties.containsKey(S3Properties.REGION)) {
+            builder.setRegion(properties.get(S3Properties.REGION));
+        }
+        if (properties.containsKey(S3Properties.ACCESS_KEY)) {
+            builder.setAk(properties.get(S3Properties.ACCESS_KEY));
+        }
+        if (properties.containsKey(S3Properties.SECRET_KEY)) {
+            builder.setSk(properties.get(S3Properties.SECRET_KEY));
+        }
+        if (properties.containsKey(S3Properties.ROOT_PATH)) {
+            Preconditions.checkArgument(!Strings.isNullOrEmpty(properties.get(S3Properties.ROOT_PATH)),
+                    "%s cannot be empty", S3Properties.ROOT_PATH);
+            builder.setPrefix(properties.get(S3Properties.ROOT_PATH));
+        }
+        if (properties.containsKey(S3Properties.BUCKET)) {
+            builder.setBucket(properties.get(S3Properties.BUCKET));
+        }
+        if (properties.containsKey(S3Properties.EXTERNAL_ENDPOINT)) {
+            builder.setExternalEndpoint(properties.get(S3Properties.EXTERNAL_ENDPOINT));
+        }
+        if (properties.containsKey(S3Properties.PROVIDER)) {
+            // S3 Provider properties should be case insensitive.
+            builder.setProvider(Provider.valueOf(properties.get(S3Properties.PROVIDER).toUpperCase()));
+        }
+
+        if (properties.containsKey(PropertyConverter.USE_PATH_STYLE)) {
+            String value = properties.get(PropertyConverter.USE_PATH_STYLE);
+            Preconditions.checkArgument(!Strings.isNullOrEmpty(value), "use_path_style cannot be empty");
+            Preconditions.checkArgument(value.equalsIgnoreCase("true")
+                    || value.equalsIgnoreCase("false"),
+                    "Invalid use_path_style value: %s only 'true' or 'false' is acceptable", value);
+            builder.setUsePathStyle(value.equalsIgnoreCase("true"));
+        }
+        return builder;
     }
 }
